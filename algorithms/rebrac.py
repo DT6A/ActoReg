@@ -776,7 +776,7 @@ def eval_actor(
 
 @pyrallis.wrap()
 def train(config: Config):
-    config.project = "ActReg"
+    config.project = "ActoReg"
     dict_config = asdict(config)
     dict_config["mlc_job_name"] = os.environ.get("PLATFORM_JOB_NAME")
 
@@ -819,7 +819,7 @@ def train(config: Config):
         target_params=actor_module.init(actor_key, init_state),
         tx=optax.adam(learning_rate=config.actor_learning_rate),
     )
-    expert_actor = checkpoints.restore_checkpoint(ckpt_dir='./checkpoints/test_checkpoint', target=expert_actor)
+    expert_actor = checkpoints.restore_checkpoint(ckpt_dir=f'./expert_checkpoints/{config.dataset_name.split("-")[0]}', target=expert_actor)
 
     critic_module = EnsembleCritic(
         hidden_dim=config.hidden_dim,

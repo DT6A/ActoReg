@@ -845,6 +845,7 @@ def action_fn(actor: TrainState) -> Callable:
 
 @pyrallis.wrap()
 def train(config: Config):
+    config.project = "ActoReg"
     dict_config = asdict(config)
     dict_config["mlc_job_name"] = os.environ.get("PLATFORM_JOB_NAME")
     is_env_with_goal = config.dataset_name.startswith(ENVS_WITH_GOAL)
