@@ -1101,7 +1101,10 @@ def train(config: Config):
             }
             offline_log.update(online_log)
             wandb.log(offline_log)
-    checkpoints.save_checkpoint(ckpt_dir=f'./expert_checkpoints/{config.dataset_name.split("-")[0]}',
+    save_name = config.dataset_name.split("-")[0]
+    if "antmaze" in config.dataset_name:
+        save_name += "-" + config.dataset_name.split("-")[1]
+    checkpoints.save_checkpoint(ckpt_dir=f'./expert_checkpoints/{save_name}',
                                 target=carry["actor"],
                                 step=0,
                                 overwrite=True,
