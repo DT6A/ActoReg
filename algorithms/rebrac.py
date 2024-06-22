@@ -819,7 +819,11 @@ def train(config: Config):
         target_params=actor_module.init(actor_key, init_state),
         tx=optax.adam(learning_rate=config.actor_learning_rate),
     )
-    expert_actor = checkpoints.restore_checkpoint(ckpt_dir=f'./expert_checkpoints/{config.dataset_name.split("-")[0]}', target=expert_actor)
+
+    save_name = config.dataset_name.split("-")[0]
+    if "antmaze" in config.dataset_name:
+        save_name += "-" + config.dataset_name.split("-")[1]
+    expert_actor = checkpoints.restore_checkpoint(ckpt_dir=f'/cluster/home/tarasovd/ActoReg//expert_checkpoints/{save_name}', target=expert_actor)
 
     critic_module = EnsembleCritic(
         hidden_dim=config.hidden_dim,
