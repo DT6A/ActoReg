@@ -366,9 +366,6 @@ class ReplayBuffer:
             val_buffer["rewards"] = ReplayBuffer.normalize_reward(
                 dataset_name, val_buffer["rewards"]
             )
-            random_buffer["rewards"] = ReplayBuffer.normalize_reward(
-                dataset_name, random_buffer["rewards"]
-            )
         self.data = buffer
         self.val_data = val_buffer
         self.random_data = random_buffer
