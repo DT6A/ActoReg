@@ -967,11 +967,9 @@ def train(config: Config):
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
             eval_returns, expert_mse, eval_batch = evaluate(
                 eval_env,
-                # update_carry["actor"].params,
+                update_carry["actor"].params,
                 expert_actor.params,
-                expert_actor.params,
-                # actor_action_fn,
-                expert_action_fn,
+                actor_action_fn,
                 expert_action_fn,
                 config.eval_episodes,
                 seed=config.eval_seed,
