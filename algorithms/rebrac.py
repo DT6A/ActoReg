@@ -49,7 +49,8 @@ class Config:
     actor_bc_coef: float = 1.0
     critic_bc_coef: float = 1.0
     actor_ln: bool = False
-    actor_ln_type: str = "ln"
+    actor_fn: bool = False
+    actor_gn: bool = False
     critic_ln: bool = True
     policy_noise: float = 0.2
     noise_clip: float = 0.5
@@ -104,26 +105,15 @@ def identity(x: Any) -> Any:
 class DetActor(nn.Module):
     action_dim: int
     hidden_dim: int = 256
-    layernorm: bool = True
-    layernorm_type: str = "ln"
+    layernorm: bool = False
+    groupnorm: bool = False
+    featurenorm: bool = False
     n_hiddens: int = 3
 
     @nn.compact
     def __call__(self, state: jax.Array, train: bool) -> Tuple[jax.Array, jax.Array]:
         s_d, h_d = state.shape[-1], self.hidden_dim
         # Initialization as in the EDAC paper
-        ln_class = identity
-        if self.layernorm_type == "ln":
-            ln_class = nn.LayerNorm
-        elif self.layernorm_type == "bn":
-            ln_class = nn.BatchNorm
-        elif self.layernorm_type == "fn":
-            ln_class = nn.GroupNorm
-        ln_args = {
-            "num_groups": 32,
-            "use_running_average": not train,
-        }
-
         layers = [
             nn.Dense(
                 self.hidden_dim,
@@ -131,21 +121,29 @@ class DetActor(nn.Module):
                 bias_init=nn.initializers.constant(0.1),
             ),
             nn.relu,
-            ln_class(**ln_args) if self.layernorm else identity,
+            nn.LayerNorm() if self.layernorm else identity,
+            nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
+            nn.GroupNorm() if self.groupnorm else identity,
         ]
-        for lc in range(self.n_hiddens - 1):
+        for _ in range(self.n_hiddens - 2):
             layers += [
                 nn.Dense(
                     self.hidden_dim,
                     kernel_init=pytorch_init(h_d),
                     bias_init=nn.initializers.constant(0.1),
                 ),
+                nn.relu,
+                nn.LayerNorm() if self.layernorm else identity,
+                nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
+                nn.GroupNorm() if self.groupnorm else identity,
             ]
-            if lc != self.n_hiddens - 2:
-                layers += [
-                    nn.relu,
-                    ln_class(**ln_args) if self.layernorm else identity,
-                ]
+        layers += [
+            nn.Dense(
+                self.hidden_dim,
+                kernel_init=pytorch_init(h_d),
+                bias_init=nn.initializers.constant(0.1),
+            ),
+        ]
 
         net = nn.Sequential(layers)
         trunk = net(state)
@@ -153,7 +151,9 @@ class DetActor(nn.Module):
         last_layer = nn.Sequential(
             [
                 nn.relu,
-                ln_class(**ln_args) if self.layernorm else identity,
+                nn.LayerNorm() if self.layernorm else identity,
+                nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
+                nn.GroupNorm() if self.groupnorm else identity,
                 nn.Dense(
                     self.action_dim,
                     kernel_init=uniform_init(1e-3),
@@ -495,6 +495,7 @@ def evaluate(
     params: jax.Array,
     expert_params: jax.Array,
     action_fn: Callable,
+    expert_action_fn: Callable,
     num_episodes: int,
     seed: int,
 ) -> Tuple[np.ndarray, float, Dict]:
@@ -514,7 +515,7 @@ def evaluate(
             eval_states.append(obs)
             action = np.asarray(jax.device_get(action_fn(params, obs)))
             eval_actions.append(action)
-            expert_action = np.asarray(jax.device_get(action_fn(expert_params, obs)))
+            expert_action = np.asarray(jax.device_get(expert_action_fn(expert_params, obs)))
             expert_mses.append(((action - expert_action) ** 2))
             obs, reward, done, _ = env.step(action)
             total_reward += reward
@@ -588,8 +589,7 @@ def update_actor(
     key, random_action_key = jax.random.split(key, 2)
 
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
-        actions, preact = actor.apply_fn(params, batch["states"], train=True)
-
+        actions, preact = actor.apply_fn(params, batch["states"], True)
         bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
         q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)
         lmbda = 1
@@ -649,7 +649,7 @@ def update_critic(
 ) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
     key, actions_key = jax.random.split(key)
 
-    next_actions, preact = actor.apply_fn(actor.target_params, batch["next_states"], train=False)
+    next_actions, preact = actor.apply_fn(actor.target_params, batch["next_states"], False)
     noise = jax.numpy.clip(
         (jax.random.normal(actions_key, next_actions.shape) * policy_noise),
         -noise_clip,
@@ -747,7 +747,7 @@ def update_td3_no_targets(
 def action_fn(actor: TrainState) -> Callable:
     @jax.jit
     def _action_fn(obs: jax.Array) -> jax.Array:
-        action = actor.apply_fn(actor.params, obs, train=False)[0]
+        action = actor.apply_fn(actor.params, obs, False)[0]
         return action
 
     return _action_fn
@@ -765,7 +765,7 @@ def eval_actor(
     metrics = {}
 
     def actor_loss_fn(params: jax.Array) -> jax.Array:
-        actions, preact = actor.apply_fn(params, batch["states"], train=False)
+        actions, preact = actor.apply_fn(params, batch["states"], False)
 
         bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
         q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)
@@ -817,30 +817,34 @@ def train(config: Config):
     init_state = buffer.data["states"][0][None, ...]
     init_action = buffer.data["actions"][0][None, ...]
 
-    actor_module = DetActor(
+    actor_class = DetActor
+
+    actor_module = actor_class(
         action_dim=init_action.shape[-1],
         hidden_dim=config.hidden_dim,
         layernorm=config.actor_ln,
-        layernorm_type=config.actor_ln_type,
+        featurenorm=config.actor_fn,
+        groupnorm=config.actor_gn,
         n_hiddens=config.actor_n_hiddens,
     )
     expert_module = DetActor(
         action_dim=init_action.shape[-1],
         hidden_dim=config.hidden_dim,
         layernorm=False,
-        layernorm_type=config.actor_ln_type,
+        featurenorm=False,
+        groupnorm=False,
         n_hiddens=config.actor_n_hiddens,
     )
     actor = ActorTrainState.create(
         apply_fn=actor_module.apply,
-        params=actor_module.init(actor_key, init_state, train=False),
-        target_params=actor_module.init(actor_key, init_state, train=False),
+        params=actor_module.init(actor_key, init_state, False),
+        target_params=actor_module.init(actor_key, init_state, False),
         tx=optax.adam(learning_rate=config.actor_learning_rate),
     )
     expert_actor = ActorTrainState.create(
         apply_fn=expert_module.apply,
-        params=expert_module.init(actor_key, init_state, train=False),
-        target_params=expert_module.init(actor_key, init_state, train=False),
+        params=expert_module.init(actor_key, init_state, False),
+        target_params=expert_module.init(actor_key, init_state, False),
         tx=optax.adam(learning_rate=config.actor_learning_rate),
     )
 
@@ -936,7 +940,11 @@ def train(config: Config):
 
     @jax.jit
     def actor_action_fn(params: jax.Array, obs: jax.Array):
-        return actor.apply_fn(params, obs, train=False)[0]
+        return actor.apply_fn(params, obs, False)[0]
+
+    @jax.jit
+    def expert_action_fn(params: jax.Array, obs: jax.Array):
+        return expert_actor.apply_fn(params, obs, False)[0]
 
     for epoch in trange(config.num_epochs, desc="ReBRAC Epochs"):
         # metrics for accumulation during epoch and logging to wandb
@@ -961,6 +969,7 @@ def train(config: Config):
                 update_carry["actor"].params,
                 expert_actor.params,
                 actor_action_fn,
+                expert_action_fn,
                 config.eval_episodes,
                 seed=config.eval_seed,
             )
