@@ -851,7 +851,7 @@ def train(config: Config):
     save_name = config.dataset_name.split("-")[0]
     if "antmaze" in config.dataset_name:
         save_name += "-" + config.dataset_name.split("-")[1]
-    expert_actor = checkpoints.restore_checkpoint(ckpt_dir=f'/cluster/home/tarasovd/ActoReg//expert_checkpoints/{save_name}', target=expert_actor)
+    expert_actor = checkpoints.restore_checkpoint(ckpt_dir=f'/cluster/home/tarasovd/ActoReg/expert_checkpoints/{save_name}', target=expert_actor)
 
     critic_module = EnsembleCritic(
         hidden_dim=config.hidden_dim,
