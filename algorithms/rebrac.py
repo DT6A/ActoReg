@@ -852,7 +852,7 @@ def train(config: Config):
     if "antmaze" in config.dataset_name:
         save_name += "-" + config.dataset_name.split("-")[1]
     print("Loading expert from:", f'expert_checkpoints/{save_name}')
-    actor = checkpoints.restore_checkpoint(ckpt_dir=f'expert_checkpoints/{save_name}', target=actor)
+    expert_actor = checkpoints.restore_checkpoint(ckpt_dir=f'expert_checkpoints/{save_name}', target=expert_actor)
 
     critic_module = EnsembleCritic(
         hidden_dim=config.hidden_dim,
@@ -967,9 +967,11 @@ def train(config: Config):
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
             eval_returns, expert_mse, eval_batch = evaluate(
                 eval_env,
-                update_carry["actor"].params,
+                # update_carry["actor"].params,
                 expert_actor.params,
-                actor_action_fn,
+                expert_actor.params,
+                # actor_action_fn,
+                expert_action_fn,
                 expert_action_fn,
                 config.eval_episodes,
                 seed=config.eval_seed,
