@@ -52,6 +52,7 @@ class Config:
     actor_fn: bool = False
     actor_gn: bool = False
     critic_ln: bool = True
+    actor_wd: float = 0.0
     policy_noise: float = 0.2
     noise_clip: float = 0.5
     policy_freq: int = 2
@@ -839,7 +840,7 @@ def train(config: Config):
         apply_fn=actor_module.apply,
         params=actor_module.init(actor_key, init_state, False),
         target_params=actor_module.init(actor_key, init_state, False),
-        tx=optax.adam(learning_rate=config.actor_learning_rate),
+        tx=optax.adamw(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd),
     )
     expert_actor = ActorTrainState.create(
         apply_fn=expert_module.apply,
