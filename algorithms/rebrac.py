@@ -52,6 +52,7 @@ class Config:
     actor_fn: bool = False
     actor_gn: bool = False
     critic_ln: bool = True
+    actor_dropout: float = 0.0
     actor_wd: float = 0.0
     policy_noise: float = 0.2
     noise_clip: float = 0.5
@@ -109,6 +110,7 @@ class DetActor(nn.Module):
     layernorm: bool = False
     groupnorm: bool = False
     featurenorm: bool = False
+    dropout_rate: float = 0.0
     n_hiddens: int = 3
 
     @nn.compact
@@ -125,6 +127,7 @@ class DetActor(nn.Module):
             nn.LayerNorm() if self.layernorm else identity,
             nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
             nn.GroupNorm() if self.groupnorm else identity,
+            nn.Dropout(rate=self.dropout_rate, deterministic=not train),
         ]
         for _ in range(self.n_hiddens - 2):
             layers += [
@@ -137,6 +140,7 @@ class DetActor(nn.Module):
                 nn.LayerNorm() if self.layernorm else identity,
                 nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
                 nn.GroupNorm() if self.groupnorm else identity,
+                nn.Dropout(rate=self.dropout_rate, deterministic=not train),
             ]
         layers += [
             nn.Dense(
@@ -155,6 +159,7 @@ class DetActor(nn.Module):
                 nn.LayerNorm() if self.layernorm else identity,
                 nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
                 nn.GroupNorm() if self.groupnorm else identity,
+                nn.Dropout(rate=self.dropout_rate, deterministic=not train),
                 nn.Dense(
                     self.action_dim,
                     kernel_init=uniform_init(1e-3),
@@ -534,6 +539,7 @@ class CriticTrainState(TrainState):
 
 class ActorTrainState(TrainState):
     target_params: FrozenDict
+    dropout_key: jax.Array
 
 
 def compute_dead_neurons_statistic(logits: jax.Array):
@@ -588,9 +594,10 @@ def update_actor(
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, random_action_key = jax.random.split(key, 2)
+    dropout_key, new_dropout_key = jax.random.split(actor.dropout_key, 2)
 
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
-        actions, preact = actor.apply_fn(params, batch["states"], True)
+        actions, preact = actor.apply_fn(params, batch["states"], True, rngs={'dropout': dropout_key})
         bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
         q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)
         lmbda = 1
@@ -619,7 +626,8 @@ def update_actor(
     new_actor = actor.apply_gradients(grads=grads)
 
     new_actor = new_actor.replace(
-        target_params=optax.incremental_update(actor.params, actor.target_params, tau)
+        target_params=optax.incremental_update(actor.params, actor.target_params, tau),
+        dropout_key=new_dropout_key,
     )
     new_critic = critic.replace(
         target_params=optax.incremental_update(critic.params, critic.target_params, tau)
@@ -811,21 +819,20 @@ def train(config: Config):
     )
 
     key = jax.random.PRNGKey(seed=config.train_seed)
-    key, actor_key, critic_key = jax.random.split(key, 3)
+    key, actor_key, critic_key, dropout_key = jax.random.split(key, 4)
 
     eval_env = make_env(config.dataset_name, seed=config.eval_seed)
     eval_env = wrap_env(eval_env, buffer.mean, buffer.std)
     init_state = buffer.data["states"][0][None, ...]
     init_action = buffer.data["actions"][0][None, ...]
 
-    actor_class = DetActor
-
-    actor_module = actor_class(
+    actor_module = DetActor(
         action_dim=init_action.shape[-1],
         hidden_dim=config.hidden_dim,
         layernorm=config.actor_ln,
         featurenorm=config.actor_fn,
         groupnorm=config.actor_gn,
+        dropout_rate=config.actor_dropout,
         n_hiddens=config.actor_n_hiddens,
     )
     expert_module = DetActor(
@@ -834,18 +841,24 @@ def train(config: Config):
         layernorm=False,
         featurenorm=False,
         groupnorm=False,
+        dropout_rate=0.0,
         n_hiddens=config.actor_n_hiddens,
     )
+
+
     actor = ActorTrainState.create(
         apply_fn=actor_module.apply,
         params=actor_module.init(actor_key, init_state, False),
         target_params=actor_module.init(actor_key, init_state, False),
+        dropout_key=dropout_key,
         tx=optax.adamw(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd),
     )
+
     expert_actor = ActorTrainState.create(
         apply_fn=expert_module.apply,
         params=expert_module.init(actor_key, init_state, False),
         target_params=expert_module.init(actor_key, init_state, False),
+        dropout_key=dropout_key,
         tx=optax.adam(learning_rate=config.actor_learning_rate),
     )
 
