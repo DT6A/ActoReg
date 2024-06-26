@@ -54,6 +54,7 @@ class Config:
     critic_ln: bool = True
     actor_dropout: float = 0.0
     actor_wd: float = 0.0
+    actor_input_noise: float = 0.0
     policy_noise: float = 0.2
     noise_clip: float = 0.5
     policy_freq: int = 2
@@ -591,13 +592,16 @@ def update_actor(
     beta: float,
     tau: float,
     normalize_q: bool,
+    input_noise: float,
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
-    key, random_action_key = jax.random.split(key, 2)
+    key, random_action_key, noise_key = jax.random.split(key, 3)
     dropout_key, new_dropout_key = jax.random.split(actor.dropout_key, 2)
 
+    in_noise = jax.random.normal(noise_key, batch["states"].shape) * input_noise
+
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
-        actions, preact = actor.apply_fn(params, batch["states"], True, rngs={'dropout': dropout_key})
+        actions, preact = actor.apply_fn(params, batch["states"] + in_noise, True, rngs={'dropout': dropout_key})
         bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
         q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)
         lmbda = 1
@@ -706,6 +710,7 @@ def update_td3(
     policy_noise: float,
     noise_clip: float,
     normalize_q: bool,
+    actor_input_noise: float,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -720,7 +725,7 @@ def update_td3(
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
-        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, new_metrics
+        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, new_metrics
     )
     return key, new_actor, new_critic, new_metrics
 
@@ -890,6 +895,7 @@ def train(config: Config):
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
         normalize_q=config.normalize_q,
+        actor_input_noise=config.actor_input_noise,
     )
 
     update_td3_no_targets_partial = partial(
