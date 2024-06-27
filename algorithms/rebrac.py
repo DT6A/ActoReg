@@ -73,6 +73,7 @@ class Config:
     train_seed: int = 0
     eval_seed: int = 42
 
+    mlc_job_name: str = None
     def __post_init__(self):
         self.name = f"{self.name}-{self.dataset_name}-{str(uuid.uuid4())[:8]}"
 
