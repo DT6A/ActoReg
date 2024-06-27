@@ -59,6 +59,7 @@ class Config:
     noise_clip: float = 0.5
     policy_freq: int = 2
     normalize_q: bool = True
+    decay_schedule: str = None
     # training params
     dataset_name: str = "halfcheetah-medium-v2"
     batch_size: int = 1024
@@ -571,7 +572,7 @@ def compute_feature_rank_pca(logits: jax.Array):
     return approximate_ranks
 
 
-def copmute_feature_statistics(logits: jax.Array):
+def compute_feature_statistics(logits: jax.Array):
     dead_neurons_frac = compute_dead_neurons_statistic(logits)
     feature_norms, feature_means, feature_stds = compute_feature_norm(logits)
     pca_rank = compute_feature_rank_pca(logits)
@@ -796,7 +797,7 @@ def eval_actor(
                 "action_mse": ((actions - batch["actions"]) ** 2).mean(),
             }
         )
-        metrics.update(copmute_feature_statistics(preact))
+        metrics.update(compute_feature_statistics(preact))
 
         return loss
 
@@ -851,13 +852,24 @@ def train(config: Config):
         n_hiddens=config.actor_n_hiddens,
     )
 
+    if config.decay_schedule == "cosine":
+        schedule_fn = optax.cosine_decay_schedule(config.actor_learning_rate, config.num_epochs * config.num_updates_on_epoch)
+        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+    elif config.decay_schedule == "linear":
+        schedule_fn = optax.linear_schedule(config.actor_learning_rate, config.actor_learning_rate / 10, config.num_epochs * config.num_updates_on_epoch)
+        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+    elif config.decay_schedule == "exp":
+        schedule_fn = optax.exponential_decay(config.actor_learning_rate, config.num_epochs * config.num_updates_on_epoch, 0.99)
+        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+    else:
+        optimizer = optax.adamw(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd)
 
     actor = ActorTrainState.create(
         apply_fn=actor_module.apply,
         params=actor_module.init(actor_key, init_state, False),
         target_params=actor_module.init(actor_key, init_state, False),
         dropout_key=dropout_key,
-        tx=optax.adamw(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd),
+        tx=optimizer,
     )
 
     expert_actor = ActorTrainState.create(
