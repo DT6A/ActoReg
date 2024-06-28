@@ -18,6 +18,7 @@ import d4rl  # noqa
 import flax.linen as nn
 import gym
 import jax
+from jax import tree_util
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -56,6 +57,7 @@ class Config:
     actor_wd: float = 0.0
     actor_input_noise: float = 0.0
     actor_bc_noise: float = 0.0
+    actor_grad_noise: float = 0.0
     policy_noise: float = 0.2
     noise_clip: float = 0.5
     policy_freq: int = 2
@@ -597,17 +599,18 @@ def update_actor(
     normalize_q: bool,
     input_noise: float,
     bc_noise: float,
+    grad_noise: float,
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
-    key, random_action_key, noise_key, bc_noise_key = jax.random.split(key, 4)
+    key, random_action_key, input_noise_key, bc_noise_key, grad_noise_key = jax.random.split(key, 5)
     dropout_key, new_dropout_key = jax.random.split(actor.dropout_key, 2)
 
-    in_noise = jax.random.normal(noise_key, batch["states"].shape) * input_noise
-    bc_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
+    in_noise = jax.random.normal(input_noise_key, batch["states"].shape) * input_noise
+    b_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
 
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
         actions, preact = actor.apply_fn(params, batch["states"] + in_noise, True, rngs={'dropout': dropout_key})
-        bc_penalty = ((actions - batch["actions"] + bc_noise) ** 2).sum(-1)
+        bc_penalty = ((actions - batch["actions"] + b_noise) ** 2).sum(-1)
         q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)
         lmbda = 1
         if normalize_q:
@@ -632,6 +635,20 @@ def update_actor(
         return loss, new_metrics
 
     grads, new_metrics = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+
+    def add_gaussian_noise(gr, noise_std, rng_key):
+        def add_noise_to_grad(g, rng_key):
+            noise = jax.random.normal(rng_key, g.shape) * noise_std
+            return g + noise
+
+        leaves, tree = jax.tree_util.tree_flatten(gr)
+        rng_keys = jax.random.split(rng_key, num=len(leaves))
+        rng_keys = jax.tree_util.tree_unflatten(tree, rng_keys)
+
+        noisy_grads = jax.tree_util.tree_map(lambda g, k: add_noise_to_grad(g, k), gr, rng_keys)
+        return noisy_grads
+
+    grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
     new_actor = actor.apply_gradients(grads=grads)
 
     new_actor = new_actor.replace(
@@ -717,6 +734,7 @@ def update_td3(
     normalize_q: bool,
     actor_input_noise: float,
     actor_bc_noise: float,
+    actor_grad_noise: float,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -731,7 +749,7 @@ def update_td3(
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
-        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise, new_metrics
+        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise, actor_grad_noise, new_metrics
     )
     return key, new_actor, new_critic, new_metrics
 
@@ -914,6 +932,7 @@ def train(config: Config):
         normalize_q=config.normalize_q,
         actor_input_noise=config.actor_input_noise,
         actor_bc_noise=config.actor_bc_noise,
+        actor_grad_noise=config.actor_grad_noise,
     )
 
     update_td3_no_targets_partial = partial(
