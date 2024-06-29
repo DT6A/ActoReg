@@ -4,6 +4,7 @@
 import os
 
 os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # For reproducibility
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import math
 import uuid
@@ -11,13 +12,13 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Any, Callable, Dict, Sequence, Tuple, Union
-from collections import defaultdict
 
 import chex
 import d4rl  # noqa
 import flax.linen as nn
 import gym
 import jax
+from jax import tree_util
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -25,6 +26,7 @@ import pyrallis
 import wandb
 from flax.core import FrozenDict
 from flax.training.train_state import TrainState
+from flax.training import checkpoints
 from tqdm.auto import trange
 
 default_kernel_init = nn.initializers.lecun_normal()
@@ -34,7 +36,7 @@ default_bias_init = nn.initializers.zeros
 @dataclass
 class Config:
     # wandb params
-    project: str = "ClORL"
+    project: str = "ActReg"
     group: str = "rebrac"
     name: str = "rebrac-ce"
     # model params
@@ -48,11 +50,19 @@ class Config:
     actor_bc_coef: float = 1.0
     critic_bc_coef: float = 1.0
     actor_ln: bool = False
+    actor_fn: bool = False
+    actor_gn: bool = False
     critic_ln: bool = True
+    actor_dropout: float = 0.0
+    actor_wd: float = 0.0
+    actor_input_noise: float = 0.0
+    actor_bc_noise: float = 0.0
+    actor_grad_noise: float = 0.0
     policy_noise: float = 0.2
     noise_clip: float = 0.5
     policy_freq: int = 2
     normalize_q: bool = True
+    decay_schedule: str = None
     # training params
     dataset_name: str = "halfcheetah-medium-v2"
     batch_size: int = 1024
@@ -62,11 +72,12 @@ class Config:
     normalize_states: bool = False
     # evaluation params
     eval_episodes: int = 10
-    eval_every: int = 5
+    eval_every: int = 10
     # general params
     train_seed: int = 0
     eval_seed: int = 42
     # classification
+
     n_classes: int = 101
     sigma_frac: float = 0.75
     v_min: float = float('inf')
@@ -74,7 +85,7 @@ class Config:
     v_expand: float = 0.0
     v_expand_mode: str = "both"
 
-    _wandb: Dict = field(default_factory=lambda: {})
+    mlc_job_name: str = None
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.dataset_name}-{str(uuid.uuid4())[:8]}"
@@ -111,11 +122,14 @@ def identity(x: Any) -> Any:
 class DetActor(nn.Module):
     action_dim: int
     hidden_dim: int = 256
-    layernorm: bool = True
+    layernorm: bool = False
+    groupnorm: bool = False
+    featurenorm: bool = False
+    dropout_rate: float = 0.0
     n_hiddens: int = 3
 
     @nn.compact
-    def __call__(self, state: jax.Array) -> jax.Array:
+    def __call__(self, state: jax.Array, train: bool) -> Tuple[jax.Array, jax.Array]:
         s_d, h_d = state.shape[-1], self.hidden_dim
         # Initialization as in the EDAC paper
         layers = [
@@ -126,8 +140,11 @@ class DetActor(nn.Module):
             ),
             nn.relu,
             nn.LayerNorm() if self.layernorm else identity,
+            nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
+            nn.GroupNorm() if self.groupnorm else identity,
+            nn.Dropout(rate=self.dropout_rate, deterministic=not train),
         ]
-        for _ in range(self.n_hiddens - 1):
+        for _ in range(self.n_hiddens - 2):
             layers += [
                 nn.Dense(
                     self.hidden_dim,
@@ -136,18 +153,39 @@ class DetActor(nn.Module):
                 ),
                 nn.relu,
                 nn.LayerNorm() if self.layernorm else identity,
+                nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
+                nn.GroupNorm() if self.groupnorm else identity,
+                nn.Dropout(rate=self.dropout_rate, deterministic=not train),
             ]
         layers += [
             nn.Dense(
-                self.action_dim,
-                kernel_init=uniform_init(1e-3),
-                bias_init=uniform_init(1e-3),
+                self.hidden_dim,
+                kernel_init=pytorch_init(h_d),
+                bias_init=nn.initializers.constant(0.1),
             ),
-            nn.tanh,
         ]
+
         net = nn.Sequential(layers)
-        actions = net(state)
-        return actions
+        trunk = net(state)
+
+        last_layer = nn.Sequential(
+            [
+                nn.relu,
+                nn.LayerNorm() if self.layernorm else identity,
+                nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
+                nn.GroupNorm() if self.groupnorm else identity,
+                nn.Dropout(rate=self.dropout_rate, deterministic=not train),
+                nn.Dense(
+                    self.action_dim,
+                    kernel_init=uniform_init(1e-3),
+                    bias_init=uniform_init(1e-3),
+                ),
+                nn.tanh
+            ]
+        )
+        actions = last_layer(trunk)
+
+        return actions, trunk
 
 
 class Critic(nn.Module):
@@ -185,7 +223,7 @@ class Critic(nn.Module):
         ]
         network = nn.Sequential(layers)
         state_action = jnp.hstack([state, action])
-        out = network(state_action) #.squeeze(-1)
+        out = network(state_action)  # .squeeze(-1)
         return out
 
 
@@ -240,60 +278,25 @@ def calc_return_to_go(is_sparse_reward, rewards, terminals, gamma):
     return return_to_go
 
 
-def convert_to_classification(labels, num_bins=10):
-    labels = np.array(labels)
-    # Determine bin edges to evenly divide the range of labels
-    bin_edges = np.linspace(labels.min(), labels.max(), num_bins + 1)
-
-    # Use numpy.digitize to assign each label to a bin
-    bins = np.digitize(labels, bin_edges)
-
-    return bins
-
-
-def convert_to_classification_equal_samples(labels, num_bins=10):
-    labels = np.array(labels)
-    # Determine the percentiles to evenly divide the data into bins
-    percentiles = np.linspace(0, 100, num_bins + 1)
-
-    # Compute the bin edges based on the percentiles
-    bin_edges = np.percentile(labels, percentiles)
-
-    # Use numpy.digitize to assign each label to a bin
-    bins = np.digitize(labels, bin_edges)
-
-    return bins
-
-
-def qlearning_dataset(env, dataset_name, normalize_reward=False, dataset=None, terminate_on_end=False, discount=0.99,
-                       **kwargs):
-    """
-    Returns datasets formatted for use by standard Q-learning algorithms,
-    with observations, actions, next_observations, next_actins, rewards,
-     and a terminal flag.
-    Args:
-       env: An OfflineEnv object.
-        dataset: An optional dataset to pass in for processing. If None,
-            the dataset will default to env.get_dataset()
-        terminate_on_end (bool): Set done=True on the last timestep
-            in a trajectory. Default is False, and will discard the
-            last timestep in each trajectory.
-        **kwargs: Arguments to pass to env.get_dataset().
-    Returns:
-        A dictionary containing keys:
-            observations: An N x dim_obs array of observations.
-            actions: An N x dim_action array of actions.
-            next_observations: An N x dim_obs array of next observations.
-            next_actions: An N x dim_action array of next actions.
-            rewards: An N-dim float array of rewards.
-            terminals: An N-dim boolean array of "done" or episode termination flags.
-    """
+def qlearning_dataset(
+        env: gym.Env,
+        dataset_name: Dict = None,
+        normalize_reward=False,
+        dataset=None,
+        terminate_on_end: bool = False,
+        validation_frac: float = 0.05,
+        discount=0.99,
+        **kwargs,
+) -> Tuple[Dict, Dict, float, float]:
     if dataset is None:
         dataset = env.get_dataset(**kwargs)
+
     if normalize_reward:
         dataset['rewards'] = ReplayBuffer.normalize_reward(dataset_name, dataset['rewards'])
-    N = dataset['rewards'].shape[0]
+
+    N = dataset["rewards"].shape[0]
     is_sparse = "antmaze" in dataset_name
+
     obs_ = []
     next_obs_ = []
     action_ = []
@@ -301,40 +304,41 @@ def qlearning_dataset(env, dataset_name, normalize_reward=False, dataset=None, t
     reward_ = []
     done_ = []
     mc_returns_ = []
-    print("SIZE", N)
+
     # The newer version of the dataset adds an explicit
     # timeouts field. Keep old method for backwards compatability.
-    use_timeouts = 'timeouts' in dataset
+    use_timeouts = "timeouts" in dataset
 
     episode_step = 0
+    episode_ends = []
     episode_rewards = []
     episode_terminals = []
+
     for i in range(N - 1):
         if episode_step == 0:
             episode_rewards = []
             episode_terminals = []
 
-        obs = dataset['observations'][i].astype(np.float32)
-        new_obs = dataset['observations'][i + 1].astype(np.float32)
-        action = dataset['actions'][i].astype(np.float32)
-        new_action = dataset['actions'][i + 1].astype(np.float32)
-        reward = dataset['rewards'][i].astype(np.float32)
-        done_bool = bool(dataset['terminals'][i])
+        obs = dataset["observations"][i].astype(np.float32)
+        new_obs = dataset["observations"][i + 1].astype(np.float32)
+        action = dataset["actions"][i].astype(np.float32)
+        new_action = dataset["actions"][i + 1].astype(np.float32)
+        reward = dataset["rewards"][i].astype(np.float32)
+        done_bool = bool(dataset["terminals"][i])
 
         if use_timeouts:
-            final_timestep = dataset['timeouts'][i]
+            final_timestep = dataset["timeouts"][i]
         else:
-            final_timestep = (episode_step == env._max_episode_steps - 1)
+            final_timestep = episode_step == env._max_episode_steps - 1
         if (not terminate_on_end) and final_timestep:
-            # Skip this transition and don't apply terminals on the last step of an episode
-            episode_step = 0
+            # Skip this transition
             mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
-            # print(len(mc_returns_), len(episode_rewards), end=";")
+            episode_step = 0
+            episode_ends.append(i)
             continue
         if done_bool or final_timestep:
             episode_step = 0
-            # mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
-            # print(i, len(mc_returns_), len(episode_rewards))
+            episode_ends.append(i)
 
         episode_rewards.append(reward)
         episode_terminals.append(done_bool)
@@ -346,26 +350,43 @@ def qlearning_dataset(env, dataset_name, normalize_reward=False, dataset=None, t
         reward_.append(reward)
         done_.append(done_bool)
         episode_step += 1
+
     if episode_step != 0:
         mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
+
     print("SHAPE", np.array(mc_returns_).shape, np.array(reward_).shape, np.array(done_).shape)
     assert np.array(mc_returns_).shape == np.array(reward_).shape
 
-    cls_rewards = np.array(mc_returns_)
-    # to_probs, from_probs = hl_gauss_transform(jnp.min(cls_rewards), jnp.max(cls_rewards), num_bins=n_classes,
-    #                                           sigma=sigma)
-    # to_probs = jax.vmap(to_probs)
-    # from_probs = jax.vmap(from_probs)
+    cnt_episodes = len(episode_ends)
+    cnt_train_episodes = int(cnt_episodes * (1 - validation_frac))
 
-    return {
-        'observations': np.array(obs_),
-        'actions': np.array(action_),
-        'next_observations': np.array(next_obs_),
-        'next_actions': np.array(next_action_),
-        'rewards': np.array(reward_),
-        'terminals': np.array(done_),
-        'mc_returns': np.array(mc_returns_),
-    }, jnp.min(cls_rewards), jnp.max(cls_rewards)
+    print("TOTAL NUMBER OF EPISODES:", cnt_episodes)
+    print("TRAIN EPISODES:", cnt_train_episodes)
+    print("VAL EPISODES:", cnt_episodes - cnt_train_episodes)
+
+    last_train_ep_idx = episode_ends[cnt_train_episodes]
+
+    cls_rewards = np.array(mc_returns_)
+
+    print("Last train idx:", last_train_ep_idx, "out of", len(obs_))
+    train_data = {
+        "observations": np.array(obs_)[:last_train_ep_idx],
+        "actions": np.array(action_)[:last_train_ep_idx],
+        "next_observations": np.array(next_obs_)[:last_train_ep_idx],
+        "next_actions": np.array(next_action_)[:last_train_ep_idx],
+        "rewards": np.array(reward_)[:last_train_ep_idx],
+        "terminals": np.array(done_)[:last_train_ep_idx],
+    }
+
+    val_data = {
+        "observations": np.array(obs_)[last_train_ep_idx:],
+        "actions": np.array(action_)[last_train_ep_idx:],
+        "next_observations": np.array(next_obs_)[last_train_ep_idx:],
+        "next_actions": np.array(next_action_)[last_train_ep_idx:],
+        "rewards": np.array(reward_)[last_train_ep_idx:],
+        "terminals": np.array(done_)[last_train_ep_idx:],
+    }
+    return train_data, val_data, jnp.min(cls_rewards), jnp.max(cls_rewards)
 
 
 def compute_mean_std(states: jax.Array, eps: float) -> Tuple[jax.Array, jax.Array]:
@@ -377,9 +398,12 @@ def compute_mean_std(states: jax.Array, eps: float) -> Tuple[jax.Array, jax.Arra
 def normalize_states(states: jax.Array, mean: jax.Array, std: jax.Array) -> jax.Array:
     return (states - mean) / std
 
+
 @chex.dataclass
 class ReplayBuffer:
     data: Dict[str, jax.Array] = None
+    val_data: Dict[str, jax.Array] = None
+    random_data: Dict[str, jax.Array] = None
     mean: float = 0
     std: float = 1
     min: float = 0
@@ -390,9 +414,14 @@ class ReplayBuffer:
             dataset_name: str,
             normalize_reward: bool = False,
             is_normalize: bool = False,
+            discount: float = 0.99
     ):
-        d4rl_data, self.min, self.max = qlearning_dataset(gym.make(dataset_name), dataset_name)
+        d4rl_data, val_data, self.min, self.max = qlearning_dataset(gym.make(dataset_name), dataset_name, discount=discount)
         print("Min/Max", self.min, self.max)
+
+        state_min = np.min(d4rl_data["observations"], axis=0)
+        state_max = np.max(d4rl_data["observations"], axis=0)
+
         buffer = {
             "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
             "actions": jnp.asarray(d4rl_data["actions"], dtype=jnp.float32),
@@ -402,19 +431,50 @@ class ReplayBuffer:
             ),
             "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
             "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
-            "mc_returns": jnp.asarray(d4rl_data["mc_returns"], dtype=jnp.float32),
         }
+        val_buffer = {
+            "states": jnp.asarray(val_data["observations"], dtype=jnp.float32),
+            "actions": jnp.asarray(val_data["actions"], dtype=jnp.float32),
+            "rewards": jnp.asarray(val_data["rewards"], dtype=jnp.float32),
+            "next_states": jnp.asarray(
+                val_data["next_observations"], dtype=jnp.float32
+            ),
+            "next_actions": jnp.asarray(val_data["next_actions"], dtype=jnp.float32),
+            "dones": jnp.asarray(val_data["terminals"], dtype=jnp.float32),
+        }
+
+        random_buffer = {
+            "states": jnp.asarray(np.random.uniform(0, 1, (val_data["observations"].shape[0], state_max.shape[0])) * (
+                        state_max - state_min) + state_min, dtype=jnp.float32),
+            "actions": jnp.asarray(
+                np.random.uniform(-1, 1, (val_data["observations"].shape[0], val_data["actions"].shape[1])),
+                dtype=jnp.float32),
+        }
+
         if is_normalize:
             self.mean, self.std = compute_mean_std(buffer["states"], eps=1e-3)
             buffer["states"] = normalize_states(buffer["states"], self.mean, self.std)
             buffer["next_states"] = normalize_states(
                 buffer["next_states"], self.mean, self.std
             )
+            val_buffer["states"] = normalize_states(val_buffer["states"], self.mean, self.std)
+            val_buffer["next_states"] = normalize_states(
+                val_buffer["next_states"], self.mean, self.std
+            )
+            random_buffer["states"] = normalize_states(random_buffer["states"], self.mean, self.std)
+            random_buffer["next_states"] = normalize_states(
+                random_buffer["next_states"], self.mean, self.std
+            )
         if normalize_reward:
             buffer["rewards"] = ReplayBuffer.normalize_reward(
                 dataset_name, buffer["rewards"]
             )
+            val_buffer["rewards"] = ReplayBuffer.normalize_reward(
+                dataset_name, val_buffer["rewards"]
+            )
         self.data = buffer
+        self.val_data = val_buffer
+        self.random_data = random_buffer
 
     @property
     def size(self) -> int:
@@ -427,7 +487,21 @@ class ReplayBuffer:
         indices = jax.random.randint(
             key, shape=(batch_size,), minval=0, maxval=self.size
         )
-        batch = jax.tree.map(lambda arr: arr[indices], self.data)
+        batch = jax.tree_map(lambda arr: arr[indices], self.data)
+        return batch
+
+    def sample_n_first(
+            self, batch_size: int
+    ) -> Dict[str, jax.Array]:
+        indices = jnp.arange(0, batch_size)
+        batch = jax.tree_map(lambda arr: arr[indices], self.data)
+        return batch
+
+    def sample_random(
+            self, batch_size: int
+    ) -> Dict[str, jax.Array]:
+        indices = jnp.arange(0, batch_size)
+        batch = jax.tree_map(lambda arr: arr[indices], self.random_data)
         return batch
 
     def get_moments(self, modality: str) -> Tuple[jax.Array, jax.Array]:
@@ -468,12 +542,11 @@ class Metrics:
 
 
 def normalize(
-    arr: jax.Array, mean: jax.Array, std: jax.Array, eps: float = 1e-8
+        arr: jax.Array, mean: jax.Array, std: jax.Array, eps: float = 1e-8
 ) -> jax.Array:
     return (arr - mean) / (std + eps)
 
 
-# @jax.jit
 def transform_to_probs(target: jax.Array, support: jax.Array, sigma: float) -> jax.Array:
     cdf_evals = jax.scipy.special.erf((support - target) / (jnp.sqrt(2) * sigma))
     z = cdf_evals[-1] - cdf_evals[0]
@@ -484,7 +557,6 @@ def transform_to_probs(target: jax.Array, support: jax.Array, sigma: float) -> j
 transform_to_probs = jax.vmap(transform_to_probs, in_axes=(0, None, None))
 
 
-# @jax.jit
 def transform_from_probs(probs: jax.Array, support: jax.Array) -> jax.Array:
     centers = (support[:-1] + support[1:]) / 2
     return jnp.sum(probs * centers)
@@ -503,15 +575,15 @@ def make_env(env_name: str, seed: int) -> gym.Env:
 
 
 def wrap_env(
-    env: gym.Env,
-    state_mean: Union[np.ndarray, float] = 0.0,
-    state_std: Union[np.ndarray, float] = 1.0,
-    reward_scale: float = 1.0,
+        env: gym.Env,
+        state_mean: Union[np.ndarray, float] = 0.0,
+        state_std: Union[np.ndarray, float] = 1.0,
+        reward_scale: float = 1.0,
 ) -> gym.Env:
     # PEP 8: E731 do not assign a lambda expression, use a def
     def normalize_state(state: np.ndarray) -> np.ndarray:
         return (
-            state - state_mean
+                state - state_mean
         ) / state_std  # epsilon should be already added in std.
 
     def scale_reward(reward: float) -> float:
@@ -525,27 +597,40 @@ def wrap_env(
 
 
 def evaluate(
-    env: gym.Env,
-    params: jax.Array,
-    action_fn: Callable,
-    num_episodes: int,
-    seed: int,
-) -> np.ndarray:
+        env: gym.Env,
+        params: jax.Array,
+        expert_params: jax.Array,
+        action_fn: Callable,
+        expert_action_fn: Callable,
+        num_episodes: int,
+        seed: int,
+) -> Tuple[np.ndarray, float, Dict]:
     env.seed(seed)
     env.action_space.seed(seed)
     env.observation_space.seed(seed)
 
     returns = []
+    expert_mses = []
+    eval_states = []
+    eval_actions = []
+
     for _ in trange(num_episodes, desc="Eval", leave=False):
         obs, done = env.reset(), False
         total_reward = 0.0
         while not done:
+            eval_states.append(obs)
             action = np.asarray(jax.device_get(action_fn(params, obs)))
+            eval_actions.append(action)
+            expert_action = np.asarray(jax.device_get(expert_action_fn(expert_params, obs)))
+            expert_mses.append(((action - expert_action) ** 2))
             obs, reward, done, _ = env.step(action)
             total_reward += reward
         returns.append(total_reward)
-
-    return np.array(returns)
+    eval_batch = {
+        "states": jnp.array(eval_states),
+        "actions": jnp.array(eval_actions),
+    }
+    return np.array(returns), np.mean(expert_mses), eval_batch
 
 
 class CriticTrainState(TrainState):
@@ -556,44 +641,80 @@ class CriticTrainState(TrainState):
 
 class ActorTrainState(TrainState):
     target_params: FrozenDict
+    dropout_key: jax.Array
+
+
+def compute_dead_neurons_statistic(logits: jax.Array):
+    positive_count = jnp.sum(logits > 0, axis=0)
+    dead_count = jnp.sum((positive_count == 0))
+    return dead_count / logits.shape[1]
+
+
+def compute_feature_norm(logits: jax.Array):
+    norms = jnp.linalg.norm(logits, axis=1)
+    means = jnp.mean(logits, axis=1)
+    stds = jnp.std(logits, axis=1)
+    return jnp.mean(norms), jnp.mean(means), jnp.mean(stds)
+
+
+def compute_feature_rank_pca(logits: jax.Array):
+    cutoff = 0.01
+    threshold = 1 - cutoff
+
+    svals = jnp.linalg.svd(logits, full_matrices=False, compute_uv=False)
+    sval_squares = svals ** 2
+    sval_squares_sum = jnp.sum(sval_squares)
+    cumsum_squares = jnp.cumsum(sval_squares)
+    threshold_crossed = cumsum_squares >= (threshold * sval_squares_sum)
+    approximate_ranks = (~threshold_crossed).sum() + 1
+
+    return approximate_ranks
+
+
+def compute_feature_statistics(logits: jax.Array):
+    dead_neurons_frac = compute_dead_neurons_statistic(logits)
+    feature_norms, feature_means, feature_stds = compute_feature_norm(logits)
+    pca_rank = compute_feature_rank_pca(logits)
+
+    return {
+        "dead_neurons_frac": dead_neurons_frac,
+        "feature_norms": feature_norms,
+        "feature_means": feature_means,
+        "feature_stds": feature_stds,
+        "pca_rank": pca_rank,
+    }
 
 
 def update_actor(
-    key: jax.random.PRNGKey,
-    actor: TrainState,
-    critic: TrainState,
-    batch: Dict[str, jax.Array],
-    beta: float,
-    tau: float,
-    normalize_q: bool,
-    metrics: Metrics,
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: TrainState,
+        batch: Dict[str, jax.Array],
+        beta: float,
+        tau: float,
+        normalize_q: bool,
+        input_noise: float,
+        bc_noise: float,
+        grad_noise: float,
+        metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
-    key, random_action_key = jax.random.split(key, 2)
+    key, random_action_key, input_noise_key, bc_noise_key, grad_noise_key = jax.random.split(key, 5)
+    dropout_key, new_dropout_key = jax.random.split(actor.dropout_key, 2)
+
+    in_noise = jax.random.normal(input_noise_key, batch["states"].shape) * input_noise
+    b_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
 
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
-        actions = actor.apply_fn(params, batch["states"])
-
-        bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
+        actions, preact = actor.apply_fn(params, batch["states"] + in_noise, True, rngs={'dropout': dropout_key})
+        bc_penalty = ((actions - batch["actions"] + b_noise) ** 2).sum(-1)
 
         logits = critic.apply_fn(critic.params, batch["states"], actions)
         probs = nn.softmax(logits, axis=-1)
         q_values = transform_from_probs(probs, critic.support).min(0)
-        # q_values = critic.apply_fn(critic.params, batch["states"], actions).min(0)
+
         lmbda = 1
         if normalize_q:
             lmbda = jax.lax.stop_gradient(1 / jax.numpy.abs(q_values).mean())
-
-        epsilon = 1e-8
-
-        probs = jnp.clip(jax.nn.softmax(logits.mean(axis=0), axis=-1), epsilon, 1.0 - epsilon)
-        q_actions_entropy = -jnp.sum(probs * jnp.log(probs), axis=-1)
-
-        logits = critic.apply_fn(critic.params, batch["states"], batch["actions"])
-        probs = jnp.clip(jax.nn.softmax(logits.mean(axis=0), axis=-1), epsilon, 1.0 - epsilon)
-        q_data_entropy = -jnp.sum(probs * jnp.log(probs), axis=-1)
-
-        diff = q_data_entropy - q_actions_entropy
-        abs_diff = jnp.abs(diff)
 
         loss = (beta * bc_penalty - lmbda * q_values).mean()
 
@@ -601,48 +722,69 @@ def update_actor(
         random_actions = jax.random.uniform(
             random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0
         )
-
         new_metrics = metrics.update(
             {
                 "actor_loss": loss,
                 "bc_mse_policy": bc_penalty.mean(),
-                "bc_mse_random": ((random_actions - batch["actions"]) ** 2).sum(-1).mean(),
+                "bc_mse_random": ((random_actions - batch["actions"]) ** 2)
+                .sum(-1)
+                .mean(),
                 "action_mse": ((actions - batch["actions"]) ** 2).mean(),
-                "actions_q_entropy": q_actions_entropy.mean(),
-                "actor_entropy_diff": diff.mean(),
-                "actor_entropy_diff_abs": abs_diff.mean(),
             }
         )
         return loss, new_metrics
 
     grads, new_metrics = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+
+    def add_gaussian_noise(gr, noise_std, rng_key):
+        def add_noise_to_grad(g, rng_key):
+            noise = jax.random.normal(rng_key, g.shape) * noise_std / ((1 + actor.step) ** 0.55)
+            return g + noise
+
+        leaves, tree = jax.tree_util.tree_flatten(gr)
+        rng_keys = jax.random.split(rng_key, num=len(leaves))
+        rng_keys = jax.tree_util.tree_unflatten(tree, rng_keys)
+
+        noisy_grads = jax.tree_util.tree_map(lambda g, k: add_noise_to_grad(g, k), gr, rng_keys)
+        return noisy_grads
+
+    grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
     new_actor = actor.apply_gradients(grads=grads)
 
     new_actor = new_actor.replace(
-        target_params=optax.incremental_update(actor.params, actor.target_params, tau)
+        target_params=optax.incremental_update(actor.params, actor.target_params, tau),
+        dropout_key=new_dropout_key,
     )
     new_critic = critic.replace(
         target_params=optax.incremental_update(critic.params, critic.target_params, tau)
     )
 
+    actor_params = new_actor.params
+    actor_params = jax.tree_util.tree_map(lambda x: x.reshape(-1), actor_params)
+    flat_vals, _ = jax.tree.flatten(actor_params)
+    flat_mean = jnp.mean(jnp.concatenate(flat_vals))
+
+    new_metrics = new_metrics.update(
+        {"weights/actor_weights_mean": flat_mean}
+    )
     return key, new_actor, new_critic, new_metrics
 
 
 def update_critic(
-    key: jax.random.PRNGKey,
-    actor: TrainState,
-    critic: CriticTrainState,
-    batch: Dict[str, jax.Array],
-    gamma: float,
-    beta: float,
-    tau: float,
-    policy_noise: float,
-    noise_clip: float,
-    metrics: Metrics,
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: CriticTrainState,
+        batch: Dict[str, jax.Array],
+        gamma: float,
+        beta: float,
+        tau: float,
+        policy_noise: float,
+        noise_clip: float,
+        metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
     key, actions_key = jax.random.split(key)
 
-    next_actions = actor.apply_fn(actor.target_params, batch["next_states"])
+    next_actions, preact = actor.apply_fn(actor.target_params, batch["next_states"], False)
     noise = jax.numpy.clip(
         (jax.random.normal(actions_key, next_actions.shape) * policy_noise),
         -noise_clip,
@@ -650,38 +792,23 @@ def update_critic(
     )
     next_actions = jax.numpy.clip(next_actions + noise, -1, 1)
     bc_penalty = ((next_actions - batch["next_actions"]) ** 2).sum(-1)
-
     logits = critic.apply_fn(critic.target_params, batch["next_states"], next_actions)
-    # logits = critic.apply_fn(critic.params, batch["next_states"], next_actions)
     probs = nn.softmax(logits, axis=-1)
     next_q = transform_from_probs(probs, critic.support).min(0)
-
-    # next_q = critic.apply_fn(
-    #     critic.target_params, batch["next_states"], next_actions
-    # ).min(0)
-
     next_q = next_q - beta * bc_penalty
 
     target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
 
-    def critic_loss_fn(critic_params: jax.Array) -> Tuple[jax.Array, Tuple[jax.Array, jax.Array]]:
+    def critic_loss_fn(critic_params: jax.Array) -> Tuple[jax.Array, jax.Array]:
         # [N, batch_size] - [1, batch_size]
         q = critic.apply_fn(critic_params, batch["states"], batch["actions"])
-
-        epsilon = 1e-8
-        probs = jnp.clip(jax.nn.softmax(q.mean(axis=0), axis=-1), epsilon, 1.0 - epsilon)
-        q_entropy = -jnp.sum(probs * jnp.log(probs), axis=-1)
-
-        # q_min = q.min(0).mean()
         q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
-
         target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
 
-        # loss = ((q - target_q[None, ...]) ** 2).mean(1).sum(0)
         loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
-        return loss, (q_min, q_entropy.mean())
+        return loss, q_min
 
-    (loss, (q_min, q_entropy)), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
+    (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
         critic.params
     )
     new_critic = critic.apply_gradients(grads=grads)
@@ -689,25 +816,27 @@ def update_critic(
         {
             "critic_loss": loss,
             "q_min": q_min,
-            "q_entropy": q_entropy,
         }
     )
     return key, new_critic, new_metrics
 
 
 def update_td3(
-    key: jax.random.PRNGKey,
-    actor: TrainState,
-    critic: CriticTrainState,
-    batch: Dict[str, Any],
-    metrics: Metrics,
-    gamma: float,
-    actor_bc_coef: float,
-    critic_bc_coef: float,
-    tau: float,
-    policy_noise: float,
-    noise_clip: float,
-    normalize_q: bool,
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: CriticTrainState,
+        batch: Dict[str, Any],
+        metrics: Metrics,
+        gamma: float,
+        actor_bc_coef: float,
+        critic_bc_coef: float,
+        tau: float,
+        policy_noise: float,
+        noise_clip: float,
+        normalize_q: bool,
+        actor_input_noise: float,
+        actor_bc_noise: float,
+        actor_grad_noise: float,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -722,23 +851,24 @@ def update_td3(
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
-        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, new_metrics
+        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise,
+        actor_grad_noise, new_metrics
     )
     return key, new_actor, new_critic, new_metrics
 
 
 def update_td3_no_targets(
-    key: jax.random.PRNGKey,
-    actor: TrainState,
-    critic: CriticTrainState,
-    batch: Dict[str, Any],
-    gamma: float,
-    metrics: Metrics,
-    actor_bc_coef: float,
-    critic_bc_coef: float,
-    tau: float,
-    policy_noise: float,
-    noise_clip: float,
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: CriticTrainState,
+        batch: Dict[str, Any],
+        gamma: float,
+        metrics: Metrics,
+        actor_bc_coef: float,
+        critic_bc_coef: float,
+        tau: float,
+        policy_noise: float,
+        noise_clip: float,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -758,16 +888,58 @@ def update_td3_no_targets(
 def action_fn(actor: TrainState) -> Callable:
     @jax.jit
     def _action_fn(obs: jax.Array) -> jax.Array:
-        action = actor.apply_fn(actor.params, obs)
+        action = actor.apply_fn(actor.params, obs, False)[0]
         return action
 
     return _action_fn
 
 
+def eval_actor(
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: TrainState,
+        batch: Dict[str, jax.Array],
+        beta: float,
+        normalize_q: bool,
+) -> Tuple[jax.random.PRNGKey, Dict]:
+    key, random_action_key = jax.random.split(key, 2)
+    metrics = {}
+
+    def actor_loss_fn(params: jax.Array) -> jax.Array:
+        actions, preact = actor.apply_fn(params, batch["states"], False)
+
+        bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
+
+        logits = critic.apply_fn(critic.params, batch["states"], actions)
+        probs = nn.softmax(logits, axis=-1)
+        q_values = transform_from_probs(probs, critic.support).min(0)
+
+        lmbda = 1
+        if normalize_q:
+            lmbda = jax.lax.stop_gradient(1 / jax.numpy.abs(q_values).mean())
+
+        loss = (beta * bc_penalty - lmbda * q_values).mean()
+
+        metrics.update(
+            {
+                "actor_loss": loss,
+                "action_mse": ((actions - batch["actions"]) ** 2).mean(),
+            }
+        )
+        metrics.update(compute_feature_statistics(preact))
+
+        return loss
+
+    actor_loss_fn(actor.params)
+
+    return key, metrics
+
+
 @pyrallis.wrap()
 def train(config: Config):
+    config.project = "ActoReg"
     dict_config = asdict(config)
-    # dict_config["mlc_job_name"] = os.environ.get("PLATFORM_JOB_NAME")
+    dict_config["mlc_job_name"] = os.environ.get("PLATFORM_JOB_NAME")
 
     wandb.init(
         config=dict_config,
@@ -779,11 +951,11 @@ def train(config: Config):
     wandb.mark_preempting()
     buffer = ReplayBuffer()
     buffer.create_from_d4rl(
-        config.dataset_name, config.normalize_reward, config.normalize_states
+        config.dataset_name, config.normalize_reward, config.normalize_states, discount=config.gamma
     )
 
     key = jax.random.PRNGKey(seed=config.train_seed)
-    key, actor_key, critic_key = jax.random.split(key, 3)
+    key, actor_key, critic_key, dropout_key = jax.random.split(key, 4)
 
     eval_env = make_env(config.dataset_name, seed=config.eval_seed)
     eval_env = wrap_env(eval_env, buffer.mean, buffer.std)
@@ -794,14 +966,57 @@ def train(config: Config):
         action_dim=init_action.shape[-1],
         hidden_dim=config.hidden_dim,
         layernorm=config.actor_ln,
+        featurenorm=config.actor_fn,
+        groupnorm=config.actor_gn,
+        dropout_rate=config.actor_dropout,
         n_hiddens=config.actor_n_hiddens,
     )
+    expert_module = DetActor(
+        action_dim=init_action.shape[-1],
+        hidden_dim=config.hidden_dim,
+        layernorm=False,
+        featurenorm=False,
+        groupnorm=False,
+        dropout_rate=0.0,
+        n_hiddens=config.actor_n_hiddens,
+    )
+
+    if config.decay_schedule == "cosine":
+        schedule_fn = optax.cosine_decay_schedule(config.actor_learning_rate,
+                                                  config.num_epochs * config.num_updates_on_epoch)
+        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+    elif config.decay_schedule == "linear":
+        schedule_fn = optax.linear_schedule(config.actor_learning_rate, config.actor_learning_rate / 10,
+                                            config.num_epochs * config.num_updates_on_epoch)
+        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+    elif config.decay_schedule == "exp":
+        schedule_fn = optax.exponential_decay(config.actor_learning_rate,
+                                              config.num_epochs * config.num_updates_on_epoch, 0.99)
+        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+    else:
+        optimizer = optax.adamw(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd)
+
     actor = ActorTrainState.create(
         apply_fn=actor_module.apply,
-        params=actor_module.init(actor_key, init_state),
-        target_params=actor_module.init(actor_key, init_state),
+        params=actor_module.init(actor_key, init_state, False),
+        target_params=actor_module.init(actor_key, init_state, False),
+        dropout_key=dropout_key,
+        tx=optimizer,
+    )
+
+    expert_actor = ActorTrainState.create(
+        apply_fn=expert_module.apply,
+        params=expert_module.init(actor_key, init_state, False),
+        target_params=expert_module.init(actor_key, init_state, False),
+        dropout_key=dropout_key,
         tx=optax.adam(learning_rate=config.actor_learning_rate),
     )
+
+    save_name = config.dataset_name.split("-")[0]
+    if "antmaze" in config.dataset_name:
+        save_name += "-" + config.dataset_name.split("-")[1]
+    print("Loading expert from:", f'expert_checkpoints/{save_name}')
+    expert_actor = checkpoints.restore_checkpoint(ckpt_dir=f'expert_checkpoints/{save_name}', target=expert_actor)
 
     critic_module = EnsembleCritic(
         hidden_dim=config.hidden_dim,
@@ -846,6 +1061,9 @@ def train(config: Config):
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
         normalize_q=config.normalize_q,
+        actor_input_noise=config.actor_input_noise,
+        actor_bc_noise=config.actor_bc_noise,
+        actor_grad_noise=config.actor_grad_noise,
     )
 
     update_td3_no_targets_partial = partial(
@@ -896,10 +1114,7 @@ def train(config: Config):
         "bc_mse_policy",
         "bc_mse_random",
         "action_mse",
-        "actions_q_entropy",
-        "actor_entropy_diff_abs",
-        "actor_entropy_diff",
-        "q_entropy",
+        "weights/actor_weights_mean",
     ]
     # shared carry for update loops
     update_carry = {
@@ -914,7 +1129,11 @@ def train(config: Config):
 
     @jax.jit
     def actor_action_fn(params: jax.Array, obs: jax.Array):
-        return actor.apply_fn(params, obs)
+        return actor.apply_fn(params, obs, False)[0]
+
+    @jax.jit
+    def expert_action_fn(params: jax.Array, obs: jax.Array):
+        return expert_actor.apply_fn(params, obs, False)[0]
 
     for epoch in trange(config.num_epochs, desc="ReBRAC Epochs"):
         # metrics for accumulation during epoch and logging to wandb
@@ -934,28 +1153,54 @@ def train(config: Config):
         )
 
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1:
-            eval_returns = evaluate(
+            eval_returns, expert_mse, eval_batch = evaluate(
                 eval_env,
                 update_carry["actor"].params,
+                expert_actor.params,
                 actor_action_fn,
+                expert_action_fn,
                 config.eval_episodes,
                 seed=config.eval_seed,
             )
             normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+            eval_metrics = {
+                "epoch": epoch,
+                "eval/return_mean": np.mean(eval_returns),
+                "eval/return_std": np.std(eval_returns),
+                "eval/normalized_score_mean": np.mean(normalized_score),
+                "eval/normalized_score_std": np.std(normalized_score),
+                "eval_metrics/expert_mse": expert_mse,
+            }
+
+            new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
+                                              buffer.val_data, config.actor_bc_coef, config.normalize_q)
+            new_key, train_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
+                                                buffer.sample_n_first(buffer.val_data["states"].shape[0]),
+                                                config.actor_bc_coef, config.normalize_q)
+            new_key, eval_metrics_1 = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
+                                                 eval_batch,
+                                                 config.actor_bc_coef, config.normalize_q)
+            new_key, rand_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
+                                               buffer.sample_random(buffer.val_data["states"].shape[0]),
+                                               config.actor_bc_coef, config.normalize_q)
+            buffer.sample_random(buffer.val_data["states"].shape[0])
+            del eval_metrics_1["action_mse"]
+
+            for k in train_metrics:
+                eval_metrics[f"train_metrics/{k}"] = train_metrics[k]
+            for k in val_metrics:
+                eval_metrics[f"validation_metrics/{k}"] = val_metrics[k]
+            for k in eval_metrics_1:
+                eval_metrics[f"eval_metrics/{k}"] = eval_metrics_1[k]
+            for k in rand_metrics:
+                eval_metrics[f"rand_metrics/{k}"] = rand_metrics[k]
+
+            update_carry["key"] = new_key
+
             wandb.log(
-                {
-                    "epoch": epoch,
-                    "eval/return_mean": np.mean(eval_returns),
-                    "eval/return_std": np.std(eval_returns),
-                    "eval/normalized_score_mean": np.mean(normalized_score),
-                    "eval/normalized_score_std": np.std(normalized_score),
-                }
+                eval_metrics
             )
 
 
 if __name__ == "__main__":
-    try:
-        train()
-    except Exception as e:
-        print("An exception occured")
-        print(e)
+    train()
