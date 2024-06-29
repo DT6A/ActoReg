@@ -638,7 +638,7 @@ def update_actor(
 
     def add_gaussian_noise(gr, noise_std, rng_key):
         def add_noise_to_grad(g, rng_key):
-            noise = jax.random.normal(rng_key, g.shape) * noise_std
+            noise = jax.random.normal(rng_key, g.shape) * noise_std / ((1 + actor.step) ** 0.55)
             return g + noise
 
         leaves, tree = jax.tree_util.tree_flatten(gr)
