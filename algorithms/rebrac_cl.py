@@ -59,7 +59,7 @@ class Config:
     actor_bc_noise: float = 0.0
     actor_grad_noise: float = 0.0
     actor_reset: bool = False
-    actor_prereset_mod: bool = True
+    actor_prereset_mode: bool = True
     policy_noise: float = 0.2
     noise_clip: float = 0.5
     policy_freq: int = 2
