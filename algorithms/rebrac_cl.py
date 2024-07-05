@@ -58,6 +58,8 @@ class Config:
     actor_input_noise: float = 0.0
     actor_bc_noise: float = 0.0
     actor_grad_noise: float = 0.0
+    actor_reset: bool = False
+    actor_prereset_mod: bool = True
     policy_noise: float = 0.2
     noise_clip: float = 0.5
     policy_freq: int = 2
@@ -67,6 +69,7 @@ class Config:
     dataset_name: str = "halfcheetah-medium-v2"
     batch_size: int = 1024
     num_epochs: int = 1000
+    num_refinement_epochs: int = 0
     num_updates_on_epoch: int = 1000
     normalize_reward: bool = False
     normalize_states: bool = False
@@ -885,6 +888,30 @@ def update_td3_no_targets(
     return key, actor, new_critic, new_metrics
 
 
+def update_refinement(
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: CriticTrainState,
+        batch: Dict[str, Any],
+        metrics: Metrics,
+        gamma: float,
+        actor_bc_coef: float,
+        critic_bc_coef: float,
+        tau: float,
+        policy_noise: float,
+        noise_clip: float,
+        normalize_q: bool,
+        actor_input_noise: float,
+        actor_bc_noise: float,
+        actor_grad_noise: float,
+) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
+    key, new_actor, new_critic, new_metrics = update_actor(
+        key, actor, critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise,
+        actor_grad_noise, metrics
+    )
+    return key, new_actor, new_critic, new_metrics
+
+
 def action_fn(actor: TrainState) -> Callable:
     @jax.jit
     def _action_fn(obs: jax.Array) -> jax.Array:
@@ -962,7 +989,27 @@ def train(config: Config):
     init_state = buffer.data["states"][0][None, ...]
     init_action = buffer.data["actions"][0][None, ...]
 
-    actor_module = DetActor(
+    if config.actor_prereset_mode:
+        actor_module = DetActor(
+            action_dim=init_action.shape[-1],
+            hidden_dim=config.hidden_dim,
+            layernorm=config.actor_ln,
+            featurenorm=config.actor_fn,
+            groupnorm=config.actor_gn,
+            dropout_rate=config.actor_dropout,
+            n_hiddens=config.actor_n_hiddens,
+        )
+    else:
+        actor_module = DetActor(
+            action_dim=init_action.shape[-1],
+            hidden_dim=config.hidden_dim,
+            layernorm=False,
+            featurenorm=False,
+            groupnorm=False,
+            dropout_rate=0.0,
+            n_hiddens=config.actor_n_hiddens,
+        )
+    reset_module = DetActor(
         action_dim=init_action.shape[-1],
         hidden_dim=config.hidden_dim,
         layernorm=config.actor_ln,
@@ -1052,6 +1099,8 @@ def train(config: Config):
         tx=optax.adam(learning_rate=config.critic_learning_rate),
     )
 
+    reset_mods = 1 if config.actor_prereset_mode else 0
+
     update_td3_partial = partial(
         update_td3,
         gamma=config.gamma,
@@ -1061,9 +1110,9 @@ def train(config: Config):
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
         normalize_q=config.normalize_q,
-        actor_input_noise=config.actor_input_noise,
-        actor_bc_noise=config.actor_bc_noise,
-        actor_grad_noise=config.actor_grad_noise,
+        actor_input_noise=config.actor_input_noise * reset_mods,
+        actor_bc_noise=config.actor_bc_noise * reset_mods,
+        actor_grad_noise=config.actor_grad_noise * reset_mods,
     )
 
     update_td3_no_targets_partial = partial(
@@ -1074,6 +1123,20 @@ def train(config: Config):
         tau=config.tau,
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
+    )
+
+    update_refinement_partial = partial(
+        update_refinement,
+        gamma=config.gamma,
+        actor_bc_coef=config.actor_bc_coef / 5,
+        critic_bc_coef=config.critic_bc_coef,
+        tau=config.tau,
+        policy_noise=config.policy_noise,
+        noise_clip=config.noise_clip,
+        normalize_q=config.normalize_q,
+        actor_input_noise=config.actor_input_noise,
+        actor_bc_noise=config.actor_bc_noise,
+        actor_grad_noise=config.actor_grad_noise,
     )
 
     def td3_loop_update_step(i: int, carry: TrainState):
@@ -1101,6 +1164,24 @@ def train(config: Config):
         key, new_actor, new_critic, new_metrics = jax.lax.cond(
             update_carry["delayed_updates"][i], full_update, update
         )
+
+        carry.update(key=key, actor=new_actor, critic=new_critic, metrics=new_metrics)
+        return carry
+
+    def refinement_loop_update_step(i: int, carry: TrainState):
+        key, batch_key = jax.random.split(carry["key"])
+        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
+
+        full_update = partial(
+            update_refinement_partial,
+            key=key,
+            actor=carry["actor"],
+            critic=carry["critic"],
+            batch=batch,
+            metrics=carry["metrics"],
+        )
+
+        key, new_actor, new_critic, new_metrics = full_update()
 
         carry.update(key=key, actor=new_actor, critic=new_critic, metrics=new_metrics)
         return carry
@@ -1135,7 +1216,22 @@ def train(config: Config):
     def expert_action_fn(params: jax.Array, obs: jax.Array):
         return expert_actor.apply_fn(params, obs, False)[0]
 
+    update_fn = td3_loop_update_step
+
     for epoch in trange(config.num_epochs, desc="ReBRAC Epochs"):
+        if epoch == config.num_epochs - config.num_refinement_epochs:
+            print("Refinement stage")
+            update_fn = refinement_loop_update_step
+            if config.actor_reset:
+                actor = ActorTrainState.create(
+                    apply_fn=reset_module.apply,
+                    params=reset_module.init(actor_key, init_state, False),
+                    target_params=reset_module.init(actor_key, init_state, False),
+                    dropout_key=dropout_key,
+                    tx=optimizer,
+                )
+                update_carry.update(actor=actor)
+
         # metrics for accumulation during epoch and logging to wandb
         # we need to reset them every epoch
         update_carry["metrics"] = Metrics.create(bc_metrics_to_log)
@@ -1143,7 +1239,7 @@ def train(config: Config):
         update_carry = jax.lax.fori_loop(
             lower=0,
             upper=config.num_updates_on_epoch,
-            body_fun=td3_loop_update_step,
+            body_fun=update_fn,
             init_val=update_carry,
         )
         # log mean over epoch for each metric
