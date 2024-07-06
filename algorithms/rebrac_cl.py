@@ -70,6 +70,7 @@ class Config:
     batch_size: int = 1024
     num_epochs: int = 1000
     num_refinement_epochs: int = 0
+    refinement_div: float = 1
     num_updates_on_epoch: int = 1000
     normalize_reward: bool = False
     normalize_states: bool = False
@@ -1128,7 +1129,7 @@ def train(config: Config):
     update_refinement_partial = partial(
         update_refinement,
         gamma=config.gamma,
-        actor_bc_coef=config.actor_bc_coef / 5,
+        actor_bc_coef=config.actor_bc_coef / config.refinement_div,
         critic_bc_coef=config.critic_bc_coef,
         tau=config.tau,
         policy_noise=config.policy_noise,
