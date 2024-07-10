@@ -11,7 +11,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from functools import partial
-from typing import Any, Callable, Dict, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Sequence, Tuple, Union, Optional
 
 import chex
 import d4rl  # noqa
@@ -22,6 +22,7 @@ from jax import tree_util
 import jax.numpy as jnp
 import numpy as np
 import optax
+from optax._src import base, combine, transform
 import pyrallis
 import wandb
 from flax.core import FrozenDict
@@ -55,6 +56,7 @@ class Config:
     critic_ln: bool = True
     actor_dropout: float = 0.0
     actor_wd: float = 0.0
+    l1_ratio: float = 0.0
     actor_input_noise: float = 0.0
     actor_bc_noise: float = 0.0
     actor_grad_noise: float = 0.0
@@ -122,6 +124,78 @@ def uniform_init(bound: float) -> Callable:
 def identity(x: Any) -> Any:
     return x
 
+
+AddDecayedWeightsState = base.EmptyState
+
+
+def add_elastic_weights(
+    weight_decay: Union[float, jax.Array] = 0.0,
+    l1_ratio: float = 0.0,
+    mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None
+) -> base.GradientTransformation:
+  def init_fn(params):
+    del params
+    return AddDecayedWeightsState()
+
+  def update_fn(updates, state, params):
+    if params is None:
+      raise ValueError(base.NO_PARAMS_MSG)
+    updates = jax.tree_util.tree_map(
+        lambda g, p: g + weight_decay * ((1 - l1_ratio) * p + l1_ratio * jnp.sign(p)), updates, params)
+    return updates, state
+
+  # If mask is not `None`, apply mask to the gradient transformation.
+  # E.g. it is common to skip weight decay on bias units and batch stats.
+  if mask is not None:
+    return wrappers.masked(
+        base.GradientTransformation(init_fn, update_fn), mask)
+  return base.GradientTransformation(init_fn, update_fn)
+
+# def add_elastic_weights(
+#     weight_decay: Union[float, jax.Array] = 0.0,
+#     l1_ratio: float = 0.0,
+#     mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None
+# ) -> base.GradientTransformation:
+#   def update_fn(updates, state, params):
+#     if params is None:
+#       raise ValueError(base.NO_PARAMS_MSG)
+#     updates = jax.tree_util.tree_map(
+#         lambda g, p: g + weight_decay * ((1 - l1_ratio) * p + l1_ratio * jnp.sign(p)), updates, params)
+#     return updates, state
+#
+#   # If mask is not `None`, apply mask to the gradient transformation.
+#   # E.g. it is common to skip weight decay on bias units and batch stats.
+#   if mask is not None:
+#     return wrappers.masked(
+#         base.GradientTransformation(base.init_empty_state, update_fn), mask)
+#   return base.GradientTransformation(base.init_empty_state, update_fn)
+
+def adamw_elastic(
+        learning_rate: base.ScalarOrSchedule,
+        b1: float = 0.9,
+        b2: float = 0.999,
+        eps: float = 1e-8,
+        eps_root: float = 0.0,
+        mu_dtype: Optional[Any] = None,
+        weight_decay: float = 1e-4,
+        l1_ratio: float = 0.0,
+        mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None,
+        *,
+        nesterov: bool = False,
+) -> base.GradientTransformation:
+
+    return combine.chain(
+        transform.scale_by_adam(
+            b1=b1,
+            b2=b2,
+            eps=eps,
+            eps_root=eps_root,
+            mu_dtype=mu_dtype,
+            nesterov=nesterov,
+        ),
+        add_elastic_weights(weight_decay, l1_ratio, mask),
+        transform.scale_by_learning_rate(learning_rate),
+    )
 
 class DetActor(nn.Module):
     action_dim: int
@@ -1032,17 +1106,17 @@ def train(config: Config):
     if config.decay_schedule == "cosine":
         schedule_fn = optax.cosine_decay_schedule(config.actor_learning_rate,
                                                   config.num_epochs * config.num_updates_on_epoch)
-        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+        optimizer = adamw_elastic(learning_rate=schedule_fn, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
     elif config.decay_schedule == "linear":
         schedule_fn = optax.linear_schedule(config.actor_learning_rate, config.actor_learning_rate / 10,
                                             config.num_epochs * config.num_updates_on_epoch)
-        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+        optimizer = adamw_elastic(learning_rate=schedule_fn, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
     elif config.decay_schedule == "exp":
         schedule_fn = optax.exponential_decay(config.actor_learning_rate,
                                               config.num_epochs * config.num_updates_on_epoch, 0.99)
-        optimizer = optax.adamw(learning_rate=schedule_fn, weight_decay=config.actor_wd)
+        optimizer = adamw_elastic(learning_rate=schedule_fn, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
     else:
-        optimizer = optax.adamw(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd)
+        optimizer = adamw_elastic(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
 
     actor = ActorTrainState.create(
         apply_fn=actor_module.apply,
