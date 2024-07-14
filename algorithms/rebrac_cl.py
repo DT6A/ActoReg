@@ -53,6 +53,8 @@ class Config:
     actor_ln: bool = False
     actor_fn: bool = False
     actor_gn: bool = False
+    actor_bn: bool = False
+    actor_sn: bool = False
     critic_ln: bool = True
     actor_dropout: float = 0.0
     actor_wd: float = 0.0
@@ -151,24 +153,6 @@ def add_elastic_weights(
         base.GradientTransformation(init_fn, update_fn), mask)
   return base.GradientTransformation(init_fn, update_fn)
 
-# def add_elastic_weights(
-#     weight_decay: Union[float, jax.Array] = 0.0,
-#     l1_ratio: float = 0.0,
-#     mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None
-# ) -> base.GradientTransformation:
-#   def update_fn(updates, state, params):
-#     if params is None:
-#       raise ValueError(base.NO_PARAMS_MSG)
-#     updates = jax.tree_util.tree_map(
-#         lambda g, p: g + weight_decay * ((1 - l1_ratio) * p + l1_ratio * jnp.sign(p)), updates, params)
-#     return updates, state
-#
-#   # If mask is not `None`, apply mask to the gradient transformation.
-#   # E.g. it is common to skip weight decay on bias units and batch stats.
-#   if mask is not None:
-#     return wrappers.masked(
-#         base.GradientTransformation(base.init_empty_state, update_fn), mask)
-#   return base.GradientTransformation(base.init_empty_state, update_fn)
 
 def adamw_elastic(
         learning_rate: base.ScalarOrSchedule,
@@ -203,6 +187,8 @@ class DetActor(nn.Module):
     layernorm: bool = False
     groupnorm: bool = False
     featurenorm: bool = False
+    batchnorm: bool = False
+    spectralnorm: bool = False
     dropout_rate: float = 0.0
     n_hiddens: int = 3
 
@@ -220,6 +206,7 @@ class DetActor(nn.Module):
             nn.LayerNorm() if self.layernorm else identity,
             nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
             nn.GroupNorm() if self.groupnorm else identity,
+            nn.BatchNorm(use_running_average=not train) if self.batchnorm else identity,
             nn.Dropout(rate=self.dropout_rate, deterministic=not train),
         ]
         for _ in range(self.n_hiddens - 2):
@@ -233,18 +220,24 @@ class DetActor(nn.Module):
                 nn.LayerNorm() if self.layernorm else identity,
                 nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
                 nn.GroupNorm() if self.groupnorm else identity,
+                nn.BatchNorm(use_running_average=not train) if self.batchnorm else identity,
                 nn.Dropout(rate=self.dropout_rate, deterministic=not train),
             ]
-        layers += [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(h_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-        ]
+
 
         net = nn.Sequential(layers)
-        trunk = net(state)
+
+        trunk = nn.Dense(
+            self.hidden_dim,
+            kernel_init=pytorch_init(h_d),
+            bias_init=nn.initializers.constant(0.1),
+        )(net(state)) if not self.spectralnorm else nn.SpectralNorm(nn.Dense(
+            self.hidden_dim,
+            kernel_init=pytorch_init(h_d),
+            bias_init=nn.initializers.constant(0.1),
+        ))(net(state), update_stats=train)
+
+        # trunk = net(state)
 
         last_layer = nn.Sequential(
             [
@@ -252,6 +245,7 @@ class DetActor(nn.Module):
                 nn.LayerNorm() if self.layernorm else identity,
                 nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
                 nn.GroupNorm() if self.groupnorm else identity,
+                nn.BatchNorm(use_running_average=not train) if self.batchnorm else identity,
                 nn.Dropout(rate=self.dropout_rate, deterministic=not train),
                 nn.Dense(
                     self.action_dim,
@@ -677,6 +671,7 @@ def wrap_env(
 def evaluate(
         env: gym.Env,
         params: jax.Array,
+        batch_stats: jax.Array,
         expert_params: jax.Array,
         action_fn: Callable,
         expert_action_fn: Callable,
@@ -697,7 +692,9 @@ def evaluate(
         total_reward = 0.0
         while not done:
             eval_states.append(obs)
-            action = np.asarray(jax.device_get(action_fn(params, obs)))
+            action = np.asarray(jax.device_get(
+                action_fn({"params": params, "batch_stats": batch_stats}, obs)
+            ))
             eval_actions.append(action)
             expert_action = np.asarray(jax.device_get(expert_action_fn(expert_params, obs)))
             expert_mses.append(((action - expert_action) ** 2))
@@ -720,6 +717,8 @@ class CriticTrainState(TrainState):
 class ActorTrainState(TrainState):
     target_params: FrozenDict
     dropout_key: jax.Array
+    batch_stats: Any
+    target_batch_stats: Any
 
 
 def compute_dead_neurons_statistic(logits: jax.Array):
@@ -783,7 +782,11 @@ def update_actor(
     b_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
 
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
-        actions, preact = actor.apply_fn(params, batch["states"] + in_noise, True, rngs={'dropout': dropout_key})
+        (actions, preact), updates = actor.apply_fn(
+            {'params': params, 'batch_stats': actor.batch_stats},
+            batch["states"] + in_noise, True, rngs={'dropout': dropout_key},
+            mutable=['batch_stats'],
+        )
         bc_penalty = ((actions - batch["actions"] + b_noise) ** 2).sum(-1)
 
         logits = critic.apply_fn(critic.params, batch["states"], actions)
@@ -810,9 +813,9 @@ def update_actor(
                 "action_mse": ((actions - batch["actions"]) ** 2).mean(),
             }
         )
-        return loss, new_metrics
+        return loss, (updates, new_metrics)
 
-    grads, new_metrics = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+    grads, (updates, new_metrics) = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
 
     def add_gaussian_noise(gr, noise_std, rng_key):
         def add_noise_to_grad(g, rng_key):
@@ -827,10 +830,15 @@ def update_actor(
         return noisy_grads
 
     grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
+    # print(grads, flush=True)
     new_actor = actor.apply_gradients(grads=grads)
 
     new_actor = new_actor.replace(
+        batch_stats=updates['batch_stats'],
+    )
+    new_actor = new_actor.replace(
         target_params=optax.incremental_update(actor.params, actor.target_params, tau),
+        target_batch_stats=optax.incremental_update(actor.batch_stats, actor.target_batch_stats, tau),
         dropout_key=new_dropout_key,
     )
     new_critic = critic.replace(
@@ -862,7 +870,13 @@ def update_critic(
 ) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
     key, actions_key = jax.random.split(key)
 
-    next_actions, preact = actor.apply_fn(actor.target_params, batch["next_states"], False)
+    next_actions, preact = actor.apply_fn(
+        {
+            'params': actor.target_params,
+            'batch_stats': actor.target_batch_stats,
+        },
+        batch["next_states"], False
+    )
     noise = jax.numpy.clip(
         (jax.random.normal(actions_key, next_actions.shape) * policy_noise),
         -noise_clip,
@@ -990,7 +1004,13 @@ def update_refinement(
 def action_fn(actor: TrainState) -> Callable:
     @jax.jit
     def _action_fn(obs: jax.Array) -> jax.Array:
-        action = actor.apply_fn(actor.params, obs, False)[0]
+        action = actor.apply_fn(
+            {
+                "params": actor.params,
+                "batch_stats": actor.batch_stats,
+            },
+            obs, False
+        )[0]
         return action
 
     return _action_fn
@@ -1008,7 +1028,10 @@ def eval_actor(
     metrics = {}
 
     def actor_loss_fn(params: jax.Array) -> jax.Array:
-        actions, preact = actor.apply_fn(params, batch["states"], False)
+        actions, preact = actor.apply_fn({
+                "params": actor.params,
+                "batch_stats": actor.batch_stats,
+            }, batch["states"], False)
 
         bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
 
@@ -1071,6 +1094,8 @@ def train(config: Config):
             layernorm=config.actor_ln,
             featurenorm=config.actor_fn,
             groupnorm=config.actor_gn,
+            batchnorm=config.actor_bn,
+            spectralnorm=config.actor_sn,
             dropout_rate=config.actor_dropout,
             n_hiddens=config.actor_n_hiddens,
         )
@@ -1081,6 +1106,7 @@ def train(config: Config):
             layernorm=False,
             featurenorm=False,
             groupnorm=False,
+            spectralnorm=False,
             dropout_rate=0.0,
             n_hiddens=config.actor_n_hiddens,
         )
@@ -1099,6 +1125,7 @@ def train(config: Config):
         layernorm=False,
         featurenorm=False,
         groupnorm=False,
+        spectralnorm=False,
         dropout_rate=0.0,
         n_hiddens=config.actor_n_hiddens,
     )
@@ -1118,10 +1145,13 @@ def train(config: Config):
     else:
         optimizer = adamw_elastic(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
 
+    init_vars = actor_module.init(actor_key, init_state, False)
     actor = ActorTrainState.create(
         apply_fn=actor_module.apply,
-        params=actor_module.init(actor_key, init_state, False),
-        target_params=actor_module.init(actor_key, init_state, False),
+        params=init_vars['params'],
+        batch_stats=init_vars['batch_stats'] if 'batch_stats' in init_vars else {},
+        target_params=init_vars['params'],
+        target_batch_stats=init_vars['batch_stats'] if 'batch_stats' in init_vars else {},
         dropout_key=dropout_key,
         tx=optimizer,
     )
@@ -1130,6 +1160,8 @@ def train(config: Config):
         apply_fn=expert_module.apply,
         params=expert_module.init(actor_key, init_state, False),
         target_params=expert_module.init(actor_key, init_state, False),
+        batch_stats={},
+        target_batch_stats={},
         dropout_key=dropout_key,
         tx=optax.adam(learning_rate=config.actor_learning_rate),
     )
@@ -1327,6 +1359,7 @@ def train(config: Config):
             eval_returns, expert_mse, eval_batch = evaluate(
                 eval_env,
                 update_carry["actor"].params,
+                update_carry["actor"].batch_stats,
                 expert_actor.params,
                 actor_action_fn,
                 expert_action_fn,
