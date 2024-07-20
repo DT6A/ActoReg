@@ -8,6 +8,7 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import math
 import uuid
+import random
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from functools import partial
@@ -92,6 +93,10 @@ class Config:
     v_max: float = float('inf')
     v_expand: float = 0.0
     v_expand_mode: str = "both"
+
+    # validation data config
+    det_validation: bool = True
+    validation_frac: float = 0.05
 
     mlc_job_name: str = None
 
@@ -358,6 +363,7 @@ def qlearning_dataset(
         terminate_on_end: bool = False,
         validation_frac: float = 0.05,
         discount=0.99,
+        det_validation=True,
         **kwargs,
 ) -> Tuple[Dict, Dict, float, float]:
     if dataset is None:
@@ -440,24 +446,66 @@ def qlearning_dataset(
 
     cls_rewards = np.array(mc_returns_)
 
-    print("Last train idx:", last_train_ep_idx, "out of", len(obs_))
+    # episode_ends.append(len(obs_))
+    episode_ends = [-1] + episode_ends
+    intervals = [(episode_ends[i]+1, episode_ends[i + 1]+1) for i in range(len(episode_ends) - 1)]
+
+    if not det_validation:
+        random.shuffle(intervals)
+    # print(intervals)
+    train_intervals = intervals[:cnt_train_episodes]
+    val_intervals = intervals[cnt_train_episodes:]
+
+    t_obs = []
+    t_action = []
+    t_next_obs = []
+    t_next_action = []
+    t_reward = []
+    t_done = []
+
+    v_obs = []
+    v_action = []
+    v_next_obs = []
+    v_next_action = []
+    v_reward = []
+    v_done = []
+
+    for inter in train_intervals:
+        t_obs += obs_[inter[0]:inter[1]]
+        t_action += action_[inter[0]:inter[1]]
+        t_next_obs += next_obs_[inter[0]:inter[1]]
+        t_next_action += next_action_[inter[0]:inter[1]]
+        t_reward += reward_[inter[0]:inter[1]]
+        t_done += done_[inter[0]:inter[1]]
+
+    for inter in val_intervals:
+        v_obs += obs_[inter[0]:inter[1]]
+        v_action += action_[inter[0]:inter[1]]
+        v_next_obs += next_obs_[inter[0]:inter[1]]
+        v_next_action += next_action_[inter[0]:inter[1]]
+        v_reward += reward_[inter[0]:inter[1]]
+        v_done += done_[inter[0]:inter[1]]
+
+    # print("Last train idx:", last_train_ep_idx, "out of", len(obs_))
     train_data = {
-        "observations": np.array(obs_)[:last_train_ep_idx],
-        "actions": np.array(action_)[:last_train_ep_idx],
-        "next_observations": np.array(next_obs_)[:last_train_ep_idx],
-        "next_actions": np.array(next_action_)[:last_train_ep_idx],
-        "rewards": np.array(reward_)[:last_train_ep_idx],
-        "terminals": np.array(done_)[:last_train_ep_idx],
+        "observations": np.array(t_obs),
+        "actions": np.array(t_action),
+        "next_observations": np.array(t_next_obs),
+        "next_actions": np.array(t_next_action),
+        "rewards": np.array(t_reward),
+        "terminals": np.array(t_done),
     }
 
     val_data = {
-        "observations": np.array(obs_)[last_train_ep_idx:],
-        "actions": np.array(action_)[last_train_ep_idx:],
-        "next_observations": np.array(next_obs_)[last_train_ep_idx:],
-        "next_actions": np.array(next_action_)[last_train_ep_idx:],
-        "rewards": np.array(reward_)[last_train_ep_idx:],
-        "terminals": np.array(done_)[last_train_ep_idx:],
+        "observations": np.array(v_obs),
+        "actions": np.array(v_action),
+        "next_observations": np.array(v_next_obs),
+        "next_actions": np.array(v_next_action),
+        "rewards": np.array(v_reward),
+        "terminals": np.array(v_done),
     }
+    print("Trains obs size:", len(train_data['observations']), "Val obs size:", len(val_data['observations']),)
+
     return train_data, val_data, jnp.min(cls_rewards), jnp.max(cls_rewards)
 
 
@@ -486,9 +534,11 @@ class ReplayBuffer:
             dataset_name: str,
             normalize_reward: bool = False,
             is_normalize: bool = False,
-            discount: float = 0.99
+            discount: float = 0.99,
+            validation_frac: float = 0.05,
+            det_validation: bool = True,
     ):
-        d4rl_data, val_data, self.min, self.max = qlearning_dataset(gym.make(dataset_name), dataset_name, discount=discount)
+        d4rl_data, val_data, self.min, self.max = qlearning_dataset(gym.make(dataset_name), dataset_name, discount=discount, validation_frac=validation_frac, det_validation=det_validation)
         print("Min/Max", self.min, self.max)
 
         state_min = np.min(d4rl_data["observations"], axis=0)
@@ -1076,9 +1126,10 @@ def train(config: Config):
     wandb.mark_preempting()
     buffer = ReplayBuffer()
     buffer.create_from_d4rl(
-        config.dataset_name, config.normalize_reward, config.normalize_states, discount=config.gamma
+        config.dataset_name, config.normalize_reward, config.normalize_states, discount=config.gamma,
+        validation_frac=config.validation_frac, det_validation=config.det_validation,
     )
-
+    random.seed(config.train_seed)
     key = jax.random.PRNGKey(seed=config.train_seed)
     key, actor_key, critic_key, dropout_key = jax.random.split(key, 4)
 
