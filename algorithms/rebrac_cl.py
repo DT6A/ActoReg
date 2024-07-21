@@ -97,6 +97,7 @@ class Config:
     # validation data config
     det_validation: bool = True
     validation_frac: float = 0.05
+    track_val_stats: bool = True
 
     mlc_job_name: str = None
 
@@ -1427,30 +1428,31 @@ def train(config: Config):
                 "eval_metrics/expert_mse": expert_mse,
             }
 
-            new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
-                                              buffer.val_data, config.actor_bc_coef, config.normalize_q)
-            new_key, train_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
-                                                buffer.sample_n_first(buffer.val_data["states"].shape[0]),
-                                                config.actor_bc_coef, config.normalize_q)
-            new_key, eval_metrics_1 = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
-                                                 eval_batch,
-                                                 config.actor_bc_coef, config.normalize_q)
-            new_key, rand_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
-                                               buffer.sample_random(buffer.val_data["states"].shape[0]),
-                                               config.actor_bc_coef, config.normalize_q)
-            buffer.sample_random(buffer.val_data["states"].shape[0])
-            del eval_metrics_1["action_mse"]
+            if config.track_val_stats:
+                new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
+                                                  buffer.val_data, config.actor_bc_coef, config.normalize_q)
+                new_key, train_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
+                                                    buffer.sample_n_first(buffer.val_data["states"].shape[0]),
+                                                    config.actor_bc_coef, config.normalize_q)
+                new_key, eval_metrics_1 = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
+                                                     eval_batch,
+                                                     config.actor_bc_coef, config.normalize_q)
+                new_key, rand_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
+                                                   buffer.sample_random(buffer.val_data["states"].shape[0]),
+                                                   config.actor_bc_coef, config.normalize_q)
+                buffer.sample_random(buffer.val_data["states"].shape[0])
+                del eval_metrics_1["action_mse"]
 
-            for k in train_metrics:
-                eval_metrics[f"train_metrics/{k}"] = train_metrics[k]
-            for k in val_metrics:
-                eval_metrics[f"validation_metrics/{k}"] = val_metrics[k]
-            for k in eval_metrics_1:
-                eval_metrics[f"eval_metrics/{k}"] = eval_metrics_1[k]
-            for k in rand_metrics:
-                eval_metrics[f"rand_metrics/{k}"] = rand_metrics[k]
+                for k in train_metrics:
+                    eval_metrics[f"train_metrics/{k}"] = train_metrics[k]
+                for k in val_metrics:
+                    eval_metrics[f"validation_metrics/{k}"] = val_metrics[k]
+                for k in eval_metrics_1:
+                    eval_metrics[f"eval_metrics/{k}"] = eval_metrics_1[k]
+                for k in rand_metrics:
+                    eval_metrics[f"rand_metrics/{k}"] = rand_metrics[k]
 
-            update_carry["key"] = new_key
+                update_carry["key"] = new_key
 
             wandb.log(
                 eval_metrics
