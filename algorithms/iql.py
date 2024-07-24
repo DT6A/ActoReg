@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from optax._src import base, combine, transform
 import distrax
 import pyrallis
 import wandb
@@ -34,15 +35,23 @@ tfb = tfp.bijectors
 @dataclass
 class Config:
     # wandb params
-    project: str = "ClORL"
+    project: str = "ActReg"
     group: str = "iql"
     name: str = "iql"
     
     # model params
     actor_hidden_dims: List[int] = field(default_factory=lambda: [256, 256])
     actor_learning_rate: float = 3e-4
+    actor_ln: bool = False
+    actor_fn: bool = False
+    actor_gn: bool = False
     state_dependent_std: bool = True
-    dropout_rate: Optional[float] = None
+    actor_dropout: Optional[float] = None
+    actor_wd: float = 0.0
+    l1_ratio: float = 0.0
+    actor_input_noise: float = 0.0
+    actor_bc_noise: float = 0.0
+    actor_grad_noise: float = 0.0
     log_std_scale: float = 1.0
     log_std_min: float = -10.0
     log_std_max: float = 2.0
@@ -73,12 +82,13 @@ class Config:
     # general params
     train_seed: int = 0
     eval_seed: int = 42
-    
-    # classification
-    # n_classes: int = 101
-    # sigma_frac: float = 0.75
-    # v_min: float = float('inf')
-    # v_max: float = float('inf')
+
+    # validation data config
+    det_validation: bool = True
+    validation_frac: float = 0.05
+    track_val_stats: bool = True
+
+    mlc_job_name: str = None
 
     _wandb: Dict = field(default_factory=lambda: {})
 
@@ -88,6 +98,65 @@ class Config:
 
 def default_init(scale: Optional[float] = jnp.sqrt(2)):
     return nn.initializers.orthogonal(scale)
+
+
+def identity(x: Any) -> Any:
+    return x
+
+
+AddDecayedWeightsState = base.EmptyState
+
+
+def add_elastic_weights(
+    weight_decay: Union[float, jax.Array] = 0.0,
+    l1_ratio: float = 0.0,
+    mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None
+) -> base.GradientTransformation:
+  def init_fn(params):
+    del params
+    return AddDecayedWeightsState()
+
+  def update_fn(updates, state, params):
+    if params is None:
+      raise ValueError(base.NO_PARAMS_MSG)
+    updates = jax.tree_util.tree_map(
+        lambda g, p: g + weight_decay * ((1 - l1_ratio) * p + l1_ratio * jnp.sign(p)), updates, params)
+    return updates, state
+
+  # If mask is not `None`, apply mask to the gradient transformation.
+  # E.g. it is common to skip weight decay on bias units and batch stats.
+  if mask is not None:
+    return wrappers.masked(
+        base.GradientTransformation(init_fn, update_fn), mask)
+  return base.GradientTransformation(init_fn, update_fn)
+
+
+def adamw_elastic(
+        learning_rate: base.ScalarOrSchedule,
+        b1: float = 0.9,
+        b2: float = 0.999,
+        eps: float = 1e-8,
+        eps_root: float = 0.0,
+        mu_dtype: Optional[Any] = None,
+        weight_decay: float = 1e-4,
+        l1_ratio: float = 0.0,
+        mask: Optional[Union[Any, Callable[[base.Params], Any]]] = None,
+        *,
+        nesterov: bool = False,
+) -> base.GradientTransformation:
+
+    return combine.chain(
+        transform.scale_by_adam(
+            b1=b1,
+            b2=b2,
+            eps=eps,
+            eps_root=eps_root,
+            mu_dtype=mu_dtype,
+            nesterov=nesterov,
+        ),
+        add_elastic_weights(weight_decay, l1_ratio, mask),
+        transform.scale_by_learning_rate(learning_rate),
+    )
 
 
 def calc_return_to_go(is_sparse_reward, rewards, terminals, gamma):
@@ -118,31 +187,6 @@ def calc_return_to_go(is_sparse_reward, rewards, terminals, gamma):
     return return_to_go
 
 
-def convert_to_classification(labels, num_bins=10):
-    labels = np.array(labels)
-    # Determine bin edges to evenly divide the range of labels
-    bin_edges = np.linspace(labels.min(), labels.max(), num_bins + 1)
-
-    # Use numpy.digitize to assign each label to a bin
-    bins = np.digitize(labels, bin_edges)
-
-    return bins
-
-
-def convert_to_classification_equal_samples(labels, num_bins=10):
-    labels = np.array(labels)
-    # Determine the percentiles to evenly divide the data into bins
-    percentiles = np.linspace(0, 100, num_bins + 1)
-
-    # Compute the bin edges based on the percentiles
-    bin_edges = np.percentile(labels, percentiles)
-
-    # Use numpy.digitize to assign each label to a bin
-    bins = np.digitize(labels, bin_edges)
-
-    return bins
-
-
 def return_reward_range(dataset, max_episode_steps):
     returns, lengths = [], []
     ep_ret, ep_len = 0.0, 0
@@ -165,35 +209,26 @@ def modify_reward(dataset, env_name, min_ret, max_ret, max_episode_steps=1000):
         dataset["rewards"] = dataset["rewards"] * 100.0
 
 
-def qlearning_dataset(env, dataset_name, normalize_reward=False, dataset=None, terminate_on_end=False, discount=0.99,
-                       **kwargs):
-    """
-    Returns datasets formatted for use by standard Q-learning algorithms,
-    with observations, actions, next_observations, next_actins, rewards,
-     and a terminal flag.
-    Args:
-       env: An OfflineEnv object.
-        dataset: An optional dataset to pass in for processing. If None,
-            the dataset will default to env.get_dataset()
-        terminate_on_end (bool): Set done=True on the last timestep
-            in a trajectory. Default is False, and will discard the
-            last timestep in each trajectory.
-        **kwargs: Arguments to pass to env.get_dataset().
-    Returns:
-        A dictionary containing keys:
-            observations: An N x dim_obs array of observations.
-            actions: An N x dim_action array of actions.
-            next_observations: An N x dim_obs array of next observations.
-            next_actions: An N x dim_action array of next actions.
-            rewards: An N-dim float array of rewards.
-            terminals: An N-dim boolean array of "done" or episode termination flags.
-    """
+def qlearning_dataset(
+        env: gym.Env,
+        dataset_name: Dict = None,
+        normalize_reward=False,
+        dataset=None,
+        terminate_on_end: bool = False,
+        validation_frac: float = 0.05,
+        discount=0.99,
+        det_validation=True,
+        **kwargs,
+) -> Tuple[Dict, Dict, float, float]:
     if dataset is None:
         dataset = env.get_dataset(**kwargs)
+
     if normalize_reward:
         dataset['rewards'] = ReplayBuffer.normalize_reward(dataset_name, dataset['rewards'])
-    N = dataset['rewards'].shape[0]
+
+    N = dataset["rewards"].shape[0]
     is_sparse = "antmaze" in dataset_name
+
     obs_ = []
     next_obs_ = []
     action_ = []
@@ -201,40 +236,41 @@ def qlearning_dataset(env, dataset_name, normalize_reward=False, dataset=None, t
     reward_ = []
     done_ = []
     mc_returns_ = []
-    print("SIZE", N)
+
     # The newer version of the dataset adds an explicit
     # timeouts field. Keep old method for backwards compatability.
-    use_timeouts = 'timeouts' in dataset
+    use_timeouts = "timeouts" in dataset
 
     episode_step = 0
+    episode_ends = []
     episode_rewards = []
     episode_terminals = []
+
     for i in range(N - 1):
         if episode_step == 0:
             episode_rewards = []
             episode_terminals = []
 
-        obs = dataset['observations'][i].astype(np.float32)
-        new_obs = dataset['observations'][i + 1].astype(np.float32)
-        action = dataset['actions'][i].astype(np.float32)
-        new_action = dataset['actions'][i + 1].astype(np.float32)
-        reward = dataset['rewards'][i].astype(np.float32)
-        done_bool = bool(dataset['terminals'][i])
+        obs = dataset["observations"][i].astype(np.float32)
+        new_obs = dataset["observations"][i + 1].astype(np.float32)
+        action = dataset["actions"][i].astype(np.float32)
+        new_action = dataset["actions"][i + 1].astype(np.float32)
+        reward = dataset["rewards"][i].astype(np.float32)
+        done_bool = bool(dataset["terminals"][i])
 
         if use_timeouts:
-            final_timestep = dataset['timeouts'][i]
+            final_timestep = dataset["timeouts"][i]
         else:
-            final_timestep = (episode_step == env._max_episode_steps - 1)
+            final_timestep = episode_step == env._max_episode_steps - 1
         if (not terminate_on_end) and final_timestep:
-            # Skip this transition and don't apply terminals on the last step of an episode
-            episode_step = 0
+            # Skip this transition
             mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
-            # print(len(mc_returns_), len(episode_rewards), end=";")
+            episode_step = 0
+            episode_ends.append(i)
             continue
         if done_bool or final_timestep:
             episode_step = 0
-            # mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
-            # print(i, len(mc_returns_), len(episode_rewards))
+            episode_ends.append(i)
 
         episode_rewards.append(reward)
         episode_terminals.append(done_bool)
@@ -246,27 +282,85 @@ def qlearning_dataset(env, dataset_name, normalize_reward=False, dataset=None, t
         reward_.append(reward)
         done_.append(done_bool)
         episode_step += 1
+
     if episode_step != 0:
         mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
+
     print("SHAPE", np.array(mc_returns_).shape, np.array(reward_).shape, np.array(done_).shape)
     assert np.array(mc_returns_).shape == np.array(reward_).shape
-    print(np.array(action_).max(), np.array(action_).min())
+
+    cnt_episodes = len(episode_ends)
+    cnt_train_episodes = int(cnt_episodes * (1 - validation_frac))
+
+    print("TOTAL NUMBER OF EPISODES:", cnt_episodes)
+    print("TRAIN EPISODES:", cnt_train_episodes)
+    print("VAL EPISODES:", cnt_episodes - cnt_train_episodes)
+
+    # last_train_ep_idx = episode_ends[cnt_train_episodes]
 
     cls_rewards = np.array(mc_returns_)
-    # to_probs, from_probs = hl_gauss_transform(jnp.min(cls_rewards), jnp.max(cls_rewards), num_bins=n_classes,
-    #                                           sigma=sigma)
-    # to_probs = jax.vmap(to_probs)
-    # from_probs = jax.vmap(from_probs)
 
-    return {
-        'observations': np.array(obs_),
-        'actions': np.array(action_),
-        'next_observations': np.array(next_obs_),
-        'next_actions': np.array(next_action_),
-        'rewards': np.array(reward_),
-        'terminals': np.array(done_),
-        'mc_returns': np.array(mc_returns_),
-    }, jnp.min(cls_rewards), jnp.max(cls_rewards)
+    # episode_ends.append(len(obs_))
+    episode_ends = [-1] + episode_ends
+    intervals = [(episode_ends[i]+1, episode_ends[i + 1]+1) for i in range(len(episode_ends) - 1)]
+
+    if not det_validation:
+        random.shuffle(intervals)
+    # print(intervals)
+    train_intervals = intervals[:cnt_train_episodes]
+    val_intervals = intervals[cnt_train_episodes:]
+
+    t_obs = []
+    t_action = []
+    t_next_obs = []
+    t_next_action = []
+    t_reward = []
+    t_done = []
+
+    v_obs = []
+    v_action = []
+    v_next_obs = []
+    v_next_action = []
+    v_reward = []
+    v_done = []
+
+    for inter in train_intervals:
+        t_obs += obs_[inter[0]:inter[1]]
+        t_action += action_[inter[0]:inter[1]]
+        t_next_obs += next_obs_[inter[0]:inter[1]]
+        t_next_action += next_action_[inter[0]:inter[1]]
+        t_reward += reward_[inter[0]:inter[1]]
+        t_done += done_[inter[0]:inter[1]]
+
+    for inter in val_intervals:
+        v_obs += obs_[inter[0]:inter[1]]
+        v_action += action_[inter[0]:inter[1]]
+        v_next_obs += next_obs_[inter[0]:inter[1]]
+        v_next_action += next_action_[inter[0]:inter[1]]
+        v_reward += reward_[inter[0]:inter[1]]
+        v_done += done_[inter[0]:inter[1]]
+
+    # print("Last train idx:", last_train_ep_idx, "out of", len(obs_))
+    train_data = {
+        "observations": np.array(t_obs),
+        "actions": np.array(t_action),
+        "next_observations": np.array(t_next_obs),
+        "next_actions": np.array(t_next_action),
+        "rewards": np.array(t_reward),
+        "terminals": np.array(t_done),
+    }
+
+    val_data = {
+        "observations": np.array(v_obs),
+        "actions": np.array(v_action),
+        "next_observations": np.array(v_next_obs),
+        "next_actions": np.array(v_next_action),
+        "rewards": np.array(v_reward),
+        "terminals": np.array(v_done),
+    }
+    print("Trains obs size:", len(train_data['observations']), "Val obs size:", len(val_data['observations']),)
+
+    return train_data, val_data, jnp.min(cls_rewards), jnp.max(cls_rewards)
 
 
 def compute_mean_std(states: jax.Array, eps: float) -> Tuple[jax.Array, jax.Array]:
@@ -274,12 +368,16 @@ def compute_mean_std(states: jax.Array, eps: float) -> Tuple[jax.Array, jax.Arra
     std = states.std(0) + eps
     return mean, std
 
+
 def normalize_states(states: jax.Array, mean: jax.Array, std: jax.Array) -> jax.Array:
     return (states - mean) / std
+
 
 @chex.dataclass
 class ReplayBuffer:
     data: Dict[str, jax.Array] = None
+    val_data: Dict[str, jax.Array] = None
+    random_data: Dict[str, jax.Array] = None
     mean: float = 0
     std: float = 1
     min: float = 0
@@ -290,9 +388,16 @@ class ReplayBuffer:
             dataset_name: str,
             normalize_reward: bool = False,
             is_normalize: bool = False,
+            discount: float = 0.99,
+            validation_frac: float = 0.05,
+            det_validation: bool = True,
     ):
-        d4rl_data, self.min, self.max = qlearning_dataset(gym.make(dataset_name), dataset_name)
+        d4rl_data, val_data, self.min, self.max = qlearning_dataset(gym.make(dataset_name), dataset_name, discount=discount, validation_frac=validation_frac, det_validation=det_validation)
         print("Min/Max", self.min, self.max)
+
+        state_min = np.min(d4rl_data["observations"], axis=0)
+        state_max = np.max(d4rl_data["observations"], axis=0)
+
         buffer = {
             "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
             "actions": jnp.asarray(d4rl_data["actions"], dtype=jnp.float32),
@@ -302,18 +407,47 @@ class ReplayBuffer:
             ),
             "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
             "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
-            "mc_returns": jnp.asarray(d4rl_data["mc_returns"], dtype=jnp.float32),
         }
+        val_buffer = {
+            "states": jnp.asarray(val_data["observations"], dtype=jnp.float32),
+            "actions": jnp.asarray(val_data["actions"], dtype=jnp.float32),
+            "rewards": jnp.asarray(val_data["rewards"], dtype=jnp.float32),
+            "next_states": jnp.asarray(
+                val_data["next_observations"], dtype=jnp.float32
+            ),
+            "next_actions": jnp.asarray(val_data["next_actions"], dtype=jnp.float32),
+            "dones": jnp.asarray(val_data["terminals"], dtype=jnp.float32),
+        }
+
+        random_buffer = {
+            "states": jnp.asarray(np.random.uniform(0, 1, (max(1, val_data["observations"].shape[0]), state_max.shape[0])) * (
+                        state_max - state_min) + state_min, dtype=jnp.float32),
+            "actions": jnp.asarray(
+                np.random.uniform(-1, 1, (max(1, val_data["observations"].shape[0]), d4rl_data["actions"].shape[1])),
+                dtype=jnp.float32),
+        }
+
         if is_normalize:
             self.mean, self.std = compute_mean_std(buffer["states"], eps=1e-3)
             buffer["states"] = normalize_states(buffer["states"], self.mean, self.std)
             buffer["next_states"] = normalize_states(
                 buffer["next_states"], self.mean, self.std
             )
+            val_buffer["states"] = normalize_states(val_buffer["states"], self.mean, self.std)
+            val_buffer["next_states"] = normalize_states(
+                val_buffer["next_states"], self.mean, self.std
+            )
+            random_buffer["states"] = normalize_states(random_buffer["states"], self.mean, self.std)
         if normalize_reward:
-            modify_reward(buffer, dataset_name, self.min, self.max)
-
+            buffer["rewards"] = ReplayBuffer.normalize_reward(
+                dataset_name, buffer["rewards"]
+            )
+            val_buffer["rewards"] = ReplayBuffer.normalize_reward(
+                dataset_name, val_buffer["rewards"]
+            )
         self.data = buffer
+        self.val_data = val_buffer
+        self.random_data = random_buffer
 
     @property
     def size(self) -> int:
@@ -326,13 +460,36 @@ class ReplayBuffer:
         indices = jax.random.randint(
             key, shape=(batch_size,), minval=0, maxval=self.size
         )
-        batch = jax.tree.map(lambda arr: arr[indices], self.data)
+        batch = jax.tree_map(lambda arr: arr[indices], self.data)
+        return batch
+
+    def sample_n_first(
+            self, batch_size: int
+    ) -> Dict[str, jax.Array]:
+        indices = jnp.arange(0, batch_size)
+        batch = jax.tree_map(lambda arr: arr[indices], self.data)
+        return batch
+
+    def sample_random(
+            self, batch_size: int
+    ) -> Dict[str, jax.Array]:
+        indices = jnp.arange(0, batch_size)
+        batch = jax.tree_map(lambda arr: arr[indices], self.random_data)
         return batch
 
     def get_moments(self, modality: str) -> Tuple[jax.Array, jax.Array]:
         mean = self.data[modality].mean(0)
         std = self.data[modality].std(0)
         return mean, std
+
+    @staticmethod
+    def normalize_reward(dataset_name: str, rewards: jax.Array) -> jax.Array:
+        if "antmaze" in dataset_name:
+            return rewards * 100.0  # like in LAPO
+        else:
+            raise NotImplementedError(
+                "Reward normalization is implemented only for AntMaze yet!"
+            )
 
 
 @chex.dataclass(frozen=True)
@@ -361,27 +518,6 @@ def normalize(
     arr: jax.Array, mean: jax.Array, std: jax.Array, eps: float = 1e-8
 ) -> jax.Array:
     return (arr - mean) / (std + eps)
-
-
-# @jax.jit
-def transform_to_probs(target: jax.Array, support: jax.Array, sigma: float) -> jax.Array:
-    cdf_evals = jax.scipy.special.erf((support - target) / (jnp.sqrt(2) * sigma))
-    z = cdf_evals[-1] - cdf_evals[0]
-    bin_probs = cdf_evals[1:] - cdf_evals[:-1]
-    return bin_probs / z
-
-
-transform_to_probs = jax.vmap(transform_to_probs, in_axes=(0, None, None))
-
-
-# @jax.jit
-def transform_from_probs(probs: jax.Array, support: jax.Array) -> jax.Array:
-    centers = (support[:-1] + support[1:]) / 2
-    return jnp.sum(probs * centers)
-
-
-transform_from_probs = jax.vmap(transform_from_probs, in_axes=(0, None))
-transform_from_probs = jax.vmap(transform_from_probs, in_axes=(0, None))
 
 
 def make_env(env_name: str, seed: int) -> gym.Env:
@@ -432,6 +568,9 @@ class NormalTanhPolicy(nn.Module):
     action_dim: int
     state_dependent_std: bool = True
     dropout_rate: Optional[float] = None
+    layernorm: bool = False
+    groupnorm: bool = False
+    featurenorm: bool = False
     log_std_scale: float = 1.0
     log_std_min: Optional[float] = None
     log_std_max: Optional[float] = None
@@ -439,7 +578,10 @@ class NormalTanhPolicy(nn.Module):
 
     @nn.compact
     def __call__(self, states: jnp.ndarray, temperature: float = 1.0, training: bool = False) -> tfd.Distribution:
-        outputs = MLP(self.hidden_dims, activate_final=True,
+        outputs, trunk = MLP(self.hidden_dims, activate_final=True,
+                      layernorm=self.layernorm,
+                      featurenorm=self.featurenorm,
+                      groupnorm=self.groupnorm,
                       dropout_rate=self.dropout_rate)(states,
                                                       training=training)
 
@@ -466,9 +608,9 @@ class NormalTanhPolicy(nn.Module):
                                                temperature)
         if self.tanh_squash_distribution:
             return tfd.TransformedDistribution(distribution=base_dist,
-                                               bijector=tfb.Tanh())
+                                               bijector=tfb.Tanh()), trunk
         else:
-            return base_dist
+            return base_dist, trunk
 
         #if self.tanh_squash_distribution:
         #    return TanhNormal(loc=means, scale=jnp.exp(log_stds) * temperature)
@@ -481,9 +623,9 @@ def _sample_actions(key: jax.random.PRNGKey,
                     actor_params: TrainState,
                     states: np.ndarray,
                     temperature: float = 1.0) -> Tuple[jax.random.PRNGKey, jnp.ndarray]:
-    dist = apply_fn(actor_params, states, temperature)
+    dist, trunk = apply_fn(actor_params, states, temperature)
     key, random_dist_key = jax.random.split(key)
-    return key, dist.sample(seed=random_dist_key)
+    return key, dist.sample(seed=random_dist_key),  trunk
 
 
 def sample_actions(key: jax.random.PRNGKey,
@@ -500,17 +642,25 @@ class MLP(nn.Module):
     activations: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
     activate_final: int = False
     dropout_rate: Optional[float] = None
+    layernorm: bool = False
+    groupnorm: bool = False
+    featurenorm: bool = False
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, training: bool = False) -> jnp.ndarray:
+        trunk = None
         for i, size in enumerate(self.hidden_dims):
             x = nn.Dense(size, kernel_init=default_init())(x)
+            trunk = x.copy()
             if i + 1 < len(self.hidden_dims) or self.activate_final:
                 x = self.activations(x)
+                x = nn.LayerNorm()(x) if self.layernorm else identity(x)
+                x = nn.LayerNorm(use_bias=False, use_scale=False)(x) if self.featurenorm else identity(x)
+                x = nn.GroupNorm()(x) if self.groupnorm else identity(x)
                 if self.dropout_rate is not None:
                     x = nn.Dropout(rate=self.dropout_rate)(
                         x, deterministic=not training)
-        return x
+        return x, trunk
 
 
 class ValueCritic(nn.Module):
@@ -520,7 +670,7 @@ class ValueCritic(nn.Module):
 
     @nn.compact
     def __call__(self, states: jnp.ndarray) -> jnp.ndarray:
-        critic = MLP((*self.hidden_dims, 1))(states)
+        critic, _ = MLP((*self.hidden_dims, 1))(states)
         return jnp.squeeze(critic, -1)
 
 
@@ -534,7 +684,7 @@ class Critic(nn.Module):
     def __call__(self, states: jnp.ndarray,
                  actions: jnp.ndarray) -> jnp.ndarray:
         inputs = jnp.concatenate([states, actions], -1)
-        critic = MLP((*self.hidden_dims, 1),
+        critic, _ = MLP((*self.hidden_dims, 1),
                      activations=self.activations)(inputs)
         return jnp.squeeze(critic, -1)
 
@@ -638,20 +788,27 @@ def update_actor(
     value: TrainState,
     batch: Dict[str, Any],
     temperature: float,
+    input_noise: float,
+    bc_noise: float,
+    grad_noise: float,
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
     # https://github.com/ikostrikov/implicit_q_learning/blob/09d700248117881a75cb21f0adb95c6c8a694cb2/actor.py#L9-L30
     
-    key, random_dropout_key = jax.random.split(key, 2)
+    key, random_dropout_key, input_noise_key, bc_noise_key, grad_noise_key = jax.random.split(key, 5)
+
+    in_noise = jax.random.normal(input_noise_key, batch["states"].shape) * input_noise
+    b_noise = jax.random.normal(bc_noise_key, (batch["actions"].shape[0],)) * bc_noise
+
     v = value.apply_fn(value.params, batch["states"])
 
     q1, q2 = critic.apply_fn(critic.target_params, batch["states"], batch["actions"])
     q = jnp.minimum(q1, q2)
-    exp_a = jnp.exp((q - v) * temperature)
+    exp_a = jnp.exp((q - v) * temperature + b_noise)
     exp_a = jnp.minimum(exp_a, 100.0)
 
     def actor_loss_fn(actor_params) -> Tuple[jnp.ndarray, Dict]:
-        dist = actor.apply_fn(actor_params, batch["states"], training=True, rngs={'dropout': random_dropout_key})
+        dist, preact = actor.apply_fn(actor_params, batch["states"] + in_noise, training=True, rngs={'dropout': random_dropout_key})
         log_probs = dist.log_prob(batch["actions"])
         actor_loss = -(exp_a * log_probs).mean()
 
@@ -662,6 +819,20 @@ def update_actor(
     )
 
     grads = jax.tree_util.tree_map(lambda x: jnp.nan_to_num(x), grads)
+
+    def add_gaussian_noise(gr, noise_std, rng_key):
+        def add_noise_to_grad(g, rng_key):
+            noise = jax.random.normal(rng_key, g.shape) * noise_std / ((1 + actor.step) ** 0.55)
+            return g + noise
+
+        leaves, tree = jax.tree_util.tree_flatten(gr)
+        rng_keys = jax.random.split(rng_key, num=len(leaves))
+        rng_keys = jax.tree_util.tree_unflatten(tree, rng_keys)
+
+        noisy_grads = jax.tree_util.tree_map(lambda g, k: add_noise_to_grad(g, k), gr, rng_keys)
+        return noisy_grads
+
+    grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
 
     new_actor = actor.apply_gradients(grads=grads)
     new_metrics = metrics.update(loss_metrics)
@@ -698,12 +869,16 @@ def update_iql(
     expectile: float,
     tau: float,
     temperature: float,
+    actor_input_noise: float,
+    actor_bc_noise: float,
+    actor_grad_noise: float,
 ) -> Tuple[jax.random.PRNGKey, TrainState, CriticTrainState, TrainState, Metrics]:
     # https://github.com/ikostrikov/implicit_q_learning/blob/09d700248117881a75cb21f0adb95c6c8a694cb2/learner.py#L26-L45
     
     key, new_value, new_metrics = update_v(key, critic, value, batch, expectile, metrics)
     
-    key, new_actor, new_metrics = update_actor(key, actor, critic, new_value, batch, temperature, new_metrics)
+    key, new_actor, new_metrics = update_actor(key, actor, critic, new_value, batch, temperature,
+                                               actor_input_noise, actor_bc_noise, actor_grad_noise, new_metrics)
 
     key, new_critic, new_metrics = update_q(key, critic, new_value, batch, gamma, new_metrics)
 
@@ -723,13 +898,91 @@ def evaluate(key: jax.random.PRNGKey, env: gym.Env, params: jax.Array, action_fn
         obs, done = env.reset(), False
         total_reward = 0.0
         while not done:
-            key, action = action_fn(key, params, obs)
+            key, action, trunk = action_fn(key, params, obs)
             action = np.asarray(jax.device_get(action))
             obs, reward, done, _ = env.step(action)
             total_reward += reward
         returns.append(total_reward)
     return np.array(returns)
 
+
+def compute_dead_neurons_statistic(logits: jax.Array):
+    positive_count = jnp.sum(logits > 0, axis=0)
+    dead_count = jnp.sum((positive_count == 0))
+    return dead_count / logits.shape[1]
+
+
+def compute_feature_norm(logits: jax.Array):
+    norms = jnp.linalg.norm(logits, axis=1)
+    means = jnp.mean(logits, axis=1)
+    stds = jnp.std(logits, axis=1)
+    return jnp.mean(norms), jnp.mean(means), jnp.mean(stds)
+
+
+def compute_feature_rank_pca(logits: jax.Array):
+    cutoff = 0.01
+    threshold = 1 - cutoff
+
+    svals = jnp.linalg.svd(logits, full_matrices=False, compute_uv=False)
+    sval_squares = svals ** 2
+    sval_squares_sum = jnp.sum(sval_squares)
+    cumsum_squares = jnp.cumsum(sval_squares)
+    threshold_crossed = cumsum_squares >= (threshold * sval_squares_sum)
+    approximate_ranks = (~threshold_crossed).sum() + 1
+
+    return approximate_ranks
+
+
+def compute_feature_statistics(logits: jax.Array):
+    dead_neurons_frac = compute_dead_neurons_statistic(logits)
+    feature_norms, feature_means, feature_stds = compute_feature_norm(logits)
+    pca_rank = compute_feature_rank_pca(logits)
+
+    return {
+        "dead_neurons_frac": dead_neurons_frac,
+        "feature_norms": feature_norms,
+        "feature_means": feature_means,
+        "feature_stds": feature_stds,
+        "pca_rank": pca_rank,
+    }
+
+
+def eval_actor(
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: CriticTrainState,
+        value: TrainState,
+        batch: Dict[str, Any],
+        temperature: float,
+) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
+    # https://github.com/ikostrikov/implicit_q_learning/blob/09d700248117881a75cb21f0adb95c6c8a694cb2/actor.py#L9-L30
+
+    key, random_dropout_key, input_noise_key, bc_noise_key, grad_noise_key = jax.random.split(key, 5)
+    metrics = {}
+
+    v = value.apply_fn(value.params, batch["states"])
+
+    q1, q2 = critic.apply_fn(critic.target_params, batch["states"], batch["actions"])
+    q = jnp.minimum(q1, q2)
+    exp_a = jnp.exp((q - v) * temperature)
+    exp_a = jnp.minimum(exp_a, 100.0)
+
+    def actor_loss_fn(actor_params) -> Tuple[jnp.ndarray, Dict]:
+        dist, preact = actor.apply_fn(actor_params, batch["states"], training=False,
+                              rngs={'dropout': random_dropout_key})
+        log_probs = dist.log_prob(batch["actions"])
+        actor_loss = -(exp_a * log_probs).mean()
+
+        metrics.update(
+            {
+                "actor_loss": actor_loss,
+            }
+        )
+        metrics.update(compute_feature_statistics(preact))
+
+    actor_loss_fn(actor.params)
+
+    return key, metrics
 
 @pyrallis.wrap()
 def train(config: Config):
@@ -745,7 +998,8 @@ def train(config: Config):
     wandb.mark_preempting()
     buffer = ReplayBuffer()
     buffer.create_from_d4rl(
-        config.dataset_name, config.normalize_reward, config.normalize_states
+        config.dataset_name, config.normalize_reward, config.normalize_states, discount=config.gamma,
+        validation_frac=config.validation_frac, det_validation=config.det_validation,
     )
 
     key = jax.random.PRNGKey(seed=config.train_seed)
@@ -760,7 +1014,10 @@ def train(config: Config):
         action_dim=init_action.shape[-1],
         hidden_dims=config.actor_hidden_dims,
         state_dependent_std=config.state_dependent_std,
-        dropout_rate=config.dropout_rate,
+        dropout_rate=config.actor_dropout,
+        layernorm=config.actor_ln,
+        featurenorm=config.actor_fn,
+        groupnorm=config.actor_gn,
         log_std_scale=config.log_std_scale,
         log_std_min=config.log_std_min,
         log_std_max=config.log_std_max,
@@ -768,10 +1025,15 @@ def train(config: Config):
     )
 
     if config.decay_schedule == "cosine":
-        schedule_fn = optax.cosine_decay_schedule(-config.actor_learning_rate, config.num_epochs * config.num_updates_on_epoch)
-        optimizer = optax.chain(optax.scale_by_adam(), optax.scale_by_schedule(schedule_fn))
+        schedule_fn = optax.cosine_decay_schedule(config.actor_learning_rate, config.num_epochs * config.num_updates_on_epoch)
+        optimizer = adamw_elastic(learning_rate=schedule_fn, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
     else:
-        optimizer = optax.adam(learning_rate=config.actor_learning_rate)
+        optimizer = adamw_elastic(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
+    # if config.decay_schedule == "cosine":
+    #     schedule_fn = optax.cosine_decay_schedule(-config.actor_learning_rate, config.num_epochs * config.num_updates_on_epoch)
+    #     optimizer = optax.chain(optax.scale_by_adam(), optax.scale_by_schedule(schedule_fn))
+    # else:
+    #     optimizer = optax.adam(learning_rate=config.actor_learning_rate)
 
     actor = TrainState.create(
         apply_fn=actor_module.apply,
@@ -788,21 +1050,13 @@ def train(config: Config):
 
     critic_module = DoubleCritic(
         hidden_dims=config.critic_hidden_dims,
-        activations = activations,
-        # n_classes=config.n_classes
+        activations=activations,
     )
 
-    # v_min, v_max = config.v_min, config.v_max
-    # if v_min == float('inf'):
-    #     v_min = buffer.min
-    # if v_max == float('inf'):
-    #     v_max = buffer.max
     critic = CriticTrainState.create(
         apply_fn=critic_module.apply,
         params=critic_module.init(critic_key, init_state, init_action),
         target_params=critic_module.init(critic_key, init_state, init_action),
-        # support=jnp.linspace(v_min, v_max, config.n_classes + 1, dtype=jnp.float32),
-        # sigma=config.sigma_frac * (v_max - v_min) / config.n_classes,
         tx=optax.adam(learning_rate=config.critic_learning_rate)
     )
 
@@ -816,7 +1070,10 @@ def train(config: Config):
     update_iql_partial = partial(
         update_iql,
         gamma=config.gamma, tau=config.tau,
-        expectile=config.expectile, temperature=config.temperature
+        expectile=config.expectile, temperature=config.temperature,
+        actor_input_noise=config.actor_input_noise,
+        actor_bc_noise=config.actor_bc_noise,
+        actor_grad_noise=config.actor_grad_noise,
     )
 
     def iql_loop_update_step(i: int, carry: TrainState):
@@ -859,8 +1116,8 @@ def train(config: Config):
 
     @jax.jit
     def actor_action_fn(key: jax.random.PRNGKey, params: jax.Array, obs: jax.Array):
-        key, actions = sample_actions(key, actor.apply_fn, params, obs, temperature=0.0)
-        return key, jnp.clip(actions, -1, 1)
+        key, actions, trunk = sample_actions(key, actor.apply_fn, params, obs, temperature=0.0)
+        return key, jnp.clip(actions, -1, 1), trunk
 
     for epoch in trange(config.num_epochs, desc="IQL Epochs"):
         # metrics for accumulation during epoch and logging to wandb
@@ -891,19 +1148,29 @@ def train(config: Config):
                 seed=config.eval_seed,
             )
             normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-            wandb.log({
+            eval_metrics = {
                 "epoch": epoch,
                 "eval/return_mean": np.mean(eval_returns),
                 "eval/return_std": np.std(eval_returns),
                 "eval/normalized_score_mean": np.mean(normalized_score),
                 "eval/normalized_score_std": np.std(normalized_score),
-            })
+            }
 
+            if config.track_val_stats:
+                new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
+                                                  update_carry["value"],
+                                                  buffer.val_data, config.temperature)
+                new_key, train_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
+                                                    update_carry["value"],
+                                                    buffer.sample_n_first(buffer.val_data["states"].shape[0]),
+                                                    config.temperature)
+                for k in train_metrics:
+                    eval_metrics[f"train_metrics/{k}"] = train_metrics[k]
+                for k in val_metrics:
+                    eval_metrics[f"validation_metrics/{k}"] = val_metrics[k]
+
+            wandb.log(eval_metrics)
 
 if __name__ == "__main__":
-    try:
-        train()
-    except Exception as e:
-        print("An exception occured")
-        print(e)
+    train()
 
