@@ -203,8 +203,6 @@ def return_reward_range(dataset, max_episode_steps):
 
 
 def modify_reward(dataset, env_name, min_ret, max_ret, max_episode_steps=1000):
-    # if any(s in env_name for s in ("halfcheetah", "hopper", "walker2d")):
-    #     dataset["rewards"] = dataset["rewards"] / (max_ret - min_ret) * max_episode_steps
     if "antmaze" in env_name:
         dataset["rewards"] = dataset["rewards"] * 100.0
 
@@ -439,12 +437,8 @@ class ReplayBuffer:
             )
             random_buffer["states"] = normalize_states(random_buffer["states"], self.mean, self.std)
         if normalize_reward:
-            buffer["rewards"] = ReplayBuffer.normalize_reward(
-                dataset_name, buffer["rewards"]
-            )
-            val_buffer["rewards"] = ReplayBuffer.normalize_reward(
-                dataset_name, val_buffer["rewards"]
-            )
+            modify_reward(buffer, dataset_name, self.min, self.max)
+            modify_reward(val_buffer, dataset_name, self.min, self.max)
         self.data = buffer
         self.val_data = val_buffer
         self.random_data = random_buffer
