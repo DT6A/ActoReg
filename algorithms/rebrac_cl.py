@@ -443,7 +443,7 @@ def qlearning_dataset(
     print("TRAIN EPISODES:", cnt_train_episodes)
     print("VAL EPISODES:", cnt_episodes - cnt_train_episodes)
 
-    last_train_ep_idx = episode_ends[cnt_train_episodes]
+    # last_train_ep_idx = episode_ends[cnt_train_episodes]
 
     cls_rewards = np.array(mc_returns_)
 
@@ -567,10 +567,10 @@ class ReplayBuffer:
         }
 
         random_buffer = {
-            "states": jnp.asarray(np.random.uniform(0, 1, (val_data["observations"].shape[0], state_max.shape[0])) * (
+            "states": jnp.asarray(np.random.uniform(0, 1, (max(1, val_data["observations"].shape[0]), state_max.shape[0])) * (
                         state_max - state_min) + state_min, dtype=jnp.float32),
             "actions": jnp.asarray(
-                np.random.uniform(-1, 1, (val_data["observations"].shape[0], val_data["actions"].shape[1])),
+                np.random.uniform(-1, 1, (max(1, val_data["observations"].shape[0]), d4rl_data["actions"].shape[1])),
                 dtype=jnp.float32),
         }
 
@@ -1440,7 +1440,6 @@ def train(config: Config):
                 new_key, rand_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
                                                    buffer.sample_random(buffer.val_data["states"].shape[0]),
                                                    config.actor_bc_coef, config.normalize_q)
-                buffer.sample_random(buffer.val_data["states"].shape[0])
                 del eval_metrics_1["action_mse"]
 
                 for k in train_metrics:
