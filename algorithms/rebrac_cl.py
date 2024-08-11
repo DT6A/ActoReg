@@ -98,6 +98,7 @@ class Config:
     det_validation: bool = True
     validation_frac: float = 0.05
     track_val_stats: bool = True
+    noisy_eval: bool = False
 
     mlc_job_name: str = None
 
@@ -728,10 +729,14 @@ def evaluate(
         expert_action_fn: Callable,
         num_episodes: int,
         seed: int,
+        action_noise: float = 0,
+        state_noise: float = 0,
 ) -> Tuple[np.ndarray, float, Dict]:
     env.seed(seed)
     env.action_space.seed(seed)
     env.observation_space.seed(seed)
+
+    key = jax.random.PRNGKey(seed=seed)
 
     returns = []
     expert_mses = []
@@ -742,6 +747,9 @@ def evaluate(
         obs, done = env.reset(), False
         total_reward = 0.0
         while not done:
+            key, actions_key, states_key = jax.random.split(key, 3)
+            obs = obs + jax.random.normal(states_key, obs.shape) * state_noise
+
             eval_states.append(obs)
             action = np.asarray(jax.device_get(
                 action_fn({"params": params, "batch_stats": batch_stats}, obs)
@@ -749,6 +757,7 @@ def evaluate(
             eval_actions.append(action)
             expert_action = np.asarray(jax.device_get(expert_action_fn(expert_params, obs)))
             expert_mses.append(((action - expert_action) ** 2))
+            action = jnp.clip(action + jax.random.normal(actions_key, action.shape) * action_noise, -1, 1)
             obs, reward, done, _ = env.step(action)
             total_reward += reward
         returns.append(total_reward)
@@ -1418,7 +1427,9 @@ def train(config: Config):
                 config.eval_episodes,
                 seed=config.eval_seed,
             )
+
             normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+
             eval_metrics = {
                 "epoch": epoch,
                 "eval/return_mean": np.mean(eval_returns),
@@ -1427,7 +1438,24 @@ def train(config: Config):
                 "eval/normalized_score_std": np.std(normalized_score),
                 "eval_metrics/expert_mse": expert_mse,
             }
-
+            if config.noisy_eval:
+                for (sn, an) in [
+                    (0.0, 0.2), (0.0, 0.05), (0.2, 0.0), (0.05, 0.0)
+                ]:
+                    returns, _, _ = evaluate(
+                        eval_env,
+                        update_carry["actor"].params,
+                        update_carry["actor"].batch_stats,
+                        expert_actor.params,
+                        actor_action_fn,
+                        expert_action_fn,
+                        config.eval_episodes,
+                        seed=config.eval_seed,
+                        action_noise=an,
+                        state_noise=sn,
+                    )
+                    normalized_returns = eval_env.get_normalized_score(returns) * 100.0
+                    eval_metrics[f"eval/normalized_score_mean_sn_{sn}_an_{an}"] = np.mean(normalized_returns)
             if config.track_val_stats:
                 new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
                                                   buffer.val_data, config.actor_bc_coef, config.normalize_q)
