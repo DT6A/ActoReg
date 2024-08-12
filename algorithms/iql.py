@@ -1159,7 +1159,7 @@ def train(config: Config):
             }
             if config.noisy_eval:
                 for (sn, an) in [
-                    (0.0, 0.2), (0.0, 0.05), (0.2, 0.0), (0.05, 0.0)
+                    (0.0, 0.2), (0.05, 0.0)
                 ]:
                     returns = evaluate(
                         eval_key,
