@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Any, Callable, Dict, Sequence, Tuple, Union, Optional, List
 from collections import defaultdict
+import random
 
 import chex
 import d4rl  # noqa
