@@ -433,10 +433,11 @@ class ReplayBuffer:
             buffer["next_states"] = normalize_states(
                 buffer["next_states"], self.mean, self.std
             )
-            val_buffer["states"] = normalize_states(val_buffer["states"], self.mean, self.std)
-            val_buffer["next_states"] = normalize_states(
-                val_buffer["next_states"], self.mean, self.std
-            )
+            if len(val_buffer["states"]) > 0:
+                val_buffer["states"] = normalize_states(val_buffer["states"], self.mean, self.std)
+                val_buffer["next_states"] = normalize_states(
+                    val_buffer["next_states"], self.mean, self.std
+                )
             random_buffer["states"] = normalize_states(random_buffer["states"], self.mean, self.std)
         if normalize_reward:
             modify_reward(buffer, dataset_name, self.min, self.max)
@@ -884,10 +885,11 @@ def update_iql(
     return key, new_actor, new_critic, new_value, new_metrics
 
 
-def evaluate(key: jax.random.PRNGKey, env: gym.Env, params: jax.Array, action_fn: Callable, num_episodes: int, seed: int,
-             action_noise: float = 0,
-             state_noise: float = 0,
-             ) -> np.ndarray:
+def evaluate(
+        key: jax.random.PRNGKey, env: gym.Env, params: jax.Array, action_fn: Callable, num_episodes: int, seed: int,
+        action_noise: float = 0,
+        state_noise: float = 0,
+    ) -> np.ndarray:
     env.seed(seed)
     env.action_space.seed(seed)
     env.observation_space.seed(seed)
