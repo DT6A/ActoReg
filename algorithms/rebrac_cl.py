@@ -1502,7 +1502,7 @@ def train(config: Config):
             if config.track_val_stats:
                 new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
                                                   buffer.val_data, config.actor_bc_coef, config.normalize_q)
-                if  config.track_plasticity:
+                if config.track_plasticity:
                     new_key, plasticity_metrics = get_plasticity(new_key, update_carry["actor"], update_carry["critic"],
                                                       buffer.val_data, config.actor_bc_coef, config.normalize_q)
                     eval_metrics.update(plasticity_metrics)

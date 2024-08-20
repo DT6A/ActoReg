@@ -89,6 +89,7 @@ class Config:
     validation_frac: float = 0.05
     track_val_stats: bool = True
     noisy_eval: bool = False
+    track_plasticity: bool = False
 
     mlc_job_name: str = None
 
@@ -989,6 +990,46 @@ def eval_actor(
 
     return key, metrics
 
+def get_plasticity(
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: CriticTrainState,
+        value: TrainState,
+        batch: Dict[str, Any],
+        temperature: float,
+) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
+    # https://github.com/ikostrikov/implicit_q_learning/blob/09d700248117881a75cb21f0adb95c6c8a694cb2/actor.py#L9-L30
+
+    key, dropout_key = jax.random.split(key, 2)
+    metrics = {"plasticity/bc_loss": 0}
+
+    @jax.jit
+    def actor_loss_fn(params: jax.Array, dropout_key) -> Tuple[jax.Array, Metrics]:
+        distr, preact = actor.apply_fn(
+            params,
+            batch["states"], True, rngs={'dropout': dropout_key},
+        )
+        actions = distr.loc
+        bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
+
+        loss = bc_penalty.mean()
+
+        metrics.update({"plasticity/bc_loss": ((actions - batch["actions"]) ** 2).mean()})
+        return loss, metrics
+
+    new_actor = actor.replace()
+    dropout_key, new_dropout_key = jax.random.split(dropout_key, 2)
+    loss, metrics = actor_loss_fn(actor.params, dropout_key)
+
+    for _ in range(100):
+        dropout_key, new_dropout_key = jax.random.split(dropout_key, 2)
+        grads, metrics = jax.grad(actor_loss_fn, has_aux=True)(actor.params, dropout_key)
+        new_actor = new_actor.apply_gradients(grads=grads)
+
+    metrics["plasticity/start_loss"] = loss
+    return key, metrics
+
+
 @pyrallis.wrap()
 def train(config: Config):
     dict_config = asdict(config)
@@ -1181,6 +1222,11 @@ def train(config: Config):
                 new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
                                                   update_carry["value"],
                                                   buffer.val_data, config.temperature)
+                if config.track_plasticity:
+                    new_key, plasticity_metrics = get_plasticity(new_key, update_carry["actor"], update_carry["critic"],
+                                                                 update_carry["value"],
+                                                                 buffer.val_data, config.temperature)
+                    eval_metrics.update(plasticity_metrics)
                 new_key, train_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
                                                     update_carry["value"],
                                                     buffer.sample_n_first(buffer.val_data["states"].shape[0]),
