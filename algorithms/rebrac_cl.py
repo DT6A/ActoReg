@@ -99,7 +99,7 @@ class Config:
     validation_frac: float = 0.05
     track_val_stats: bool = True
     noisy_eval: bool = False
-
+    track_plasticity: bool = False
     mlc_job_name: str = None
 
     def __post_init__(self):
@@ -1120,6 +1120,49 @@ def eval_actor(
     return key, metrics
 
 
+def get_plasticity(
+        key: jax.random.PRNGKey,
+        actor: TrainState,
+        critic: TrainState,
+        batch: Dict[str, jax.Array],
+        beta: float,
+        normalize_q: bool,
+) -> Tuple[jax.random.PRNGKey, Dict]:
+    key, random_action_key = jax.random.split(key, 2)
+    metrics = {"plasticity/bc_loss": 0}
+
+    @jax.jit
+    def actor_loss_fn(params: jax.Array, dropout_key) -> Tuple[jax.Array, Metrics]:
+        (actions, preact), updates = actor.apply_fn(
+            {'params': params, 'batch_stats': actor.batch_stats},
+            batch["states"], True, rngs={'dropout': dropout_key},
+            mutable=['batch_stats'],
+        )
+        bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
+
+        loss = bc_penalty.mean()
+
+        metrics.update({"plasticity/bc_loss": ((actions - batch["actions"]) ** 2).mean()})
+        return loss, (updates, metrics)
+
+    new_actor = actor.replace()
+    dropout_key, new_dropout_key = jax.random.split(new_actor.dropout_key, 2)
+    loss, (updates, metrics) = actor_loss_fn(actor.params, dropout_key)
+
+    for _ in range(100):
+        dropout_key, new_dropout_key = jax.random.split(new_actor.dropout_key, 2)
+        grads, (updates, metrics) = jax.grad(actor_loss_fn, has_aux=True)(actor.params, dropout_key)
+        new_actor = new_actor.apply_gradients(grads=grads)
+
+        new_actor = new_actor.replace(
+            batch_stats=updates['batch_stats'],
+        )
+        new_actor = new_actor.replace(
+            dropout_key=new_dropout_key,
+        )
+    metrics["plasticity/start_loss"] = loss
+    return key, metrics
+
 @pyrallis.wrap()
 def train(config: Config):
     config.project = "ActoReg"
@@ -1459,6 +1502,10 @@ def train(config: Config):
             if config.track_val_stats:
                 new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
                                                   buffer.val_data, config.actor_bc_coef, config.normalize_q)
+                if  config.track_plasticity:
+                    new_key, plasticity_metrics = get_plasticity(new_key, update_carry["actor"], update_carry["critic"],
+                                                      buffer.val_data, config.actor_bc_coef, config.normalize_q)
+                    eval_metrics.update(plasticity_metrics)
                 new_key, train_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
                                                     buffer.sample_n_first(buffer.val_data["states"].shape[0]),
                                                     config.actor_bc_coef, config.normalize_q)
