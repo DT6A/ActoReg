@@ -237,6 +237,157 @@ def get_data_from_sweeps(sweeps_ids, param_1="actor_bc_coef", param_2="critic_bc
     return full_scores
 
 
+def get_generalization_data_from_sweeps(sweeps_ids, only_last=True):
+    name_list = []
+    config_list = []
+    full_scores = {}
+
+    for s in tqdm(sweeps_ids, desc="Sweeps processing", position=0, leave=True):
+        api = wandb.Api(timeout=39)
+        sweep = api.sweep(s)
+        runs = sweep.runs
+        cur_max = 0
+        for run in tqdm(runs, desc="Runs processing", position=0, leave=True):
+            all_scores = []
+            action_noise_scores = []
+            state_noise_scores = []
+            config = {k: v for k, v in run.config.items() if not k.startswith('_')}
+            skip = False
+            if skip:
+                continue
+            # print(run.name, end=' ')
+            for i, row in run.history(keys=["eval/normalized_score_mean", "eval/normalized_score_mean_sn_0.0_an_0.2", "eval/normalized_score_mean_sn_0.05_an_0.0"], samples=3000).iterrows():
+                all_scores.append(row["eval/normalized_score_mean"])
+                action_noise_scores.append(row["eval/normalized_score_mean_sn_0.0_an_0.2"])
+                state_noise_scores.append(row["eval/normalized_score_mean_sn_0.05_an_0.0"])
+            cur_max = max(cur_max, len(all_scores))
+            if config["dataset_name"] not in full_scores:
+                full_scores[config["dataset_name"]] = {"scores": [], "an_scores": [], "sn_scores": []}
+            # print("LEN", len(all_scores))
+            if len(all_scores) == 0:
+                continue
+            last_score_idx = -10
+            if "antmaze" in config["dataset_name"]:
+                last_score_idx = -5
+            if only_last:
+                last_score_idx = -1
+            # print(len(all_scores), all_scores[last_score_idx:])
+            full_scores[config["dataset_name"]]["scores"].append(
+                np.mean(all_scores[last_score_idx:]))
+            full_scores[config["dataset_name"]]["an_scores"].append(
+                np.mean(action_noise_scores[last_score_idx:]))
+            full_scores[config["dataset_name"]]["sn_scores"].append(
+                np.mean(state_noise_scores[last_score_idx:]))
+            config_list.append(config)
+            name_list.append(run.name)
+
+    return full_scores
+
+
+def get_actor_data_from_sweeps(sweeps_ids, only_last=True, params_filter=dict()):
+    name_list = []
+    config_list = []
+    full_scores = {}
+    save_keys = [
+        "train_metrics/dead_neurons_frac",
+        "train_metrics/feature_norms",
+        "train_metrics/feature_means",
+        "train_metrics/feature_stds",
+        "train_metrics/pca_rank",
+        "train_metrics/actor_loss",
+        "validation_metrics/dead_neurons_frac",
+        "validation_metrics/feature_norms",
+        "validation_metrics/feature_means",
+        "validation_metrics/feature_stds",
+        "validation_metrics/pca_rank",
+        "validation_metrics/actor_loss",
+    ]
+    for s in tqdm(sweeps_ids, desc="Sweeps processing", position=0, leave=True):
+        api = wandb.Api(timeout=39)
+        sweep = api.sweep(s)
+        runs = sweep.runs
+        cur_max = 0
+        for run in tqdm(runs, desc="Runs processing", position=0, leave=True):
+            all_scores = {k: [] for k in save_keys}
+            action_noise_scores = []
+            state_noise_scores = []
+            config = {k: v for k, v in run.config.items() if not k.startswith('_')}
+            skip = False
+            for fk in params_filter:
+                if config[fk] != params_filter[fk]:
+                    skip = True
+                    break
+            if skip:
+                continue
+            # print(run.name, end=' ')
+            for i, row in run.history(keys=save_keys, samples=3000).iterrows():
+                for k in save_keys:
+                    all_scores[k].append(row[k])
+            if config["dataset_name"] not in full_scores:
+                full_scores[config["dataset_name"]] = {k: [] for k in save_keys}
+            # print("LEN", len(all_scores))
+            last_score_idx = -10
+            if "antmaze" in config["dataset_name"]:
+                last_score_idx = -5
+            if only_last:
+                last_score_idx = -1
+            # print(len(all_scores), all_scores[last_score_idx:])
+            for k in save_keys:
+                full_scores[config["dataset_name"]][k].append(
+                    np.mean(all_scores[k][last_score_idx:]))
+            config_list.append(config)
+            name_list.append(run.name)
+
+    return full_scores
+
+
+def get_plasticity_from_sweeps(sweeps_ids, only_last=True, params_filter=dict()):
+    name_list = []
+    config_list = []
+    full_scores = {}
+    save_keys = [
+        "plasticity/bc_loss",
+        "plasticity/start_loss",
+    ]
+    for s in tqdm(sweeps_ids, desc="Sweeps processing", position=0, leave=True):
+        api = wandb.Api(timeout=39)
+        sweep = api.sweep(s)
+        runs = sweep.runs
+        cur_max = 0
+        for run in tqdm(runs, desc="Runs processing", position=0, leave=True):
+            all_scores = {k: [] for k in save_keys}
+            action_noise_scores = []
+            state_noise_scores = []
+            config = {k: v for k, v in run.config.items() if not k.startswith('_')}
+            skip = False
+            for fk in params_filter:
+                if config[fk] != params_filter[fk]:
+                    skip = True
+                    break
+            if skip:
+                continue
+            # print(run.name, end=' ')
+            for i, row in run.history(keys=save_keys, samples=3000).iterrows():
+                for k in save_keys:
+                    all_scores[k].append(row[k])
+            if config["dataset_name"] not in full_scores:
+                full_scores[config["dataset_name"]] = {k: [] for k in save_keys}
+            # print("LEN", len(all_scores))
+            last_score_idx = -10
+            if "antmaze" in config["dataset_name"]:
+                last_score_idx = -5
+            if only_last:
+                last_score_idx = -1
+            # print(len(all_scores), all_scores[last_score_idx:])
+            for k in save_keys:
+                full_scores[config["dataset_name"]][k].append(
+                    np.mean(all_scores[k][last_score_idx:]))
+            config_list.append(config)
+            name_list.append(run.name)
+
+    return full_scores
+
+
 def average_seeds(full_scores, is_td3=False, three_params=False):
     S = 0
     full_means = {}
@@ -635,6 +786,7 @@ with open('bin/profiles_data.pickle', 'rb') as handle:
 # profiles_data['ReBRAC+DO+LN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/asbsw8r1'], only_last=False)
 # profiles_data['ReBRAC+DO+LN+BCN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/ve3oqy1z'], only_last=False, params_filter={"actor_bc_noise": 0.01})
 # profiles_data['ReBRAC+DO+LN+GrN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/5fq1q3bs'], only_last=False, params_filter={"actor_grad_noise": 0.003})
+# profiles_data['ReBRAC+DO+LN+InN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/mflso9ma'], only_last=False, params_filter={"actor_input_noise": 0.01})
 # profiles_data['ReBRAC+DO+LN+L2'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/z1iyvygn'], only_last=False, params_filter={"actor_wd": 0.0001})
 # profiles_data['ReBRAC+EN+DO'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/r3cvll25'], only_last=False, params_filter={})
 # profiles_data['ReBRAC+L2+DO'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/mys5pr8e'], only_last=False, params_filter={"actor_dropout": 0.1})
@@ -654,22 +806,88 @@ with open('bin/profiles_data.pickle', 'rb') as handle:
 # profiles_data['ReBRAC+L1+DO'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/x2gvtc4j'], only_last=False, params_filter={})
 # profiles_data['ReBRAC+DO+LN+L1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/yros0tt1'], only_last=False, params_filter={"actor_wd": 1e-05, "l1_ratio": 1.0})
 # profiles_data['ReBRAC+DO+LN+EN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/yros0tt1'], only_last=False, params_filter={"actor_wd": 1e-05, "l1_ratio": 0.5})
+
+
+# profiles_data['IQL'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/zb7ph6s6'], only_last=False, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+LN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/6mckizcf'], only_last=False, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+FN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/cminzipk'], only_last=False, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+GN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qfdwrkqy'], only_last=False, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L2'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.1, "l1_ratio": 0.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.01, "l1_ratio": 1.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+EN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.01, "l1_ratio": 0.5}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/5h7vroey'], only_last=False, params_filter={"actor_dropout": 0.1}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+InN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/k4wksvwn'], only_last=False, params_filter={"actor_input_noise": 0.01}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+BCN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/xha44dyd'], only_last=False, params_filter={"actor_bc_noise": 0.3}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+GrN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/8qeewggq'], only_last=False, params_filter={"actor_grad_noise": 0.01}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO+LN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/yqsw2jtq'], only_last=False, params_filter={}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO+LN+GrN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/fb40oyxm'], only_last=False, params_filter={"actor_grad_noise": 0.1}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO+LN+L2'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/3l05qwr6'], only_last=False, params_filter={"actor_wd": 0.1, "l1_ratio": 0.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO+LN+L1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/3l05qwr6'], only_last=False, params_filter={"actor_wd": 0.01, "l1_ratio": 1.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO+LN+EN'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/3l05qwr6'], only_last=False, params_filter={"actor_wd": 0.01, "l1_ratio": 0.5}, param_1="temperature", param_2="expectile")
 #
+# profiles_data['IQL+DO 0.1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/5h7vroey'], only_last=False, params_filter={"actor_dropout": 0.1}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO 0.2'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/5h7vroey'], only_last=False, params_filter={"actor_dropout": 0.2}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO 0.3'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/5h7vroey'], only_last=False, params_filter={"actor_dropout": 0.3}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+DO 0.5'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/5h7vroey'], only_last=False, params_filter={"actor_dropout": 0.5}, param_1="temperature", param_2="expectile")
 # with open('bin/profiles_data.pickle', 'wb') as handle:
 #     pickle.dump(profiles_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
-#
-# with open('bin/profiles_data.pickle', 'rb') as handle:
-#     profiles_data = pickle.load(handle)
+# profiles_data['IQL+L2 0.00001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.00001, "l1_ratio": 0.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L2 0.0001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.0001, "l1_ratio": 0.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L2 0.001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.001, "l1_ratio": 0.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L2 0.01'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.01, "l1_ratio": 0.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L2 0.1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.1, "l1_ratio": 0.0}, param_1="temperature", param_2="expectile")
+# with open('bin/profiles_data.pickle', 'wb') as handle:
+#     pickle.dump(profiles_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+# profiles_data['IQL+L1 0.00001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.00001, "l1_ratio": 1.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L1 0.0001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.0001, "l1_ratio": 1.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L1 0.001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.001, "l1_ratio": 1.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L1 0.01'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.01, "l1_ratio": 1.0}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+L1 0.1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.1, "l1_ratio": 1.0}, param_1="temperature", param_2="expectile")
+# with open('bin/profiles_data.pickle', 'wb') as handle:
+#     pickle.dump(profiles_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+# profiles_data['IQL+EN 0.00001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.00001, "l1_ratio": 0.5}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+EN 0.0001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.0001, "l1_ratio": 0.5}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+EN 0.001'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.001, "l1_ratio": 0.5}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+EN 0.01'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.01, "l1_ratio": 0.5}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+EN 0.1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=False, params_filter={"actor_wd": 0.1, "l1_ratio": 0.5}, param_1="temperature", param_2="expectile")
+# with open('bin/profiles_data.pickle', 'wb') as handle:
+#     pickle.dump(profiles_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+# profiles_data['IQL+InN 0.003'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/k4wksvwn'], only_last=False, params_filter={"actor_input_noise": 0.003}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+InN 0.01'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/k4wksvwn'], only_last=False, params_filter={"actor_input_noise": 0.01}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+InN 0.03'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/k4wksvwn'], only_last=False, params_filter={"actor_input_noise": 0.03}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+InN 0.1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/k4wksvwn'], only_last=False, params_filter={"actor_input_noise": 0.1}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+InN 0.3'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/k4wksvwn'], only_last=False, params_filter={"actor_input_noise": 0.3}, param_1="temperature", param_2="expectile")
+# with open('bin/profiles_data.pickle', 'wb') as handle:
+#     pickle.dump(profiles_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+# profiles_data['IQL+BCN 0.003'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/xha44dyd'], only_last=False, params_filter={"actor_bc_noise": 0.003}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+BCN 0.01'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/xha44dyd'], only_last=False, params_filter={"actor_bc_noise": 0.01}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+BCN 0.03'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/xha44dyd'], only_last=False, params_filter={"actor_bc_noise": 0.03}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+BCN 0.1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/xha44dyd'], only_last=False, params_filter={"actor_bc_noise": 0.1}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+BCN 0.3'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/xha44dyd'], only_last=False, params_filter={"actor_bc_noise": 0.3}, param_1="temperature", param_2="expectile")
+# with open('bin/profiles_data.pickle', 'wb') as handle:
+#     pickle.dump(profiles_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+# profiles_data['IQL+GrN 0.003'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/8qeewggq'], only_last=False, params_filter={"actor_grad_noise": 0.003}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+GrN 0.01'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/8qeewggq'], only_last=False, params_filter={"actor_grad_noise": 0.01}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+GrN 0.03'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/8qeewggq'], only_last=False, params_filter={"actor_grad_noise": 0.03}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+GrN 0.1'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/8qeewggq'], only_last=False, params_filter={"actor_grad_noise": 0.1}, param_1="temperature", param_2="expectile")
+# profiles_data['IQL+GrN 0.3'] = get_data_from_sweeps(['tarasovd/ActoReg/sweeps/8qeewggq'], only_last=False, params_filter={"actor_grad_noise": 0.3}, param_1="temperature", param_2="expectile")
+
+with open('bin/profiles_data.pickle', 'wb') as handle:
+    pickle.dump(profiles_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+with open('bin/profiles_data.pickle', 'rb') as handle:
+    profiles_data = pickle.load(handle)
 
 avg_scores = {k: average_scores(profiles_data[k]) for k in profiles_data}
 
 for k in avg_scores:
-    print(k, avg_scores[k], (avg_scores[k] - avg_scores["ReBRAC"]) / avg_scores["ReBRAC"] * 100)
+    cur_alg = k.split("+")[0]
+    print(k, avg_scores[k], (avg_scores[k] - avg_scores[cur_alg]) / avg_scores[cur_alg] * 100)
 
 
 flat_profiles_data = {k: np.array(flatten(profiles_data[k])) for k in profiles_data}
 
-sns.set(style="ticks", font_scale=0.5)
+
 
 algorithms = ['ReBRAC', 'ReBRAC+LN', 'ReBRAC+L2', 'ReBRAC+L1', 'ReBRAC+EN', 'ReBRAC+DO', 'ReBRAC+InN', 'ReBRAC+BCN', 'ReBRAC+GrN', ]
 
@@ -701,7 +919,7 @@ plot_utils.plot_performance_profiles(
   legend=True
   )
 plt.savefig("out/perf_profiles.pdf", dpi=300, bbox_inches='tight')
-
+plt.close()
 
 # algorithm_pairs = {
 #     'ReBRAC+LN,ReBRAC': (flat_profiles_data["ReBRAC+LN"].T, flat_profiles_data["ReBRAC"].T),
@@ -784,7 +1002,7 @@ plot_utils.plot_performance_profiles(
   legend=True
   )
 plt.savefig("out/perf_profiles_comb.pdf", dpi=300, bbox_inches='tight')
-
+plt.close()
 
 # algorithms = ['ReBRAC', 'ReBRAC+L2+LN', 'ReBRAC+L2+DO', 'ReBRAC+L2+DO+LN', 'ReBRAC+L1+LN', 'ReBRAC+L1+DO', 'ReBRAC+L1+DO+LN', 'ReBRAC+EN+LN', 'ReBRAC+EN+DO', 'ReBRAC+EN+DO+LN', 'ReBRAC+DO+LN', 'ReBRAC+DO+LN+L2', 'ReBRAC+DO+LN+BCN', 'ReBRAC+DO+LN+GrN', 'ReBRAC+DO+LN+GrN+L2', 'ReBRAC+DO+LN+GrN+L1', 'ReBRAC+DO+LN+GrN+EN', ]#[::-1]
 # # Load ALE scores as a dictionary mapping algorithms to their human normalized
@@ -848,7 +1066,7 @@ plt.savefig("out/perf_profiles_comb.pdf", dpi=300, bbox_inches='tight')
 #   algorithms=algorithms, xlabel='D4RL Normalized Score / 100')
 # plt.savefig("out/metrics.pdf", dpi=300, bbox_inches='tight')
 
-def plot_metrics(algorithms, suffix, pi_range=(0.4, 0.9)):
+def plot_metrics(algorithms, suffix, pi_range=(0.4, 0.9), main_algo="ReBRAC", div_trials=1, profiles=True):
     normalized_score_dict = {
         k: flat_profiles_data[k].T / 100 for k in algorithms
     }
@@ -858,32 +1076,67 @@ def plot_metrics(algorithms, suffix, pi_range=(0.4, 0.9)):
       metrics.aggregate_mean(x),
       metrics.aggregate_optimality_gap(x)])
     aggregate_scores, aggregate_score_cis = rly.get_interval_estimates(
-      normalized_score_dict, aggregate_func, reps=50000)
+      normalized_score_dict, aggregate_func, reps=50000 // div_trials)
     plot_utils.plot_interval_estimates(
       aggregate_scores, aggregate_score_cis,
       metric_names=['Median', 'IQM', 'Mean', 'Optimality Gap'],
       algorithms=algorithms, xlabel='D4RL Normalized Score / 100')
     plt.savefig(f"out/metrics_{suffix}.pdf", dpi=300, bbox_inches='tight')
+    plt.close()
 
-    algorithms.remove("ReBRAC")
-    algorithm_pairs = {
-        f'{k},ReBRAC': (flat_profiles_data[k].T, flat_profiles_data["ReBRAC"].T) for k in algorithms
-    }
+    if profiles:
+        thresholds = np.linspace(-0.05, 1.5, 31)
+        score_distributions, score_distributions_cis = rly.create_performance_profile(
+            normalized_score_dict, thresholds)
+        # Plot score distributions
+        fig, ax = plt.subplots(ncols=1, figsize=(7, 5))
+        # plt.legend()
+        plot_utils.plot_performance_profiles(
+            score_distributions, thresholds,
+            performance_profile_cis=score_distributions_cis,
+            colors=dict(zip(algorithms, sns.color_palette('colorblind'))),
+            xlabel=r'D4RL Normalized Score $(\tau)$',
+            ax=ax,
+            legend=True
+        )
+        plt.savefig(f"out/perf_profiles_{suffix}.pdf", dpi=300, bbox_inches='tight')
+        plt.close()
+
+    if type(main_algo) is not list:
+        algorithms.remove(main_algo)
+        algorithm_pairs = {
+            f'{k},{main_algo}': (flat_profiles_data[k].T, flat_profiles_data[main_algo].T) for k in algorithms
+        }
+    else:
+        algorithm_pairs = {}
+        for ma in main_algo:
+            algorithms.remove(ma)
+            for alg in algorithms:
+                if ma in alg:
+                    algorithm_pairs[f'{alg},{ma}'] = (flat_profiles_data[alg].T, flat_profiles_data[ma].T)
+
     average_probabilities, average_prob_cis = rly.get_interval_estimates(
-      algorithm_pairs, metrics.probability_of_improvement, reps=2000)
+      algorithm_pairs, metrics.probability_of_improvement, reps=2000 // div_trials)
     ax = plot_utils.plot_probability_of_improvement(average_probabilities, average_prob_cis)
     ax.set_xlim(pi_range[0], pi_range[1])
     # plt.show()
     plt.savefig(f"out/improvement_probability_{suffix}.pdf", dpi=300, bbox_inches='tight')
+    plt.close()
 
-
-plot_metrics(
-    ['ReBRAC', 'ReBRAC+L2+LN', 'ReBRAC+L2+DO', 'ReBRAC+L2+DO+LN', 'ReBRAC+L1+LN', 'ReBRAC+L1+DO', 'ReBRAC+L1+DO+LN',
-     'ReBRAC+EN+LN', 'ReBRAC+EN+DO', 'ReBRAC+EN+DO+LN', 'ReBRAC+DO+LN', 'ReBRAC+DO+LN+L2', 'ReBRAC+DO+LN+L1', 'ReBRAC+DO+LN+EN', 'ReBRAC+DO+LN+BCN', 'ReBRAC+DO+LN+GrN',
-     'ReBRAC+DO+LN+GrN+L2', 'ReBRAC+DO+LN+GrN+L1', 'ReBRAC+DO+LN+GrN+EN', ],#[::-1]
-    "comb",
-)
-
+sns.set(style="ticks", font_scale=0.6)
+# plot_metrics(
+#     ['ReBRAC', 'ReBRAC+L2+LN', 'ReBRAC+L2+DO', 'ReBRAC+L2+DO+LN', 'ReBRAC+L1+LN', 'ReBRAC+L1+DO', 'ReBRAC+L1+DO+LN',
+#      'ReBRAC+EN+LN', 'ReBRAC+EN+DO', 'ReBRAC+EN+DO+LN', 'ReBRAC+DO+LN', 'ReBRAC+DO+LN+L2', 'ReBRAC+DO+LN+L1', 'ReBRAC+DO+LN+EN',
+#      'ReBRAC+DO+LN+InN', 'ReBRAC+DO+LN+BCN', 'ReBRAC+DO+LN+GrN', 'ReBRAC+DO+LN+GrN+L2', 'ReBRAC+DO+LN+GrN+L1', 'ReBRAC+DO+LN+GrN+EN', ],#[::-1]
+#     "comb",
+#     profiles=False,
+# )
+#
+# plot_metrics(
+#     ['ReBRAC', 'ReBRAC+LN', 'ReBRAC+L2', 'ReBRAC+L1', 'ReBRAC+EN', 'ReBRAC+DO', 'ReBRAC+InN', 'ReBRAC+BCN', 'ReBRAC+GrN', ],#[::-1]
+#     "individual",
+#     profiles=False,
+# )
 # plot_metrics(
 #     ["ReBRAC", "ReBRAC+DO 0.1", "ReBRAC+DO 0.2", "ReBRAC+DO 0.3", "ReBRAC+DO 0.5", "ReBRAC+DO 0.75", "ReBRAC+DO 0.9"],
 #     "dropout",
@@ -931,4 +1184,531 @@ plot_metrics(
 #     pi_range=(0.0, 0.9)
 # )
 
-# TODO: (DO + Input Noise), (Schedulers?)
+# plot_metrics(
+#     ['IQL', 'IQL+LN', 'IQL+L2', 'IQL+L1', 'IQL+EN', 'IQL+DO', 'IQL+InN', 'IQL+BCN', 'IQL+GrN'],
+#     "iql",
+#     pi_range=(0.4, 0.8),
+#     main_algo="IQL",
+# )
+#
+# plot_metrics(
+#     ['IQL', 'IQL+DO+LN', 'IQL+DO+LN+L2', 'IQL+DO+LN+L1', 'IQL+DO+LN+EN', 'IQL+DO+LN+GrN',],
+#     "iql_comb",
+#     pi_range=(0.3, 0.9),
+#     main_algo="IQL",
+# )
+
+# plot_metrics(
+#     ["IQL", "IQL+DO 0.1", "IQL+DO 0.2", "IQL+DO 0.3", "IQL+DO 0.5"],
+#     "iql_dropout",
+#     pi_range=(0.2, 0.8),
+#     main_algo="IQL",
+# )
+#
+# plot_metrics(
+#     ["IQL", "IQL+LN", "IQL+FN", "IQL+GN"],
+#     "iql_ln",
+#     main_algo="IQL",
+#     pi_range=(0.4, 0.7),
+# )
+#
+# plot_metrics(
+#     ["IQL", "IQL+L2 0.00001", "IQL+L2 0.0001", "IQL+L2 0.001", "IQL+L2 0.01", "IQL+L2 0.1"],
+#     "iql_l2",
+#     pi_range=(0.4, 0.8),
+#     main_algo="IQL",
+# )
+#
+# plot_metrics(
+#     ["IQL", "IQL+L1 0.00001", "IQL+L1 0.0001", "IQL+L1 0.001", "IQL+L1 0.01", "IQL+L1 0.1"],
+#     "iql_l1",
+#     pi_range=(0.1, 0.8),
+#     main_algo="IQL",
+# )
+#
+# plot_metrics(
+#     ["IQL", "IQL+EN 0.00001", "IQL+EN 0.0001", "IQL+EN 0.001", "IQL+EN 0.01", "IQL+EN 0.1"],
+#     "iql_en",
+#     pi_range=(0.3, 0.8),
+#     main_algo="IQL",
+# )
+#
+# plot_metrics(
+#     ["IQL", "IQL+InN 0.003", "IQL+InN 0.01", "IQL+InN 0.03", "IQL+InN 0.1", "IQL+InN 0.3"],
+#     "iql_inn",
+#     pi_range=(0.2, 0.8),
+#     main_algo="IQL",
+# )
+#
+# plot_metrics(
+#     ["IQL", "IQL+BCN 0.003", "IQL+BCN 0.01", "IQL+BCN 0.03", "IQL+BCN 0.1", "IQL+BCN 0.3"],
+#     "iql_bcn",
+#     pi_range=(0.4, 0.8),
+#     main_algo="IQL",
+# )
+#
+# plot_metrics(
+#     ["IQL", "IQL+GrN 0.003", "IQL+GrN 0.01", "IQL+GrN 0.03", "IQL+GrN 0.1", "IQL+GrN 0.3"],
+#     "iql_grn",
+#     pi_range=(0.4, 0.8),
+#     main_algo="IQL",
+# )
+
+
+# dataset_scale_data = {}
+
+# dataset_scale_data['ReBRAC'] = [
+#     average_scores(get_data_from_sweeps(
+#         ['tarasovd/ActoReg/sweeps/njrnd5dc'], only_last=False, params_filter={"validation_frac": vf})
+#     )
+#     for vf in [0.1, 0.25, 0.5, 0.75, 0.9][::-1]
+# ]
+# print(dataset_scale_data)
+# with open('bin/scale_data.pickle', 'wb') as handle:
+#     pickle.dump(dataset_scale_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+# with open('bin/scale_data.pickle', 'rb') as handle:
+#     dataset_scale_data = pickle.load(handle)
+#
+# dataset_scale_data['ReBRAC+DO'] = [
+#     average_scores(get_data_from_sweeps(
+#         ['tarasovd/ActoReg/sweeps/6eu5206d'], only_last=False, params_filter={"validation_frac": vf})
+#     )
+#     for vf in [0.1, 0.25, 0.5, 0.75, 0.9][::-1]
+# ]
+#
+#
+# with open('bin/scale_data.pickle', 'wb') as handle:
+#     pickle.dump(dataset_scale_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+#
+# dataset_scale_data['ReBRAC+LN'] = [
+#     average_scores(get_data_from_sweeps(
+#         ['tarasovd/ActoReg/sweeps/3ol0epj4'], only_last=False, params_filter={"validation_frac": vf})
+#     )
+#     for vf in [0.1, 0.25, 0.5, 0.75, 0.9][::-1]
+# ]
+#
+#
+# with open('bin/scale_data.pickle', 'wb') as handle:
+#     pickle.dump(dataset_scale_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+#
+#
+# dataset_scale_data['ReBRAC+L2'] = [
+#     average_scores(get_data_from_sweeps(
+#         ['tarasovd/ActoReg/sweeps/j3k3pq9u'], only_last=False, params_filter={"validation_frac": vf})
+#     )
+#     for vf in [0.1, 0.25, 0.5, 0.75, 0.9][::-1]
+# ]
+#
+#
+# with open('bin/scale_data.pickle', 'wb') as handle:
+#     pickle.dump(dataset_scale_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+#
+# dataset_scale_data['ReBRAC+L1'] = [
+#     average_scores(get_data_from_sweeps(
+#         ['tarasovd/ActoReg/sweeps/tx0mddo3'], only_last=False, params_filter={"validation_frac": vf})
+#     )
+#     for vf in [0.1, 0.25, 0.5, 0.75, 0.9][::-1]
+# ]
+#
+#
+# with open('bin/scale_data.pickle', 'wb') as handle:
+#     pickle.dump(dataset_scale_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+#
+#
+# dataset_scale_data['ReBRAC+EN'] = [
+#     average_scores(get_data_from_sweeps(
+#         ['tarasovd/ActoReg/sweeps/4pkra3ma'], only_last=False, params_filter={"validation_frac": vf})
+#     )
+#     for vf in [0.1, 0.25, 0.5, 0.75, 0.9][::-1]
+# ]
+# with open('bin/scale_data.pickle', 'wb') as handle:
+#     pickle.dump(dataset_scale_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+# with open('bin/scale_data.pickle', 'rb') as handle:
+#     dataset_scale_data = pickle.load(handle)
+#
+# for k in dataset_scale_data:
+#     plt.plot([0.1, 0.25, 0.5, 0.75, 0.9], dataset_scale_data[k], label=k)
+# plt.grid()
+# plt.legend()
+# plt.savefig(f"out/data_scale_rebrac.pdf", dpi=300, bbox_inches='tight')
+# plt.close()
+
+# generalization_data = {}
+# generalization_data["ReBRAC"] = get_generalization_data_from_sweeps(['tarasovd/ActoReg/sweeps/36w1lih9', 'tarasovd/ActoReg/wy58h3gg'], only_last=True)
+# generalization_data["ReBRAC+L2"] = get_generalization_data_from_sweeps(['tarasovd/ActoReg/sweeps/j16hbmaq', 'tarasovd/ActoReg/i9xlh0ch'], only_last=True)
+# generalization_data["ReBRAC+DO+LN+GrN"] = get_generalization_data_from_sweeps(['tarasovd/ActoReg/sweeps/j2qnvwil', 'tarasovd/ActoReg/nawvkbeq'], only_last=True)
+#
+# with open('bin/gener_data.pickle', 'wb') as handle:
+#     pickle.dump(generalization_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+# with open('bin/gener_data.pickle', 'rb') as handle:
+#     generalization_data = pickle.load(handle)
+
+# generalization_data["IQL"] = get_generalization_data_from_sweeps(['tarasovd/ActoReg/sweeps/1h2z4kzd', 'tarasovd/ActoReg/2c8gjdhb'], only_last=True)
+# generalization_data["IQL+L1"] = get_generalization_data_from_sweeps(['tarasovd/ActoReg/sweeps/08ygop65', 'tarasovd/ActoReg/rrtuyx4a'], only_last=True)
+# generalization_data["IQL+DO+LN+EN"] = get_generalization_data_from_sweeps(['tarasovd/ActoReg/sweeps/oadnmq99', 'tarasovd/ActoReg/01ae51st'], only_last=True)
+
+# with open('bin/gener_data.pickle', 'wb') as handle:
+#     pickle.dump(generalization_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+with open('bin/gener_data.pickle', 'rb') as handle:
+    generalization_data = pickle.load(handle)
+
+ordered_envs = [
+    "hopper-random-v2",
+    "hopper-medium-v2",
+    "hopper-expert-v2",
+    "hopper-medium-expert-v2",
+    "hopper-medium-replay-v2",
+    "hopper-full-replay-v2",
+    "halfcheetah-random-v2",
+    "halfcheetah-medium-v2",
+    "halfcheetah-expert-v2",
+    "halfcheetah-medium-expert-v2",
+    "halfcheetah-medium-replay-v2",
+    "halfcheetah-full-replay-v2",
+    "walker2d-random-v2",
+    "walker2d-medium-v2",
+    "walker2d-expert-v2",
+    "walker2d-medium-expert-v2",
+    "walker2d-medium-replay-v2",
+    "walker2d-full-replay-v2",
+    "antmaze-umaze-v2",
+    "antmaze-umaze-diverse-v2",
+    "antmaze-medium-play-v2",
+    "antmaze-medium-diverse-v2",
+    "antmaze-large-play-v2",
+    "antmaze-large-diverse-v2",
+    "pen-human-v1",
+    "pen-cloned-v1",
+    "pen-expert-v1",
+    "door-human-v1",
+    "door-cloned-v1",
+    "door-expert-v1",
+    "hammer-human-v1",
+    "hammer-cloned-v1",
+    "hammer-expert-v1",
+    "relocate-human-v1",
+    "relocate-cloned-v1",
+    "relocate-expert-v1",
+]
+
+def make_table(scores):
+    print("=" * 80)
+    algos = list(scores.keys())
+    envs = ordered_envs
+    print(" & ".join(algos) + " \\\\")
+    gym_scores = [[] for _ in range(len(algos))]
+    antmaze_scores = [[] for _ in range(len(algos))]
+    adroit_scores = [[] for _ in range(len(algos))]
+    adroit_ne_scores = [[] for _ in range(len(algos))]
+    all_scores = [[] for _ in range(len(algos))]
+    for env in envs:
+        print(env, end=" & ")
+        for i, a in enumerate(algos):
+            print(f"{np.mean(scores[a][env]['scores']):.1f} $\\pm$ {np.std(scores[a][env]['scores']):.1f}", end=" & ")
+            all_scores[i].append(np.mean(scores[a][env]['scores']))
+            if "antmaze" in env:
+                antmaze_scores[i].append(np.mean(scores[a][env]['scores']))
+            elif "v2" in env:
+                gym_scores[i].append(np.mean(scores[a][env]['scores']))
+            else:
+                if "expert" not in env:
+                    adroit_ne_scores[i].append(np.mean(scores[a][env]['scores']))
+                adroit_scores[i].append(np.mean(scores[a][env]['scores']))
+        print("\\\\")
+    for domain, avgs in zip(["Gym-MuJoCo", "AntMaze", "Adroit w\\o expert", "Adroit", "Avg"], [gym_scores, antmaze_scores, adroit_ne_scores, adroit_scores, all_scores]):
+        print(domain, end=" & ")
+        for i, a in enumerate(algos):
+            print(f"{np.mean(avgs[i]):.1f} $\\pm$ {np.std(avgs[i]):.1f}", end=" & ")
+        print("\\\\")
+    print("=" * 80)
+
+make_table(generalization_data)
+
+
+def flatten_pd(data, target_lens=5):
+    flat = []
+    for env in ordered_envs:
+        env_list = []
+        env_list += data[env]['scores']
+        while len(env_list) < target_lens:
+            env_list.append(np.mean(env_list))
+        if len(env_list) > target_lens:
+            env_list = env_list[:target_lens]
+        flat.append(env_list)
+    return flat
+
+# sns.set(style="ticks", font_scale=0.7)
+#
+# flat_perdataset = {k: np.array(flatten_pd(generalization_data[k])) for k in generalization_data}
+# plot_metrics(
+#     ["ReBRAC", "ReBRAC+L2", "ReBRAC+DO+LN+GrN", "IQL", "IQL+L1", "IQL+DO+LN+EN"],
+#     "per_dataset",
+#     pi_range=(0.4, 0.9),
+#     main_algo=["ReBRAC", "IQL"],
+#     # div_trials=100
+# )
+def make_table_generalization(scores, noise_field="an_scores"):
+    print("=" * 80)
+    algos = list(scores.keys())
+    envs = ordered_envs
+    print(" & ".join(algos) + " \\\\")
+    gym_scores = [[] for _ in range(len(algos))]
+    antmaze_scores = [[] for _ in range(len(algos))]
+    adroit_scores = [[] for _ in range(len(algos))]
+    adroit_ne_scores = [[] for _ in range(len(algos))]
+    all_scores = [[] for _ in range(len(algos))]
+
+    gym_unag = [[] for _ in range(len(algos))]
+    antmaze_unag = [[] for _ in range(len(algos))]
+    adroit_unag = [[] for _ in range(len(algos))]
+    all_unag = [[] for _ in range(len(algos))]
+
+    for env in envs:
+        print(env, end=" & ")
+        for i, a in enumerate(algos):
+            fraction = np.minimum(np.maximum(scores[a][env][noise_field], 1e-6) / np.maximum(scores[a][env]['scores'], 1e-6), 1.1)
+            # print(fraction, np.mean(fraction))
+            print(f"{np.mean(fraction):.3f} \\pm {np.std(fraction):.3f}", end=" & ")
+            all_scores[i].append(np.mean(fraction))
+            all_unag[i] += list(fraction)
+            if "antmaze" in env:
+                antmaze_scores[i].append(np.mean(fraction))
+                antmaze_unag[i] += list(fraction)
+            elif "v2" in env:
+                gym_scores[i].append(np.mean(fraction))
+                gym_unag[i] += list(fraction)
+            else:
+                if "expert" not in env:
+                    adroit_ne_scores[i].append(fraction)
+                adroit_scores[i].append(np.mean(fraction))
+                adroit_unag[i] += list(fraction)
+        print("\\\\")
+    for domain, avgs in zip(["Gym-MuJoCo", "AntMaze", "Adroit w\\o expert", "Adroit", "Avg"], [gym_scores, antmaze_scores, adroit_ne_scores, adroit_scores, all_scores]):
+        print(domain, end=" & ")
+        for i, a in enumerate(algos):
+            print(f"{np.mean(avgs[i]):.3f} \\pm {np.std(avgs[i]):.3f}", end=" & ")
+        print("\\\\")
+    print("=" * 80)
+    return algos, gym_unag, antmaze_unag, adroit_unag, all_unag
+
+
+labels, gym_scores_a, antmaze_scores_a, adroit_scores_a, all_scores_a = make_table_generalization(generalization_data, "an_scores")
+labels, gym_scores_s, antmaze_scores_s, adroit_scores_s, all_scores_s = make_table_generalization(generalization_data, "sn_scores")
+
+colors = ['lightblue', 'lightgreen', 'lightcoral', 'lightyellow', 'pink', 'tan']
+
+def plot_boxes(data, labels, title, save_suffix):
+    box = plt.boxplot(data, labels=labels, patch_artist=True, vert=False, showfliers=False)
+    for patch, color in zip(box['boxes'], colors):
+        patch.set_facecolor(color)
+    for median in box['medians']:
+        median.set_color('black')
+    # Add a title and labels
+    plt.title(title)
+    plt.xlabel("Fraction of original performance")
+    # Display the plot
+    plt.savefig(f"out/boxes_{save_suffix}.pdf", dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+# plot_boxes(gym_scores_a, labels, "Gym-MuJoCo + actions noise", "gym_an")
+# plot_boxes(antmaze_scores_a, labels, "AntMaze + actions noise", "antmaze_an")
+# plot_boxes(adroit_scores_a, labels, "Adroit + actions noise", "adroit_an")
+# plot_boxes(all_scores_a, labels, "All datasets + actions noise", "all_an")
+# plot_boxes(gym_scores_s, labels, "Gym-MuJoCo + states noise", "gym_sn")
+# plot_boxes(antmaze_scores_s, labels, "AntMaze + states noise", "antmaze_sn")
+# plot_boxes(adroit_scores_s, labels, "Adroit + states noise", "adroit_sn")
+# plot_boxes(all_scores_s, labels, "All datasets + states noise", "all_sn")
+
+
+# actor_data = {}
+# actor_data['ReBRAC'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/0z8dn2l0'], only_last=True)
+# actor_data['ReBRAC+LN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/gs6rtiyt'], only_last=True)
+# actor_data['ReBRAC+L2'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/l367pg9o'], only_last=True, params_filter={"actor_wd": 0.001})
+# actor_data['ReBRAC+L1'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/psuls6h7'], only_last=True, params_filter={"actor_wd": 0.0001})
+# actor_data['ReBRAC+EN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/h6pbjmbh'], only_last=True, params_filter={"actor_wd": 0.001})
+# actor_data['ReBRAC+DO'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/ozpwee0i'], only_last=True, params_filter={"actor_dropout": 0.1})
+# actor_data['ReBRAC+InN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/vxdbh1ir'], only_last=True, params_filter={"actor_input_noise": 0.003})
+# actor_data['ReBRAC+BCN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/gaf8jov8'], only_last=True, params_filter={"actor_bc_noise":  0.01})
+# actor_data['ReBRAC+GrN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/40y41cde'], only_last=True, params_filter={"actor_grad_noise": 0.01})
+#
+# actor_data['IQL'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/zb7ph6s6'], only_last=True)
+# actor_data['IQL+LN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/6mckizcf'], only_last=True)
+# actor_data['IQL+L2'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=True, params_filter={"actor_wd": 0.1, "l1_ratio": 0.0})
+# actor_data['IQL+L1'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=True, params_filter={"actor_wd": 0.01, "l1_ratio": 1.0})
+# actor_data['IQL+EN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/qqr9mkfd'], only_last=True, params_filter={"actor_wd": 0.01, "l1_ratio": 0.5})
+# actor_data['IQL+DO'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/5h7vroey'], only_last=True, params_filter={"actor_dropout": 0.1})
+# actor_data['IQL+InN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/k4wksvwn'], only_last=True, params_filter={"actor_input_noise": 0.01})
+# actor_data['IQL+BCN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/xha44dyd'], only_last=True, params_filter={"actor_bc_noise": 0.3})
+# actor_data['IQL+GrN'] = get_actor_data_from_sweeps(['tarasovd/ActoReg/sweeps/8qeewggq'], only_last=True, params_filter={"actor_grad_noise": 0.01})
+#
+# with open('bin/actor_data.pickle', 'wb') as handle:
+#     pickle.dump(actor_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+with open('bin/actor_data.pickle', 'rb') as handle:
+    actor_data = pickle.load(handle)
+
+
+def preprocess_actor_data(scores, metric="pca_rank"):
+    algos = list(scores.keys())
+    envs = [
+        "hopper-medium-v2",
+        "halfcheetah-medium-v2",
+        "walker2d-medium-v2",
+        "antmaze-medium-diverse-v2",
+        "antmaze-large-diverse-v2",
+        "pen-cloned-v1",
+        "door-cloned-v1",
+        "hammer-cloned-v1",
+        "relocate-cloned-v1",
+    ]
+    gym_scores = [[] for _ in range(len(algos))]
+    antmaze_scores = [[] for _ in range(len(algos))]
+    adroit_scores = [[] for _ in range(len(algos))]
+    adroit_ne_scores = [[] for _ in range(len(algos))]
+    all_scores = [[] for _ in range(len(algos))]
+
+    gym_unag = [[] for _ in range(len(algos))]
+    antmaze_unag = [[] for _ in range(len(algos))]
+    adroit_unag = [[] for _ in range(len(algos))]
+    all_unag = [[] for _ in range(len(algos))]
+    for env in envs:
+        for i, a in enumerate(algos):
+            # print(a, env, scores[a][env][f'validation_metrics/{metric}'])
+            fraction = (np.array(scores[a][env][f'validation_metrics/{metric}'])) / np.maximum(scores[a][env][f'train_metrics/{metric}'], 1e-3)
+            lf = list(filter(lambda x: x < 10, list(fraction)))
+            # print(fraction, np.mean(fraction))
+            all_unag[i] += lf
+            if "antmaze" in env:
+                antmaze_scores[i].append(np.mean(fraction))
+                antmaze_unag[i] += lf
+            elif "v2" in env:
+                gym_scores[i].append(np.mean(fraction))
+                gym_unag[i] += lf
+            else:
+                if "expert" not in env:
+                    adroit_ne_scores[i].append(fraction)
+                adroit_scores[i].append(np.mean(fraction))
+                adroit_unag[i] += lf
+    return algos, gym_unag, antmaze_unag, adroit_unag, all_unag
+
+
+def plot_actor_boxes(data, labels, title, save_suffix, xlabel="validation / train"):
+    box = plt.boxplot(data, labels=labels, patch_artist=True, vert=False, showfliers=False)
+    # for patch, color in zip(box['boxes'], colors):
+    #     patch.set_facecolor(color)
+    for median in box['medians']:
+        median.set_color('red')
+    # Add a title and labels
+    plt.title(title)
+    plt.xlabel(xlabel)
+    # Display the plot
+    plt.savefig(f"out/actor_boxes_{save_suffix}.pdf", dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def plot_metric(actor_data, metric, title, suffix):
+    labels, gym_scores, antmaze_scores, adroit_scores, all_scores = preprocess_actor_data(actor_data, metric)
+
+    for sc, t, s in zip(
+        [gym_scores, antmaze_scores, adroit_scores, all_scores],
+        ["Gym-MuJoCo ", "AntMaze ", "Adroit ", "All domains "],
+        ["gym", "antmaze", "adroit", "all"]
+    ):
+        plot_actor_boxes(sc, labels, t + title, f"{suffix}_{s}")
+
+
+sns.set(style="ticks", font_scale=1.0)
+plot_metric(actor_data, "dead_neurons_frac", "Dead neurons", "dead_neurons")
+plot_metric(actor_data, "feature_norms", "Features norms", "feature_norms")
+plot_metric(actor_data, "feature_means", "Features means", "feature_means")
+plot_metric(actor_data, "feature_stds", "Features stds", "feature_stds")
+plot_metric(actor_data, "pca_rank", "PCA rank", "pca")
+plot_metric(actor_data, "actor_loss", "Actor loss", "loss")
+
+# plasticity_data = {}
+# plasticity_data["ReBRAC"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/hhrqhme8'], only_last=True)
+# plasticity_data["ReBRAC+LN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/8k5oxdy2'], only_last=True)
+# plasticity_data["ReBRAC+L2"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/7cvugreb'], only_last=True)
+# plasticity_data["ReBRAC+L1"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/r7qq8yx1'], only_last=True)
+# plasticity_data["ReBRAC+EN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/nq4h6mvl'], only_last=True)
+# plasticity_data["ReBRAC+DO"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/21vk0egg'], only_last=True)
+# plasticity_data["ReBRAC+InN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/5n3zz22m'], only_last=True)
+# plasticity_data["ReBRAC+BCN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/jnasq4rs'], only_last=True)
+# plasticity_data["ReBRAC+GrN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/2rkoojnp'], only_last=True)
+#
+# with open('bin/plasticity_data.pickle', 'wb') as handle:
+#     pickle.dump(plasticity_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+with open('bin/plasticity_data.pickle', 'rb') as handle:
+    plasticity_data = pickle.load(handle)
+
+plasticity_data["IQL"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/sfck1iif'], only_last=True)
+plasticity_data["IQL+LN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/4dbfwbfh'], only_last=True)
+plasticity_data["IQL+L2"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/nxl9f4i4'], only_last=True)
+plasticity_data["IQL+L1"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/ug8ajlq6'], only_last=True)
+plasticity_data["IQL+EN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/p1k9lmnw'], only_last=True)
+plasticity_data["IQL+DO"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/3nx833sc'], only_last=True)
+plasticity_data["IQL+InN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/y599n4z4'], only_last=True)
+plasticity_data["IQL+BCN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/ust6a7fh'], only_last=True)
+plasticity_data["IQL+GrN"] = get_plasticity_from_sweeps(['tarasovd/ActoReg/sweeps/eepfpvya'], only_last=True)
+
+with open('bin/plasticity_data.pickle', 'wb') as handle:
+    pickle.dump(plasticity_data, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+with open('bin/plasticity_data.pickle', 'rb') as handle:
+    plasticity_data = pickle.load(handle)
+
+def preprocess_plasticity_data(scores, metric="bc_loss"):
+    algos = list(scores.keys())
+    envs = [
+        "hopper-medium-v2",
+        "halfcheetah-medium-v2",
+        "walker2d-medium-v2",
+        "antmaze-medium-diverse-v2",
+        "antmaze-large-diverse-v2",
+        "pen-cloned-v1",
+        "door-cloned-v1",
+        "hammer-cloned-v1",
+        "relocate-cloned-v1",
+    ]
+    gym_scores = [[] for _ in range(len(algos))]
+    antmaze_scores = [[] for _ in range(len(algos))]
+    adroit_scores = [[] for _ in range(len(algos))]
+    adroit_ne_scores = [[] for _ in range(len(algos))]
+    all_scores = [[] for _ in range(len(algos))]
+
+    gym_unag = [[] for _ in range(len(algos))]
+    antmaze_unag = [[] for _ in range(len(algos))]
+    adroit_unag = [[] for _ in range(len(algos))]
+    all_unag = [[] for _ in range(len(algos))]
+    for env in envs:
+        for i, a in enumerate(algos):
+            # print(a, env, scores[a][env][f'validation_metrics/{metric}'])
+            fraction = np.array(scores[a][env][f'plasticity/{metric}'])
+            lf = list(filter(lambda x: True, list(fraction)))
+            # print(fraction, np.mean(fraction))
+            all_unag[i] += lf
+            if "antmaze" in env:
+                antmaze_scores[i].append(np.mean(fraction))
+                antmaze_unag[i] += lf
+            elif "v2" in env:
+                gym_scores[i].append(np.mean(fraction))
+                gym_unag[i] += lf
+            else:
+                if "expert" not in env:
+                    adroit_ne_scores[i].append(fraction)
+                adroit_scores[i].append(np.mean(fraction))
+                adroit_unag[i] += lf
+    return algos, gym_unag, antmaze_unag, adroit_unag, all_unag
+
+labels, gym_scores, antmaze_scores, adroit_scores, all_scores = preprocess_plasticity_data(plasticity_data)
+for sc, t, s in zip(
+    [gym_scores, antmaze_scores, adroit_scores, all_scores],
+    ["Gym-MuJoCo ", "AntMaze ", "Adroit ", "All domains "],
+    ["gym", "antmaze", "adroit", "all"]
+):
+    plot_actor_boxes(sc, labels, t + "Plasticity", f"plasticity_{s}", xlabel="Optimized BC loss")
