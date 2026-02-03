@@ -74,6 +74,7 @@ class Config:
     nf_use_plu: bool = True
     nf_use_layernorm: bool = True
     nf_dropout: float = 0.1
+    nf_det_layers: int = 2
     nf_eval_num_samples: int = 32
     nf_eval_z_scale: float = 1.0
     nf_eval_z_clip: float = 0.0
@@ -982,6 +983,8 @@ class ActorTrainState(TrainState):
     dropout_key: jax.Array
     batch_stats: Any
     target_batch_stats: Any
+    constants: Any = None
+    target_constants: Any = None
 
 
 class ValueTrainState(TrainState):
@@ -1012,7 +1015,7 @@ def update_actor(
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
         if use_nf:
             actions = actor.apply_fn(
-                {'params': params, 'batch_stats': actor.batch_stats},
+                {'params': params, 'batch_stats': actor.batch_stats, 'constants': actor.constants},
                 batch["states"] + in_noise,
                 batch["prev_actions"],
                 rng=sample_key,
@@ -1023,7 +1026,7 @@ def update_actor(
             updates = {'batch_stats': actor.batch_stats}
             bc_actions = batch["actions"] + b_noise
             log_probs = actor.apply_fn(
-                {'params': params, 'batch_stats': actor.batch_stats},
+                {'params': params, 'batch_stats': actor.batch_stats, 'constants': actor.constants},
                 bc_actions,
                 batch["states"] + in_noise,
                 batch["prev_actions"],
@@ -1178,6 +1181,7 @@ def update_critic(
             {
                 'params': actor.target_params,
                 'batch_stats': actor.target_batch_stats,
+                'constants': actor.target_constants,
             },
             batch["next_states"],
             next_prev_actions,
@@ -1467,6 +1471,7 @@ def train(config: Config):
             use_plu=config.nf_use_plu,
             use_layernorm=config.nf_use_layernorm,
             dropout_rate=config.nf_dropout,
+            deterministic_layers=config.nf_det_layers,
         )
         reset_module = NFActor(
             action_dim=init_action.shape[-1],
@@ -1479,6 +1484,7 @@ def train(config: Config):
             use_plu=config.nf_use_plu,
             use_layernorm=config.nf_use_layernorm,
             dropout_rate=config.nf_dropout,
+            deterministic_layers=config.nf_det_layers,
         )
     else:
         if config.actor_prereset_mode:
@@ -1537,7 +1543,7 @@ def train(config: Config):
 
     if config.use_nf:
         init_vars = actor_module.init(
-            {"params": actor_key},
+            {"params": actor_key, "mask": actor_key},
             init_state,
             init_prev_actions,
             rng=actor_key,
@@ -1551,6 +1557,8 @@ def train(config: Config):
         batch_stats=init_vars['batch_stats'] if 'batch_stats' in init_vars else {},
         target_params=init_vars['params'],
         target_batch_stats=init_vars['batch_stats'] if 'batch_stats' in init_vars else {},
+        constants=init_vars.get("constants", {}),
+        target_constants=init_vars.get("constants", {}),
         dropout_key=dropout_key,
         tx=optimizer,
     )
@@ -1840,7 +1848,7 @@ def train(config: Config):
         if config.use_nf:
             if num_samples > 1:
                 return actor.apply_fn(
-                    params,
+                    {**params, "constants": actor.constants},
                     obs,
                     prev_actions,
                     rng=rng,
@@ -1851,7 +1859,12 @@ def train(config: Config):
                     method=NFActor.sample_n,
                 )
             return actor.apply_fn(
-                params, obs, prev_actions, rng=rng, train=False, method=NFActor.sample
+                {**params, "constants": actor.constants},
+                obs,
+                prev_actions,
+                rng=rng,
+                train=False,
+                method=NFActor.sample,
             )
         return actor.apply_fn(params, obs, prev_actions, False)[0]
 
@@ -1863,7 +1876,7 @@ def train(config: Config):
             if config.actor_reset:
                 if config.use_nf:
                     reset_params = reset_module.init(
-                        {"params": actor_key},
+                        {"params": actor_key, "mask": actor_key},
                         init_state,
                         init_prev_actions,
                         rng=actor_key,
@@ -1877,6 +1890,8 @@ def train(config: Config):
                     batch_stats=reset_params['batch_stats'] if 'batch_stats' in reset_params else {},
                     target_params=reset_params,
                     target_batch_stats=reset_params['batch_stats'] if 'batch_stats' in reset_params else {},
+                    constants=reset_params.get("constants", {}),
+                    target_constants=reset_params.get("constants", {}),
                     dropout_key=dropout_key,
                     tx=optimizer,
                 )

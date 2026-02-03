@@ -9,7 +9,6 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 import math
 import uuid
 import random
-from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Any, Callable, Dict, Sequence, Tuple, Union, Optional
@@ -94,12 +93,7 @@ class Config:
     v_expand: float = 0.0
     v_expand_mode: str = "both"
 
-    # validation data config
-    det_validation: bool = True
-    validation_frac: float = 0.05
-    track_val_stats: bool = True
     noisy_eval: bool = False
-    track_plasticity: bool = False
     mlc_job_name: str = None
 
     def __post_init__(self):
@@ -363,11 +357,9 @@ def qlearning_dataset(
         normalize_reward=False,
         dataset=None,
         terminate_on_end: bool = False,
-        validation_frac: float = 0.05,
         discount=0.99,
-        det_validation=True,
         **kwargs,
-) -> Tuple[Dict, Dict, float, float]:
+) -> Tuple[Dict, float, float]:
     if dataset is None:
         dataset = env.get_dataset(**kwargs)
 
@@ -437,78 +429,19 @@ def qlearning_dataset(
     print("SHAPE", np.array(mc_returns_).shape, np.array(reward_).shape, np.array(done_).shape)
     assert np.array(mc_returns_).shape == np.array(reward_).shape
 
-    cnt_episodes = len(episode_ends)
-    cnt_train_episodes = int(cnt_episodes * (1 - validation_frac))
-
-    print("TOTAL NUMBER OF EPISODES:", cnt_episodes)
-    print("TRAIN EPISODES:", cnt_train_episodes)
-    print("VAL EPISODES:", cnt_episodes - cnt_train_episodes)
-
-    # last_train_ep_idx = episode_ends[cnt_train_episodes]
-
     cls_rewards = np.array(mc_returns_)
 
-    # episode_ends.append(len(obs_))
-    episode_ends = [-1] + episode_ends
-    intervals = [(episode_ends[i]+1, episode_ends[i + 1]+1) for i in range(len(episode_ends) - 1)]
-
-    if not det_validation:
-        random.shuffle(intervals)
-    # print(intervals)
-    train_intervals = intervals[:cnt_train_episodes]
-    val_intervals = intervals[cnt_train_episodes:]
-
-    t_obs = []
-    t_action = []
-    t_next_obs = []
-    t_next_action = []
-    t_reward = []
-    t_done = []
-
-    v_obs = []
-    v_action = []
-    v_next_obs = []
-    v_next_action = []
-    v_reward = []
-    v_done = []
-
-    for inter in train_intervals:
-        t_obs += obs_[inter[0]:inter[1]]
-        t_action += action_[inter[0]:inter[1]]
-        t_next_obs += next_obs_[inter[0]:inter[1]]
-        t_next_action += next_action_[inter[0]:inter[1]]
-        t_reward += reward_[inter[0]:inter[1]]
-        t_done += done_[inter[0]:inter[1]]
-
-    for inter in val_intervals:
-        v_obs += obs_[inter[0]:inter[1]]
-        v_action += action_[inter[0]:inter[1]]
-        v_next_obs += next_obs_[inter[0]:inter[1]]
-        v_next_action += next_action_[inter[0]:inter[1]]
-        v_reward += reward_[inter[0]:inter[1]]
-        v_done += done_[inter[0]:inter[1]]
-
-    # print("Last train idx:", last_train_ep_idx, "out of", len(obs_))
     train_data = {
-        "observations": np.array(t_obs),
-        "actions": np.array(t_action),
-        "next_observations": np.array(t_next_obs),
-        "next_actions": np.array(t_next_action),
-        "rewards": np.array(t_reward),
-        "terminals": np.array(t_done),
+        "observations": np.array(obs_),
+        "actions": np.array(action_),
+        "next_observations": np.array(next_obs_),
+        "next_actions": np.array(next_action_),
+        "rewards": np.array(reward_),
+        "terminals": np.array(done_),
     }
+    print("Trains obs size:", len(train_data['observations']))
 
-    val_data = {
-        "observations": np.array(v_obs),
-        "actions": np.array(v_action),
-        "next_observations": np.array(v_next_obs),
-        "next_actions": np.array(v_next_action),
-        "rewards": np.array(v_reward),
-        "terminals": np.array(v_done),
-    }
-    print("Trains obs size:", len(train_data['observations']), "Val obs size:", len(val_data['observations']),)
-
-    return train_data, val_data, jnp.min(cls_rewards), jnp.max(cls_rewards)
+    return train_data, jnp.min(cls_rewards), jnp.max(cls_rewards)
 
 
 def compute_mean_std(states: jax.Array, eps: float) -> Tuple[jax.Array, jax.Array]:
@@ -524,8 +457,6 @@ def normalize_states(states: jax.Array, mean: jax.Array, std: jax.Array) -> jax.
 @chex.dataclass
 class ReplayBuffer:
     data: Dict[str, jax.Array] = None
-    val_data: Dict[str, jax.Array] = None
-    random_data: Dict[str, jax.Array] = None
     mean: float = 0
     std: float = 1
     min: float = 0
@@ -537,14 +468,9 @@ class ReplayBuffer:
             normalize_reward: bool = False,
             is_normalize: bool = False,
             discount: float = 0.99,
-            validation_frac: float = 0.05,
-            det_validation: bool = True,
     ):
-        d4rl_data, val_data, self.min, self.max = qlearning_dataset(gym.make(dataset_name), dataset_name, discount=discount, validation_frac=validation_frac, det_validation=det_validation)
+        d4rl_data, self.min, self.max = qlearning_dataset(gym.make(dataset_name), dataset_name, discount=discount)
         print("Min/Max", self.min, self.max)
-
-        state_min = np.min(d4rl_data["observations"], axis=0)
-        state_max = np.max(d4rl_data["observations"], axis=0)
 
         buffer = {
             "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
@@ -556,24 +482,6 @@ class ReplayBuffer:
             "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
             "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
         }
-        val_buffer = {
-            "states": jnp.asarray(val_data["observations"], dtype=jnp.float32),
-            "actions": jnp.asarray(val_data["actions"], dtype=jnp.float32),
-            "rewards": jnp.asarray(val_data["rewards"], dtype=jnp.float32),
-            "next_states": jnp.asarray(
-                val_data["next_observations"], dtype=jnp.float32
-            ),
-            "next_actions": jnp.asarray(val_data["next_actions"], dtype=jnp.float32),
-            "dones": jnp.asarray(val_data["terminals"], dtype=jnp.float32),
-        }
-
-        random_buffer = {
-            "states": jnp.asarray(np.random.uniform(0, 1, (max(1, val_data["observations"].shape[0]), state_max.shape[0])) * (
-                        state_max - state_min) + state_min, dtype=jnp.float32),
-            "actions": jnp.asarray(
-                np.random.uniform(-1, 1, (max(1, val_data["observations"].shape[0]), d4rl_data["actions"].shape[1])),
-                dtype=jnp.float32),
-        }
 
         if is_normalize:
             self.mean, self.std = compute_mean_std(buffer["states"], eps=1e-3)
@@ -581,24 +489,11 @@ class ReplayBuffer:
             buffer["next_states"] = normalize_states(
                 buffer["next_states"], self.mean, self.std
             )
-            val_buffer["states"] = normalize_states(val_buffer["states"], self.mean, self.std)
-            val_buffer["next_states"] = normalize_states(
-                val_buffer["next_states"], self.mean, self.std
-            )
-            random_buffer["states"] = normalize_states(random_buffer["states"], self.mean, self.std)
-            random_buffer["next_states"] = normalize_states(
-                random_buffer["next_states"], self.mean, self.std
-            )
         if normalize_reward:
             buffer["rewards"] = ReplayBuffer.normalize_reward(
                 dataset_name, buffer["rewards"]
             )
-            val_buffer["rewards"] = ReplayBuffer.normalize_reward(
-                dataset_name, val_buffer["rewards"]
-            )
         self.data = buffer
-        self.val_data = val_buffer
-        self.random_data = random_buffer
 
     @property
     def size(self) -> int:
@@ -611,22 +506,16 @@ class ReplayBuffer:
         indices = jax.random.randint(
             key, shape=(batch_size,), minval=0, maxval=self.size
         )
-        batch = jax.tree_map(lambda arr: arr[indices], self.data)
+        batch = jax.tree_util.tree_map(lambda arr: arr[indices], self.data)
         return batch
 
     def sample_n_first(
             self, batch_size: int
     ) -> Dict[str, jax.Array]:
         indices = jnp.arange(0, batch_size)
-        batch = jax.tree_map(lambda arr: arr[indices], self.data)
+        batch = jax.tree_util.tree_map(lambda arr: arr[indices], self.data)
         return batch
 
-    def sample_random(
-            self, batch_size: int
-    ) -> Dict[str, jax.Array]:
-        indices = jnp.arange(0, batch_size)
-        batch = jax.tree_map(lambda arr: arr[indices], self.random_data)
-        return batch
 
     def get_moments(self, modality: str) -> Tuple[jax.Array, jax.Array]:
         mean = self.data[modality].mean(0)
@@ -653,11 +542,13 @@ class Metrics:
         return Metrics(accumulators=init_metrics)
 
     def update(self, updates: Dict[str, jax.Array]) -> "Metrics":
-        new_accumulators = deepcopy(self.accumulators)
-        for key, value in updates.items():
-            acc, steps = new_accumulators[key]
-            new_accumulators[key] = (acc + value, steps + 1)
-
+        new_accumulators = {}
+        for key, (acc, steps) in self.accumulators.items():
+            if key in updates:
+                value = updates[key]
+                new_accumulators[key] = (acc + value, steps + 1)
+            else:
+                new_accumulators[key] = (acc, steps)
         return self.replace(accumulators=new_accumulators)
 
     def compute(self) -> Dict[str, np.ndarray]:
@@ -781,47 +672,6 @@ class ActorTrainState(TrainState):
     target_batch_stats: Any
 
 
-def compute_dead_neurons_statistic(logits: jax.Array):
-    positive_count = jnp.sum(logits > 0, axis=0)
-    dead_count = jnp.sum((positive_count == 0))
-    return dead_count / logits.shape[1]
-
-
-def compute_feature_norm(logits: jax.Array):
-    norms = jnp.linalg.norm(logits, axis=1)
-    means = jnp.mean(logits, axis=1)
-    stds = jnp.std(logits, axis=1)
-    return jnp.mean(norms), jnp.mean(means), jnp.mean(stds)
-
-
-def compute_feature_rank_pca(logits: jax.Array):
-    cutoff = 0.01
-    threshold = 1 - cutoff
-
-    svals = jnp.linalg.svd(logits, full_matrices=False, compute_uv=False)
-    sval_squares = svals ** 2
-    sval_squares_sum = jnp.sum(sval_squares)
-    cumsum_squares = jnp.cumsum(sval_squares)
-    threshold_crossed = cumsum_squares >= (threshold * sval_squares_sum)
-    approximate_ranks = (~threshold_crossed).sum() + 1
-
-    return approximate_ranks
-
-
-def compute_feature_statistics(logits: jax.Array):
-    dead_neurons_frac = compute_dead_neurons_statistic(logits)
-    feature_norms, feature_means, feature_stds = compute_feature_norm(logits)
-    pca_rank = compute_feature_rank_pca(logits)
-
-    return {
-        "dead_neurons_frac": dead_neurons_frac,
-        "feature_norms": feature_norms,
-        "feature_means": feature_means,
-        "feature_stds": feature_stds,
-        "pca_rank": pca_rank,
-    }
-
-
 def update_actor(
         key: jax.random.PRNGKey,
         actor: TrainState,
@@ -855,7 +705,7 @@ def update_actor(
 
         lmbda = 1
         if normalize_q:
-            lmbda = jax.lax.stop_gradient(1 / jax.numpy.abs(q_values).mean())
+            lmbda = jax.lax.stop_gradient(1 / jnp.abs(q_values).mean())
 
         loss = (beta * bc_penalty - lmbda * q_values).mean()
 
@@ -907,7 +757,7 @@ def update_actor(
 
     actor_params = new_actor.params
     actor_params = jax.tree_util.tree_map(lambda x: x.reshape(-1), actor_params)
-    flat_vals, _ = jax.tree.flatten(actor_params)
+    flat_vals, _ = jax.tree_util.tree_flatten(actor_params)
     flat_mean = jnp.mean(jnp.concatenate(flat_vals))
 
     new_metrics = new_metrics.update(
@@ -937,12 +787,12 @@ def update_critic(
         },
         batch["next_states"], False
     )
-    noise = jax.numpy.clip(
+    noise = jnp.clip(
         (jax.random.normal(actions_key, next_actions.shape) * policy_noise),
         -noise_clip,
         noise_clip,
     )
-    next_actions = jax.numpy.clip(next_actions + noise, -1, 1)
+    next_actions = jnp.clip(next_actions + noise, -1, 1)
     bc_penalty = ((next_actions - batch["next_actions"]) ** 2).sum(-1)
     logits = critic.apply_fn(critic.target_params, batch["next_states"], next_actions)
     probs = nn.softmax(logits, axis=-1)
@@ -1076,93 +926,6 @@ def action_fn(actor: TrainState) -> Callable:
     return _action_fn
 
 
-def eval_actor(
-        key: jax.random.PRNGKey,
-        actor: TrainState,
-        critic: TrainState,
-        batch: Dict[str, jax.Array],
-        beta: float,
-        normalize_q: bool,
-) -> Tuple[jax.random.PRNGKey, Dict]:
-    key, random_action_key = jax.random.split(key, 2)
-    metrics = {}
-
-    def actor_loss_fn(params: jax.Array) -> jax.Array:
-        actions, preact = actor.apply_fn({
-                "params": actor.params,
-                "batch_stats": actor.batch_stats,
-            }, batch["states"], False)
-
-        bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
-
-        logits = critic.apply_fn(critic.params, batch["states"], actions)
-        probs = nn.softmax(logits, axis=-1)
-        q_values = transform_from_probs(probs, critic.support).min(0)
-
-        lmbda = 1
-        if normalize_q:
-            lmbda = jax.lax.stop_gradient(1 / jax.numpy.abs(q_values).mean())
-
-        loss = (beta * bc_penalty - lmbda * q_values).mean()
-
-        metrics.update(
-            {
-                "actor_loss": loss,
-                "action_mse": ((actions - batch["actions"]) ** 2).mean(),
-            }
-        )
-        metrics.update(compute_feature_statistics(preact))
-
-        return loss
-
-    actor_loss_fn(actor.params)
-
-    return key, metrics
-
-
-def get_plasticity(
-        key: jax.random.PRNGKey,
-        actor: TrainState,
-        critic: TrainState,
-        batch: Dict[str, jax.Array],
-        beta: float,
-        normalize_q: bool,
-) -> Tuple[jax.random.PRNGKey, Dict]:
-    key, random_action_key = jax.random.split(key, 2)
-    metrics = {"plasticity/bc_loss": 0}
-
-    @jax.jit
-    def actor_loss_fn(params: jax.Array, dropout_key) -> Tuple[jax.Array, Metrics]:
-        (actions, preact), updates = actor.apply_fn(
-            {'params': params, 'batch_stats': actor.batch_stats},
-            batch["states"], True, rngs={'dropout': dropout_key},
-            mutable=['batch_stats'],
-        )
-        bc_penalty = ((actions - batch["actions"]) ** 2).sum(-1)
-
-        loss = bc_penalty.mean()
-
-        metrics.update({"plasticity/bc_loss": ((actions - batch["actions"]) ** 2).mean()})
-        return loss, (updates, metrics)
-
-    new_actor = actor.replace()
-    dropout_key, new_dropout_key = jax.random.split(new_actor.dropout_key, 2)
-    loss, (updates, metrics) = actor_loss_fn(actor.params, dropout_key)
-
-    for _ in range(100):
-        dropout_key, new_dropout_key = jax.random.split(new_actor.dropout_key, 2)
-        grads, (updates, metrics) = jax.grad(actor_loss_fn, has_aux=True)(actor.params, dropout_key)
-        new_actor = new_actor.apply_gradients(grads=grads)
-
-        new_actor = new_actor.replace(
-            batch_stats=updates['batch_stats'],
-        )
-        new_actor = new_actor.replace(
-            dropout_key=new_dropout_key,
-        )
-    metrics["plasticity/start_loss"] = loss
-    return key, metrics
-
 @pyrallis.wrap()
 def train(config: Config):
     config.project = "ActoReg"
@@ -1180,7 +943,6 @@ def train(config: Config):
     buffer = ReplayBuffer()
     buffer.create_from_d4rl(
         config.dataset_name, config.normalize_reward, config.normalize_states, discount=config.gamma,
-        validation_frac=config.validation_frac, det_validation=config.det_validation,
     )
     random.seed(config.train_seed)
     key = jax.random.PRNGKey(seed=config.train_seed)
@@ -1350,53 +1112,6 @@ def train(config: Config):
         actor_grad_noise=config.actor_grad_noise,
     )
 
-    def td3_loop_update_step(i: int, carry: TrainState):
-        key, batch_key = jax.random.split(carry["key"])
-        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
-
-        full_update = partial(
-            update_td3_partial,
-            key=key,
-            actor=carry["actor"],
-            critic=carry["critic"],
-            batch=batch,
-            metrics=carry["metrics"],
-        )
-
-        update = partial(
-            update_td3_no_targets_partial,
-            key=key,
-            actor=carry["actor"],
-            critic=carry["critic"],
-            batch=batch,
-            metrics=carry["metrics"],
-        )
-
-        key, new_actor, new_critic, new_metrics = jax.lax.cond(
-            update_carry["delayed_updates"][i], full_update, update
-        )
-
-        carry.update(key=key, actor=new_actor, critic=new_critic, metrics=new_metrics)
-        return carry
-
-    def refinement_loop_update_step(i: int, carry: TrainState):
-        key, batch_key = jax.random.split(carry["key"])
-        batch = carry["buffer"].sample_batch(batch_key, batch_size=config.batch_size)
-
-        full_update = partial(
-            update_refinement_partial,
-            key=key,
-            actor=carry["actor"],
-            critic=carry["critic"],
-            batch=batch,
-            metrics=carry["metrics"],
-        )
-
-        key, new_actor, new_critic, new_metrics = full_update()
-
-        carry.update(key=key, actor=new_actor, critic=new_critic, metrics=new_metrics)
-        return carry
-
     # metrics
     bc_metrics_to_log = [
         "critic_loss",
@@ -1408,15 +1123,117 @@ def train(config: Config):
         "action_mse",
         "weights/actor_weights_mean",
     ]
-    # shared carry for update loops
+    delayed_updates = jnp.equal(
+        jnp.arange(config.num_updates_on_epoch) % config.policy_freq, 0
+    )
+
+    def run_td3_updates(carry, buffer_data):
+        buffer_size = buffer_data["states"].shape[0]
+
+        key, indices_key = jax.random.split(carry["key"])
+        batch_indices = jax.random.randint(
+            indices_key,
+            shape=(config.num_updates_on_epoch, config.batch_size),
+            minval=0,
+            maxval=buffer_size,
+        )
+
+        def body(carry, inputs):
+            indices, do_update = inputs
+            batch = jax.tree_util.tree_map(lambda arr: arr[indices], buffer_data)
+
+            full_update = partial(
+                update_td3_partial,
+                key=carry["key"],
+                actor=carry["actor"],
+                critic=carry["critic"],
+                batch=batch,
+                metrics=carry["metrics"],
+            )
+
+            update = partial(
+                update_td3_no_targets_partial,
+                key=carry["key"],
+                actor=carry["actor"],
+                critic=carry["critic"],
+                batch=batch,
+                metrics=carry["metrics"],
+            )
+
+            key, new_actor, new_critic, new_metrics = jax.lax.cond(
+                do_update, full_update, update
+            )
+
+            new_carry = {
+                "key": key,
+                "actor": new_actor,
+                "critic": new_critic,
+                "metrics": new_metrics,
+            }
+            return new_carry, None
+
+        carry = {
+            "key": key,
+            "actor": carry["actor"],
+            "critic": carry["critic"],
+            "metrics": carry["metrics"],
+        }
+        carry, _ = jax.lax.scan(
+            body, carry, (batch_indices, delayed_updates)
+        )
+        return carry
+
+    def run_refinement_updates(carry, buffer_data):
+        buffer_size = buffer_data["states"].shape[0]
+
+        key, indices_key = jax.random.split(carry["key"])
+        batch_indices = jax.random.randint(
+            indices_key,
+            shape=(config.num_updates_on_epoch, config.batch_size),
+            minval=0,
+            maxval=buffer_size,
+        )
+
+        def body(carry, indices):
+            batch = jax.tree_util.tree_map(lambda arr: arr[indices], buffer_data)
+
+            full_update = partial(
+                update_refinement_partial,
+                key=carry["key"],
+                actor=carry["actor"],
+                critic=carry["critic"],
+                batch=batch,
+                metrics=carry["metrics"],
+            )
+
+            key, new_actor, new_critic, new_metrics = full_update()
+
+            new_carry = {
+                "key": key,
+                "actor": new_actor,
+                "critic": new_critic,
+                "metrics": new_metrics,
+            }
+            return new_carry, None
+
+        carry = {
+            "key": key,
+            "actor": carry["actor"],
+            "critic": carry["critic"],
+            "metrics": carry["metrics"],
+        }
+        carry, _ = jax.lax.scan(
+            body, carry, batch_indices
+        )
+        return carry
+
+    run_td3_updates = jax.jit(run_td3_updates)
+    run_refinement_updates = jax.jit(run_refinement_updates)
+
     update_carry = {
         "key": key,
         "actor": actor,
         "critic": critic,
-        "buffer": buffer,
-        "delayed_updates": jax.numpy.equal(
-            jax.numpy.arange(config.num_updates_on_epoch) % config.policy_freq, 0
-        ).astype(int),
     }
 
     @jax.jit
@@ -1427,12 +1244,11 @@ def train(config: Config):
     def expert_action_fn(params: jax.Array, obs: jax.Array):
         return expert_actor.apply_fn(params, obs, False)[0]
 
-    update_fn = td3_loop_update_step
-
     for epoch in trange(config.num_epochs, desc="ReBRAC Epochs"):
+        update_fn = run_td3_updates
         if epoch == config.num_epochs - config.num_refinement_epochs:
             print("Refinement stage")
-            update_fn = refinement_loop_update_step
+            update_fn = run_refinement_updates
             if config.actor_reset:
                 actor = ActorTrainState.create(
                     apply_fn=reset_module.apply,
@@ -1447,12 +1263,7 @@ def train(config: Config):
         # we need to reset them every epoch
         update_carry["metrics"] = Metrics.create(bc_metrics_to_log)
 
-        update_carry = jax.lax.fori_loop(
-            lower=0,
-            upper=config.num_updates_on_epoch,
-            body_fun=update_fn,
-            init_val=update_carry,
-        )
+        update_carry = update_fn(update_carry, buffer.data)
         # log mean over epoch for each metric
         mean_metrics = update_carry["metrics"].compute()
         wandb.log(
@@ -1499,35 +1310,6 @@ def train(config: Config):
                     )
                     normalized_returns = eval_env.get_normalized_score(returns) * 100.0
                     eval_metrics[f"eval/normalized_score_mean_sn_{sn}_an_{an}"] = np.mean(normalized_returns)
-            if config.track_val_stats:
-                new_key, val_metrics = eval_actor(update_carry["key"], update_carry["actor"], update_carry["critic"],
-                                                  buffer.val_data, config.actor_bc_coef, config.normalize_q)
-                if config.track_plasticity:
-                    new_key, plasticity_metrics = get_plasticity(new_key, update_carry["actor"], update_carry["critic"],
-                                                      buffer.val_data, config.actor_bc_coef, config.normalize_q)
-                    eval_metrics.update(plasticity_metrics)
-                new_key, train_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
-                                                    buffer.sample_n_first(buffer.val_data["states"].shape[0]),
-                                                    config.actor_bc_coef, config.normalize_q)
-                new_key, eval_metrics_1 = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
-                                                     eval_batch,
-                                                     config.actor_bc_coef, config.normalize_q)
-                new_key, rand_metrics = eval_actor(new_key, update_carry["actor"], update_carry["critic"],
-                                                   buffer.sample_random(buffer.val_data["states"].shape[0]),
-                                                   config.actor_bc_coef, config.normalize_q)
-                del eval_metrics_1["action_mse"]
-
-                for k in train_metrics:
-                    eval_metrics[f"train_metrics/{k}"] = train_metrics[k]
-                for k in val_metrics:
-                    eval_metrics[f"validation_metrics/{k}"] = val_metrics[k]
-                for k in eval_metrics_1:
-                    eval_metrics[f"eval_metrics/{k}"] = eval_metrics_1[k]
-                for k in rand_metrics:
-                    eval_metrics[f"rand_metrics/{k}"] = rand_metrics[k]
-
-                update_carry["key"] = new_key
-
             wandb.log(
                 eval_metrics
             )
