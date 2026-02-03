@@ -30,6 +30,7 @@ from flax.training.train_state import TrainState
 from flax.training import checkpoints
 from tqdm.auto import trange
 
+from nf_policy import NFActor
 default_kernel_init = nn.initializers.lecun_normal()
 default_bias_init = nn.initializers.zeros
 
@@ -64,6 +65,18 @@ class Config:
     actor_grad_noise: float = 0.0
     actor_reset: bool = False
     actor_prereset_mode: bool = True
+    use_nf: bool = False
+    nf_num_layers: int = 10
+    nf_hidden_dim: int = 128
+    nf_n_hiddens: int = 3
+    nf_scale_max: float = 1.0
+    nf_base_dist: str = "normal"
+    nf_use_plu: bool = True
+    nf_use_layernorm: bool = True
+    nf_dropout: float = 0.1
+    nf_eval_num_samples: int = 32
+    nf_eval_z_scale: float = 1.0
+    nf_eval_z_clip: float = 0.0
     policy_noise: float = 0.2
     noise_clip: float = 0.5
     policy_freq: int = 2
@@ -78,7 +91,7 @@ class Config:
     num_updates_on_epoch: int = 1000
     normalize_reward: bool = False
     normalize_states: bool = False
-    action_chunk_len: int = 5
+    action_chunk_len: int = 6
     action_chunk_stride: int = 1
     rtc_prefix_len: Optional[int] = None
     q_infer_step_size: float = 0.1
@@ -758,6 +771,10 @@ def evaluate(
         rtc_prefix_len: Optional[int] = None,
         q_infer_step_size: float = 0.0,
         q_infer_steps: int = 0,
+        use_nf: bool = False,
+        nf_eval_num_samples: int = 1,
+        nf_eval_z_scale: float = 1.0,
+        nf_eval_z_clip: float = 0.0,
 ) -> Tuple[np.ndarray, Dict]:
     if rtc_prefix_len is None:
         rtc_prefix_len = 0
@@ -766,12 +783,28 @@ def evaluate(
     use_refine = q_infer_step_size > 0 and q_infer_steps > 0
     q_infer_steps = max(0, int(q_infer_steps))
 
+    @partial(jax.jit, static_argnums=(5,))
+    def policy_action(params_j, batch_stats_j, obs_j, prev_actions_j, rng_j, num_samples_j):
+        return action_fn(
+            {"params": params_j, "batch_stats": batch_stats_j},
+            obs_j,
+            prev_actions_j,
+            rng_j,
+            num_samples_j,
+            nf_eval_z_scale,
+            nf_eval_z_clip,
+        )
+
+    @jax.jit
+    def eval_q(obs_j, action_j):
+        logits = critic.apply_fn(critic.params, obs_j, action_j)
+        probs = nn.softmax(logits, axis=-1)
+        q_values = transform_from_probs(probs, critic.support).min(0)
+        return q_values
+
     def _refine_action_chunk(obs_j, action_j):
         def q_value(a):
-            logits = critic.apply_fn(critic.params, obs_j, a)
-            probs = nn.softmax(logits, axis=-1)
-            q_values = transform_from_probs(probs, critic.support).min(0)
-            return q_values[0]
+            return eval_q(obs_j, a)[0]
 
         def body(_, a):
             grad = jax.grad(q_value)(a)
@@ -794,6 +827,13 @@ def evaluate(
         action_buffers = [[] for _ in range(num_envs)]
         prev_prefix = np.zeros((num_envs, rtc_prefix_len, action_dim), dtype=np.float32)
         done = np.zeros(num_envs, dtype=bool)
+        base_eps = num_episodes // num_envs
+        remainder = num_episodes % num_envs
+        per_env_target = np.array(
+            [base_eps + (1 if i < remainder else 0) for i in range(num_envs)],
+            dtype=np.int32,
+        )
+        per_env_done = np.zeros(num_envs, dtype=np.int32)
 
         while len(returns) < num_episodes:
             actions = []
@@ -807,8 +847,20 @@ def evaluate(
 
                 if not action_buffers[i]:
                     action_chunk = np.asarray(jax.device_get(
-                        action_fn({"params": params, "batch_stats": batch_stats}, obs_i, prev_prefix[i])
+                        policy_action(
+                            params, batch_stats, obs_i, prev_prefix[i], actions_key, nf_eval_num_samples
+                        )
                     ))
+                    if use_nf and nf_eval_num_samples > 1:
+                        obs_j = jnp.asarray(obs_i)[None, ...]
+                        cand_actions = jnp.asarray(action_chunk)
+                        if cand_actions.ndim == 3:
+                            cand_actions = cand_actions[None, ...]
+                        cand_actions = cand_actions[0]
+                        obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
+                        q_vals = eval_q(obs_rep, cand_actions)
+                        best_idx = int(jax.device_get(jnp.argmax(q_vals)))
+                        action_chunk = np.asarray(jax.device_get(cand_actions[best_idx]))
                     action_buffers[i] = list(action_chunk) if action_chunk.ndim > 1 else [action_chunk]
                     if rtc_prefix_len > 0:
                         prev_prefix[i] = action_chunk[-rtc_prefix_len:].reshape(rtc_prefix_len, action_dim)
@@ -841,15 +893,19 @@ def evaluate(
 
             if np.any(done):
                 for i in np.where(done)[0]:
-                    returns.append(float(episode_returns[i]))
+                    if per_env_done[i] < per_env_target[i]:
+                        returns.append(float(episode_returns[i]))
+                        per_env_done[i] += 1
                     if len(returns) >= num_episodes:
                         break
-                    reset_out = env.envs[i].reset()
-                    obs[i] = reset_out[0] if isinstance(reset_out, tuple) else reset_out
-                    episode_returns[i] = 0.0
-                    action_buffers[i] = []
-                    prev_prefix[i] = 0.0
-                done = np.zeros(num_envs, dtype=bool)
+                    if per_env_done[i] < per_env_target[i]:
+                        reset_out = env.envs[i].reset()
+                        obs[i] = reset_out[0] if isinstance(reset_out, tuple) else reset_out
+                        episode_returns[i] = 0.0
+                        action_buffers[i] = []
+                        prev_prefix[i] = 0.0
+                    else:
+                        done[i] = True
     else:
         env.seed(seed)
         env.action_space.seed(seed)
@@ -868,8 +924,20 @@ def evaluate(
                 eval_states.append(obs)
                 if not action_buffer:
                     action_chunk = np.asarray(jax.device_get(
-                        action_fn({"params": params, "batch_stats": batch_stats}, obs, prev_prefix)
+                        policy_action(
+                            params, batch_stats, obs, prev_prefix, actions_key, nf_eval_num_samples
+                        )
                     ))
+                    if use_nf and nf_eval_num_samples > 1:
+                        obs_j = jnp.asarray(obs)[None, ...]
+                        cand_actions = jnp.asarray(action_chunk)
+                        if cand_actions.ndim == 3:
+                            cand_actions = cand_actions[None, ...]
+                        cand_actions = cand_actions[0]
+                        obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
+                        q_vals = eval_q(obs_rep, cand_actions)
+                        best_idx = int(jax.device_get(jnp.argmax(q_vals)))
+                        action_chunk = np.asarray(jax.device_get(cand_actions[best_idx]))
                     if action_chunk.ndim == 1:
                         action_buffer = [action_chunk]
                     else:
@@ -931,23 +999,48 @@ def update_actor(
         input_noise: float,
         bc_noise: float,
         grad_noise: float,
+        use_nf: bool,
         metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, random_action_key, input_noise_key, bc_noise_key, grad_noise_key = jax.random.split(key, 5)
     dropout_key, new_dropout_key = jax.random.split(actor.dropout_key, 2)
+    sample_key, dropout_apply_key, dropout_log_key = jax.random.split(dropout_key, 3)
 
     in_noise = jax.random.normal(input_noise_key, batch["states"].shape) * input_noise
     b_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
 
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
-        (actions, preact), updates = actor.apply_fn(
-            {'params': params, 'batch_stats': actor.batch_stats},
-            batch["states"] + in_noise,
-            batch["prev_actions"],
-            True, rngs={'dropout': dropout_key},
-            mutable=['batch_stats'],
-        )
-        bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+        if use_nf:
+            actions = actor.apply_fn(
+                {'params': params, 'batch_stats': actor.batch_stats},
+                batch["states"] + in_noise,
+                batch["prev_actions"],
+                rng=sample_key,
+                train=True,
+                method=NFActor.sample,
+                rngs={'dropout': dropout_apply_key},
+            )
+            updates = {'batch_stats': actor.batch_stats}
+            bc_actions = batch["actions"] + b_noise
+            log_probs = actor.apply_fn(
+                {'params': params, 'batch_stats': actor.batch_stats},
+                bc_actions,
+                batch["states"] + in_noise,
+                batch["prev_actions"],
+                train=True,
+                method=NFActor.log_prob,
+                rngs={'dropout': dropout_log_key},
+            )
+            bc_penalty = -log_probs
+        else:
+            (actions, preact), updates = actor.apply_fn(
+                {'params': params, 'batch_stats': actor.batch_stats},
+                batch["states"] + in_noise,
+                batch["prev_actions"],
+                True, rngs={'dropout': dropout_key},
+                mutable=['batch_stats'],
+            )
+            bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
 
         logits = critic.apply_fn(critic.params, batch["states"], actions)
         probs = nn.softmax(logits, axis=-1)
@@ -963,10 +1056,11 @@ def update_actor(
         random_actions = jax.random.uniform(
             random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0
         )
+        bc_mse_policy = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2)).mean()
         new_metrics = metrics.update(
             {
                 "actor_loss": loss,
-                "bc_mse_policy": bc_penalty.mean(),
+                "bc_mse_policy": bc_mse_policy,
                 "bc_mse_random": jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2)).mean(),
                 "action_mse": ((actions - batch["actions"]) ** 2).mean(),
             }
@@ -1068,9 +1162,10 @@ def update_critic(
         noise_clip: float,
         chunk_len: int,
         rtc_prefix_len: int,
+        use_nf: bool,
         metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
-    key, actions_key = jax.random.split(key)
+    key, actions_key, noise_key = jax.random.split(key, 3)
 
     if rtc_prefix_len > 0:
         next_prev_actions = batch["actions"][:, -rtc_prefix_len:, :]
@@ -1078,17 +1173,30 @@ def update_critic(
         action_dim = batch["actions"].shape[-1]
         next_prev_actions = jnp.zeros((batch["actions"].shape[0], 0, action_dim), dtype=batch["actions"].dtype)
 
-    next_actions, preact = actor.apply_fn(
-        {
-            'params': actor.target_params,
-            'batch_stats': actor.target_batch_stats,
-        },
-        batch["next_states"],
-        next_prev_actions,
-        False
-    )
+    if use_nf:
+        next_actions = actor.apply_fn(
+            {
+                'params': actor.target_params,
+                'batch_stats': actor.target_batch_stats,
+            },
+            batch["next_states"],
+            next_prev_actions,
+            rng=actions_key,
+            train=False,
+            method=NFActor.sample,
+        )
+    else:
+        next_actions, preact = actor.apply_fn(
+            {
+                'params': actor.target_params,
+                'batch_stats': actor.target_batch_stats,
+            },
+            batch["next_states"],
+            next_prev_actions,
+            False
+        )
     noise = jnp.clip(
-        (jax.random.normal(actions_key, next_actions.shape) * policy_noise),
+        (jax.random.normal(noise_key, next_actions.shape) * policy_noise),
         -noise_clip,
         noise_clip,
     )
@@ -1141,6 +1249,7 @@ def update_td3(
         actor_grad_noise: float,
         chunk_len: int,
         rtc_prefix_len: int,
+        use_nf: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1154,11 +1263,12 @@ def update_td3(
         noise_clip,
         chunk_len,
         rtc_prefix_len,
+        use_nf,
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
         key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise,
-        actor_grad_noise, new_metrics
+        actor_grad_noise, use_nf, new_metrics
     )
     return key, new_actor, new_critic, new_metrics
 
@@ -1179,6 +1289,7 @@ def update_iql(
         actor_input_noise: float,
         actor_bc_noise: float,
         actor_grad_noise: float,
+        use_nf: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, CriticTrainState, ValueTrainState, Metrics]:
     new_value, value_loss = update_value(value, critic, batch, iql_expectile)
     new_critic, critic_loss, q_min = update_critic_iql(
@@ -1186,7 +1297,7 @@ def update_iql(
     )
     key, new_actor, new_critic, new_metrics = update_actor(
         key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise,
-        actor_grad_noise, metrics
+        actor_grad_noise, use_nf, metrics
     )
     new_metrics = new_metrics.update(
         {
@@ -1237,6 +1348,7 @@ def update_td3_no_targets(
         noise_clip: float,
         chunk_len: int,
         rtc_prefix_len: int,
+        use_nf: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1250,6 +1362,7 @@ def update_td3_no_targets(
         noise_clip,
         chunk_len,
         rtc_prefix_len,
+        use_nf,
         metrics,
     )
     return key, actor, new_critic, new_metrics
@@ -1271,10 +1384,11 @@ def update_refinement(
         actor_input_noise: float,
         actor_bc_noise: float,
         actor_grad_noise: float,
+        use_nf: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_actor, new_critic, new_metrics = update_actor(
         key, actor, critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise,
-        actor_grad_noise, metrics
+        actor_grad_noise, use_nf, metrics
     )
     return key, new_actor, new_critic, new_metrics
 
@@ -1341,8 +1455,60 @@ def train(config: Config):
     init_action = buffer.data["actions"][0][None, ...]
     init_prev_actions = buffer.data["prev_actions"][0][None, ...]
 
-    if config.actor_prereset_mode:
-        actor_module = DetActor(
+    if config.use_nf:
+        actor_module = NFActor(
+            action_dim=init_action.shape[-1],
+            chunk_len=config.action_chunk_len,
+            hidden_dim=config.nf_hidden_dim,
+            n_hiddens=config.nf_n_hiddens,
+            num_layers=config.nf_num_layers,
+            scale_max=config.nf_scale_max,
+            base_dist=config.nf_base_dist,
+            use_plu=config.nf_use_plu,
+            use_layernorm=config.nf_use_layernorm,
+            dropout_rate=config.nf_dropout,
+        )
+        reset_module = NFActor(
+            action_dim=init_action.shape[-1],
+            chunk_len=config.action_chunk_len,
+            hidden_dim=config.nf_hidden_dim,
+            n_hiddens=config.nf_n_hiddens,
+            num_layers=config.nf_num_layers,
+            scale_max=config.nf_scale_max,
+            base_dist=config.nf_base_dist,
+            use_plu=config.nf_use_plu,
+            use_layernorm=config.nf_use_layernorm,
+            dropout_rate=config.nf_dropout,
+        )
+    else:
+        if config.actor_prereset_mode:
+            actor_module = DetActor(
+                action_dim=init_action.shape[-1],
+                chunk_len=config.action_chunk_len,
+                rtc_prefix_len=config.rtc_prefix_len,
+                hidden_dim=config.hidden_dim,
+                layernorm=config.actor_ln,
+                featurenorm=config.actor_fn,
+                groupnorm=config.actor_gn,
+                batchnorm=config.actor_bn,
+                spectralnorm=config.actor_sn,
+                dropout_rate=config.actor_dropout,
+                n_hiddens=config.actor_n_hiddens,
+            )
+        else:
+            actor_module = DetActor(
+                action_dim=init_action.shape[-1],
+                chunk_len=config.action_chunk_len,
+                rtc_prefix_len=config.rtc_prefix_len,
+                hidden_dim=config.hidden_dim,
+                layernorm=False,
+                featurenorm=False,
+                groupnorm=False,
+                spectralnorm=False,
+                dropout_rate=0.0,
+                n_hiddens=config.actor_n_hiddens,
+            )
+        reset_module = DetActor(
             action_dim=init_action.shape[-1],
             chunk_len=config.action_chunk_len,
             rtc_prefix_len=config.rtc_prefix_len,
@@ -1350,35 +1516,9 @@ def train(config: Config):
             layernorm=config.actor_ln,
             featurenorm=config.actor_fn,
             groupnorm=config.actor_gn,
-            batchnorm=config.actor_bn,
-            spectralnorm=config.actor_sn,
             dropout_rate=config.actor_dropout,
             n_hiddens=config.actor_n_hiddens,
         )
-    else:
-        actor_module = DetActor(
-            action_dim=init_action.shape[-1],
-            chunk_len=config.action_chunk_len,
-            rtc_prefix_len=config.rtc_prefix_len,
-            hidden_dim=config.hidden_dim,
-            layernorm=False,
-            featurenorm=False,
-            groupnorm=False,
-            spectralnorm=False,
-            dropout_rate=0.0,
-            n_hiddens=config.actor_n_hiddens,
-        )
-    reset_module = DetActor(
-        action_dim=init_action.shape[-1],
-        chunk_len=config.action_chunk_len,
-        rtc_prefix_len=config.rtc_prefix_len,
-        hidden_dim=config.hidden_dim,
-        layernorm=config.actor_ln,
-        featurenorm=config.actor_fn,
-        groupnorm=config.actor_gn,
-        dropout_rate=config.actor_dropout,
-        n_hiddens=config.actor_n_hiddens,
-    )
 
     if config.decay_schedule == "cosine":
         schedule_fn = optax.cosine_decay_schedule(config.actor_learning_rate,
@@ -1395,7 +1535,16 @@ def train(config: Config):
     else:
         optimizer = adamw_elastic(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
 
-    init_vars = actor_module.init(actor_key, init_state, init_prev_actions, False)
+    if config.use_nf:
+        init_vars = actor_module.init(
+            {"params": actor_key},
+            init_state,
+            init_prev_actions,
+            rng=actor_key,
+            method=NFActor.sample,
+        )
+    else:
+        init_vars = actor_module.init(actor_key, init_state, init_prev_actions, False)
     actor = ActorTrainState.create(
         apply_fn=actor_module.apply,
         params=init_vars['params'],
@@ -1468,6 +1617,7 @@ def train(config: Config):
         actor_grad_noise=config.actor_grad_noise * reset_mods,
         chunk_len=config.action_chunk_len,
         rtc_prefix_len=config.rtc_prefix_len,
+        use_nf=config.use_nf,
     )
 
     update_td3_no_targets_partial = partial(
@@ -1480,6 +1630,7 @@ def train(config: Config):
         noise_clip=config.noise_clip,
         chunk_len=config.action_chunk_len,
         rtc_prefix_len=config.rtc_prefix_len,
+        use_nf=config.use_nf,
     )
     update_iql_partial = partial(
         update_iql,
@@ -1492,6 +1643,7 @@ def train(config: Config):
         actor_input_noise=config.actor_input_noise * reset_mods,
         actor_bc_noise=config.actor_bc_noise * reset_mods,
         actor_grad_noise=config.actor_grad_noise * reset_mods,
+        use_nf=config.use_nf,
     )
     update_iql_no_actor_partial = partial(
         update_iql_no_actor,
@@ -1512,6 +1664,7 @@ def train(config: Config):
         actor_input_noise=config.actor_input_noise,
         actor_bc_noise=config.actor_bc_noise,
         actor_grad_noise=config.actor_grad_noise,
+        use_nf=config.use_nf,
     )
 
     # metrics
@@ -1674,8 +1827,32 @@ def train(config: Config):
     if config.use_iql:
         update_carry["value"] = value
 
-    @jax.jit
-    def actor_action_fn(params: jax.Array, obs: jax.Array, prev_actions: jax.Array):
+    @partial(jax.jit, static_argnums=(4, 5, 6))
+    def actor_action_fn(
+        params: jax.Array,
+        obs: jax.Array,
+        prev_actions: jax.Array,
+        rng: jax.Array,
+        num_samples: int,
+        z_scale: float,
+        z_clip: float,
+    ):
+        if config.use_nf:
+            if num_samples > 1:
+                return actor.apply_fn(
+                    params,
+                    obs,
+                    prev_actions,
+                    rng=rng,
+                    num_samples=num_samples,
+                    z_scale=z_scale,
+                    z_clip=z_clip,
+                    train=False,
+                    method=NFActor.sample_n,
+                )
+            return actor.apply_fn(
+                params, obs, prev_actions, rng=rng, train=False, method=NFActor.sample
+            )
         return actor.apply_fn(params, obs, prev_actions, False)[0]
 
     for epoch in trange(config.num_epochs, desc="ReBRAC Epochs"):
@@ -1684,10 +1861,22 @@ def train(config: Config):
             print("Refinement stage")
             update_fn = run_refinement_updates
             if config.actor_reset:
+                if config.use_nf:
+                    reset_params = reset_module.init(
+                        {"params": actor_key},
+                        init_state,
+                        init_prev_actions,
+                        rng=actor_key,
+                        method=NFActor.sample,
+                    )
+                else:
+                    reset_params = reset_module.init(actor_key, init_state, init_prev_actions, False)
                 actor = ActorTrainState.create(
                     apply_fn=reset_module.apply,
-                    params=reset_module.init(actor_key, init_state, init_prev_actions, False),
-                    target_params=reset_module.init(actor_key, init_state, init_prev_actions, False),
+                    params=reset_params,
+                    batch_stats=reset_params['batch_stats'] if 'batch_stats' in reset_params else {},
+                    target_params=reset_params,
+                    target_batch_stats=reset_params['batch_stats'] if 'batch_stats' in reset_params else {},
                     dropout_key=dropout_key,
                     tx=optimizer,
                 )
@@ -1716,6 +1905,10 @@ def train(config: Config):
                 rtc_prefix_len=config.rtc_prefix_len,
                 q_infer_step_size=config.q_infer_step_size,
                 q_infer_steps=config.q_infer_steps,
+                use_nf=config.use_nf,
+                nf_eval_num_samples=config.nf_eval_num_samples,
+                nf_eval_z_scale=config.nf_eval_z_scale,
+                nf_eval_z_clip=config.nf_eval_z_clip,
             )
 
             if hasattr(eval_env, "get_normalized_score"):
@@ -1747,6 +1940,10 @@ def train(config: Config):
                         rtc_prefix_len=config.rtc_prefix_len,
                         q_infer_step_size=config.q_infer_step_size,
                         q_infer_steps=config.q_infer_steps,
+                        use_nf=config.use_nf,
+                        nf_eval_num_samples=config.nf_eval_num_samples,
+                        nf_eval_z_scale=config.nf_eval_z_scale,
+                        nf_eval_z_clip=config.nf_eval_z_clip,
                     )
                     if hasattr(eval_env, "get_normalized_score"):
                         normalized_returns = eval_env.get_normalized_score(returns) * 100.0
