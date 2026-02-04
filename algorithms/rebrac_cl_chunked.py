@@ -69,6 +69,7 @@ class Config:
     nf_num_layers: int = 8
     nf_hidden_dim: int = 64
     nf_n_hiddens: int = 2
+    nf_use_transformer: bool = False
     nf_scale_max: float = 1.0
     nf_base_dist: str = "normal"
     nf_use_plu: bool = False
@@ -1635,6 +1636,7 @@ def train(config: Config):
             hidden_dim=config.nf_hidden_dim,
             n_hiddens=config.nf_n_hiddens,
             num_layers=config.nf_num_layers,
+            use_transformer=config.nf_use_transformer,
             scale_max=config.nf_scale_max,
             base_dist=config.nf_base_dist,
             use_plu=config.nf_use_plu,
@@ -1648,6 +1650,7 @@ def train(config: Config):
             hidden_dim=config.nf_hidden_dim,
             n_hiddens=config.nf_n_hiddens,
             num_layers=config.nf_num_layers,
+            use_transformer=config.nf_use_transformer,
             scale_max=config.nf_scale_max,
             base_dist=config.nf_base_dist,
             use_plu=config.nf_use_plu,

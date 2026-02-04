@@ -40,6 +40,7 @@ class Config:
     num_layers: int = 8
     scale_max: float = 1.0
     base_dist: str = "normal"
+    use_transformer: bool = True
     use_plu: bool = False
     use_layernorm: bool = False
     dropout_rate: float = 0.1
@@ -332,6 +333,7 @@ def train(config: Config):
         hidden_dim=config.hidden_dim,
         n_hiddens=config.n_hiddens,
         num_layers=config.num_layers,
+        use_transformer=config.use_transformer,
         scale_max=config.scale_max,
         base_dist=config.base_dist,
         use_plu=config.use_plu,

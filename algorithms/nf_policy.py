@@ -415,6 +415,7 @@ class NFActor(nn.Module):
     hidden_dim: int
     n_hiddens: int
     num_layers: int
+    use_transformer: bool = True
     scale_max: float = 1.0
     base_dist: str = "normal"
     use_plu: bool = True
@@ -490,7 +491,7 @@ class NFActor(nn.Module):
                     scale_max=self.scale_max,
                     use_layernorm=self.use_layernorm,
                     dropout_rate=self.dropout_rate,
-                    use_transformer=True,
+                    use_transformer=self.use_transformer,
                     tf_dim=self.hidden_dim,
                     tf_heads=self.tf_heads,
                     tf_depth=self.tf_depth,

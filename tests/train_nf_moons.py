@@ -53,6 +53,7 @@ def main() -> None:
     parser.add_argument("--base-dist", type=str, default="normal", choices=["normal", "uniform"])
     parser.add_argument("--plot-path", type=str, default="tests/moons_nf_samples.png")
     parser.add_argument("--plot-samples", type=int, default=2000)
+    parser.add_argument("--use-transformer", action="store_true")
     args = parser.parse_args()
 
     cfg = TrainConfig(
@@ -77,9 +78,10 @@ def main() -> None:
         hidden_dim=64,
         n_hiddens=2,
         num_layers=6,
+        use_transformer=args.use_transformer,
         scale_max=1.0,
         base_dist=args.base_dist,
-        use_plu=False,
+        use_plu=True,
         use_layernorm=True,
         dropout_rate=0.0,
     )
