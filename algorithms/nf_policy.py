@@ -17,6 +17,265 @@ def _normal_log_prob(z: jax.Array) -> jax.Array:
     return -0.5 * (z ** 2 + math.log(2 * math.pi))
 
 
+class RMSNorm(nn.Module):
+    dim: int
+    eps: float = 1e-6
+
+    def setup(self) -> None:
+        self.scale = self.param("scale", nn.initializers.ones, (self.dim,))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        norm = jnp.sqrt(jnp.mean(x ** 2, axis=-1, keepdims=True) + self.eps)
+        return x / norm * self.scale
+
+
+def precompute_freqs_1d(dim: int, max_seq_len: int, theta: float = 10000.0) -> Tuple[jax.Array, jax.Array]:
+    freqs = jnp.arange(0, dim, 2, dtype=jnp.float32)
+    freqs = theta ** (-freqs / dim)
+    positions = jnp.arange(max_seq_len, dtype=jnp.float32)
+    angles = positions[:, None] * freqs[None, :]
+    return jnp.cos(angles), jnp.sin(angles)
+
+
+def apply_rotary_pos_emb(
+    q: jax.Array, k: jax.Array, cos: jax.Array, sin: jax.Array
+) -> Tuple[jax.Array, jax.Array]:
+    q1, q2 = jnp.split(q, 2, axis=-1)
+    k1, k2 = jnp.split(k, 2, axis=-1)
+    cos = cos[None, None, :, :]
+    sin = sin[None, None, :, :]
+    q_rot = jnp.concatenate([q1 * cos - q2 * sin, q2 * cos + q1 * sin], axis=-1)
+    k_rot = jnp.concatenate([k1 * cos - k2 * sin, k2 * cos + k1 * sin], axis=-1)
+    return q_rot, k_rot
+
+
+class SwiGlu(nn.Module):
+    dim: int
+    hidden_dim: int
+    dropout: float = 0.0
+    out_dim: int = None
+
+    def setup(self) -> None:
+        out_dim = self.out_dim if self.out_dim is not None else self.dim
+        self.fc1 = nn.Dense(self.hidden_dim, use_bias=False)
+        self.fc2 = nn.Dense(self.hidden_dim, use_bias=False)
+        self.proj = nn.Dense(out_dim, use_bias=False)
+        self.dropout_layer = nn.Dropout(rate=self.dropout)
+
+    def __call__(self, x: jax.Array, train: bool) -> jax.Array:
+        x1 = nn.silu(self.fc1(x))
+        x2 = self.fc2(x)
+        x = x1 * x2
+        x = self.dropout_layer(x, deterministic=not train)
+        x = self.proj(x)
+        return x
+
+
+class FlowerAttention(nn.Module):
+    dim: int
+    n_heads: int = 8
+    attn_pdrop: float = 0.1
+    resid_pdrop: float = 0.1
+    use_rope: bool = False
+    max_seq_len: int = 128
+    rope_theta: float = 32.0
+
+    def setup(self) -> None:
+        self.head_dim = self.dim // self.n_heads
+        self.scale = self.head_dim ** -0.5
+        self.qkv = nn.Dense(self.dim * 3, use_bias=False)
+        self.proj = nn.Dense(self.dim, use_bias=False)
+        self.attn_dropout = nn.Dropout(rate=self.attn_pdrop)
+        self.resid_dropout = nn.Dropout(rate=self.resid_pdrop)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+        if self.use_rope:
+            cos, sin = precompute_freqs_1d(self.head_dim, self.max_seq_len, self.rope_theta)
+            self.cos = cos
+            self.sin = sin
+
+    def __call__(self, x: jax.Array, train: bool, is_causal: bool = False) -> jax.Array:
+        B, T, C = x.shape
+        qkv = self.qkv(x).reshape(B, T, self.n_heads, 3, self.head_dim)
+        qkv = qkv.transpose(0, 2, 1, 3, 4)  # [B, H, T, 3, D]
+        q, k, v = jnp.split(qkv, 3, axis=3)
+        q = jnp.squeeze(q, axis=3)
+        k = jnp.squeeze(k, axis=3)
+        v = jnp.squeeze(v, axis=3)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        if self.use_rope:
+            q, k = apply_rotary_pos_emb(q, k, self.cos[:T], self.sin[:T])
+        attn = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scale
+        if is_causal:
+            mask = jnp.triu(jnp.ones((T, T), dtype=bool), 1)
+            attn = jnp.where(mask[None, None, :, :], -jnp.inf, attn)
+        attn = nn.softmax(attn, axis=-1)
+        attn = self.attn_dropout(attn, deterministic=not train)
+        out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
+        out = self.resid_dropout(self.proj(out), deterministic=not train)
+        return out
+
+
+class FlowerCrossAttention(nn.Module):
+    dim: int
+    n_heads: int = 8
+    attn_pdrop: float = 0.1
+    resid_pdrop: float = 0.1
+
+    def setup(self) -> None:
+        self.head_dim = self.dim // self.n_heads
+        self.scale = self.head_dim ** -0.5
+        self.q_proj = nn.Dense(self.dim, use_bias=False)
+        self.k_proj = nn.Dense(self.dim, use_bias=False)
+        self.v_proj = nn.Dense(self.dim, use_bias=False)
+        self.proj = nn.Dense(self.dim, use_bias=False)
+        self.attn_dropout = nn.Dropout(rate=self.attn_pdrop)
+        self.resid_dropout = nn.Dropout(rate=self.resid_pdrop)
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
+    def __call__(self, x: jax.Array, context: jax.Array, train: bool) -> jax.Array:
+        B, T, C = x.shape
+        _, S, _ = context.shape
+        q = self.q_proj(x).reshape(B, T, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        k = self.k_proj(context).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        v = self.v_proj(context).reshape(B, S, self.n_heads, self.head_dim).transpose(0, 2, 1, 3)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        attn = jnp.einsum("bhqd,bhkd->bhqk", q, k) * self.scale
+        attn = nn.softmax(attn, axis=-1)
+        attn = self.attn_dropout(attn, deterministic=not train)
+        out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+        out = out.transpose(0, 2, 1, 3).reshape(B, T, C)
+        out = self.resid_dropout(self.proj(out), deterministic=not train)
+        return out
+
+
+class FlowBlock(nn.Module):
+    dim: int
+    heads: int = 8
+    attn_pdrop: float = 0.1
+    resid_pdrop: float = 0.1
+    mlp_pdrop: float = 0.1
+    use_cross_attn: bool = False
+    use_rope: bool = False
+    max_seq_len: int = 128
+    rope_theta: float = 32.0
+
+    def setup(self) -> None:
+        self.norm1 = RMSNorm(self.dim)
+        self.norm2 = RMSNorm(self.dim)
+        self.norm3 = RMSNorm(self.dim) if self.use_cross_attn else None
+        self.self_attn = FlowerAttention(
+            dim=self.dim,
+            n_heads=self.heads,
+            attn_pdrop=self.attn_pdrop,
+            resid_pdrop=self.resid_pdrop,
+            use_rope=self.use_rope,
+            max_seq_len=self.max_seq_len,
+            rope_theta=self.rope_theta,
+        )
+        if self.use_cross_attn:
+            self.cross_attn = FlowerCrossAttention(
+                dim=self.dim,
+                n_heads=self.heads,
+                attn_pdrop=self.attn_pdrop,
+                resid_pdrop=self.resid_pdrop,
+            )
+        self.mlp = SwiGlu(self.dim, hidden_dim=self.dim * 4, dropout=self.mlp_pdrop, out_dim=self.dim)
+
+    def __call__(self, x: jax.Array, context: jax.Array, train: bool, is_causal: bool = True) -> jax.Array:
+        x_norm = self.norm1(x)
+        x = x + self.self_attn(x_norm, train=train, is_causal=is_causal)
+        if self.use_cross_attn:
+            x_norm = self.norm2(x)
+            x = x + self.cross_attn(x_norm, context, train=train)
+            x_norm = self.norm3(x)
+        else:
+            x_norm = self.norm2(x)
+        x = x + self.mlp(x_norm, train=train)
+        return x
+
+
+class TransformerBlock(nn.Module):
+    in_dim: int
+    cond_dim: int
+    dim: int = 64
+    num_heads: int = 8
+    attn_pdrop: float = 0.1
+    resid_pdrop: float = 0.1
+    mlp_pdrop: float = 0.1
+    block_depth: int = 1
+    is_causal: bool = True
+    use_rope: bool = True
+    rope_theta: float = 32.0
+    max_seq_len: int = 128
+
+    def setup(self) -> None:
+        self.input_proj = nn.Dense(self.dim)
+        self.cond_fc1 = nn.Dense(self.dim * 2)
+        self.cond_drop = nn.Dropout(rate=self.mlp_pdrop)
+        self.cond_fc2 = nn.Dense(self.dim)
+        self.cond_proj = nn.Dense(self.dim)
+        blocks = []
+        for _ in range(self.block_depth):
+            blocks.append(
+                FlowBlock(
+                    dim=self.dim,
+                    heads=self.num_heads,
+                    attn_pdrop=self.attn_pdrop,
+                    resid_pdrop=self.resid_pdrop,
+                    mlp_pdrop=self.mlp_pdrop,
+                    use_cross_attn=False,
+                    use_rope=self.use_rope,
+                    max_seq_len=self.max_seq_len,
+                    rope_theta=self.rope_theta,
+                )
+            )
+            blocks.append(
+                FlowBlock(
+                    dim=self.dim,
+                    heads=self.num_heads,
+                    attn_pdrop=self.attn_pdrop,
+                    resid_pdrop=self.resid_pdrop,
+                    mlp_pdrop=self.mlp_pdrop,
+                    use_cross_attn=True,
+                    use_rope=self.use_rope,
+                    max_seq_len=self.max_seq_len,
+                    rope_theta=self.rope_theta,
+                )
+            )
+        self.blocks = blocks
+        self.norm = RMSNorm(self.dim)
+        self.ff_mult_dense1 = nn.Dense(self.dim * 2)
+        self.ff_mult_drop = nn.Dropout(rate=self.mlp_pdrop)
+        self.ff_mult_dense2 = nn.Dense(self.in_dim)
+        self.ff_shift_dense1 = nn.Dense(self.dim * 2)
+        self.ff_shift_drop = nn.Dropout(rate=self.mlp_pdrop)
+        self.ff_shift_dense2 = nn.Dense(self.in_dim)
+
+    def __call__(self, x: jax.Array, cond: jax.Array, train: bool) -> Tuple[jax.Array, jax.Array]:
+        x = self.input_proj(x)
+        cond_enc = self.cond_fc1(cond)
+        cond_enc = nn.gelu(cond_enc)
+        cond_enc = self.cond_drop(cond_enc, deterministic=not train)
+        cond_enc = self.cond_fc2(cond_enc)
+        context = self.cond_proj(cond_enc)[:, None, :]
+        for block in self.blocks:
+            x = block(x, context, train=train, is_causal=self.is_causal)
+        x = self.norm(x)
+        x_mult = self.ff_mult_dense1(x)
+        x_mult = nn.gelu(x_mult)
+        x_mult = self.ff_mult_drop(x_mult, deterministic=not train)
+        x_mult = self.ff_mult_dense2(x_mult)
+        x_shift = self.ff_shift_dense1(x)
+        x_shift = nn.gelu(x_shift)
+        x_shift = self.ff_shift_drop(x_shift, deterministic=not train)
+        x_shift = self.ff_shift_dense2(x_shift)
+        return x_mult, x_shift
+
 @dataclass
 class FlowConfig:
     num_layers: int = 4
@@ -34,12 +293,44 @@ class AffineCoupling(nn.Module):
     scale_max: float = 1.0
     use_layernorm: bool = False
     dropout_rate: float = 0.0
+    use_transformer: bool = True
+    tf_dim: int = 128
+    tf_heads: int = 8
+    tf_depth: int = 1
+    tf_rope_theta: float = 32.0
+    tf_max_seq_len: int = 128
 
     def setup(self) -> None:
         self.n_out = int(self.idx2.shape[0])
+        if self.use_transformer:
+            self.tf = TransformerBlock(
+                in_dim=1,
+                cond_dim=1,
+                dim=self.tf_dim,
+                num_heads=self.tf_heads,
+                attn_pdrop=self.dropout_rate,
+                resid_pdrop=self.dropout_rate,
+                mlp_pdrop=self.dropout_rate,
+                block_depth=self.tf_depth,
+                is_causal=True,
+                use_rope=True,
+                rope_theta=self.tf_rope_theta,
+                max_seq_len=self.tf_max_seq_len,
+            )
 
     @nn.compact
     def _st(self, x1: jax.Array, cond: jax.Array, train: bool) -> Tuple[jax.Array, jax.Array]:
+        if self.use_transformer:
+            x_full = jnp.zeros((x1.shape[0], self.dim), dtype=x1.dtype)
+            x_full = x_full.at[:, self.idx1].set(x1)
+            x_tokens = x_full[..., None]
+            x_mult, x_shift = self.tf(x_tokens, cond, train=train)
+            s = jnp.squeeze(x_mult, axis=-1)
+            t = jnp.squeeze(x_shift, axis=-1)
+            s = jnp.tanh(s) * self.scale_max
+            s = jnp.take(s, self.idx2, axis=1)
+            t = jnp.take(t, self.idx2, axis=1)
+            return s, t
         h = jnp.concatenate([x1, cond], axis=-1)
         for _ in range(self.n_hiddens - 1):
             h = nn.Dense(self.hidden_dim)(h)
@@ -130,6 +421,10 @@ class NFActor(nn.Module):
     use_layernorm: bool = False
     dropout_rate: float = 0.0
     deterministic_layers: int = 2
+    tf_heads: int = 8
+    tf_depth: int = 1
+    tf_rope_theta: float = 32.0
+    tf_max_seq_len: int = 128
 
     def setup(self) -> None:
         self.dim = self.action_dim * self.chunk_len
@@ -195,6 +490,12 @@ class NFActor(nn.Module):
                     scale_max=self.scale_max,
                     use_layernorm=self.use_layernorm,
                     dropout_rate=self.dropout_rate,
+                    use_transformer=True,
+                    tf_dim=self.hidden_dim,
+                    tf_heads=self.tf_heads,
+                    tf_depth=self.tf_depth,
+                    tf_rope_theta=self.tf_rope_theta,
+                    tf_max_seq_len=self.tf_max_seq_len,
                 )
             )
             if self.use_plu:

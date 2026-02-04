@@ -35,7 +35,7 @@ class TrainConfig:
     n_samples: int = 2048
     batch_size: int = 256
     steps: int = 2000
-    lr: float = 3e-4
+    lr: float = 1e-4
     noise: float = 0.05
     seed: int = 0
     log_every: int = 200
@@ -74,14 +74,14 @@ def main() -> None:
     model = NFActor(
         action_dim=1,
         chunk_len=2,
-        hidden_dim=256,
-        n_hiddens=3,
-        num_layers=10,
+        hidden_dim=64,
+        n_hiddens=2,
+        num_layers=6,
         scale_max=1.0,
         base_dist=args.base_dist,
-        use_plu=True,
+        use_plu=False,
         use_layernorm=True,
-        dropout_rate=0.1,
+        dropout_rate=0.0,
     )
 
     dummy_state = jnp.zeros((cfg.batch_size, 1), dtype=jnp.float32)

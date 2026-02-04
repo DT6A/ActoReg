@@ -35,19 +35,19 @@ class Config:
     group: str = "nf-il"
     name: str = "nf-il"
     # flow params
-    hidden_dim: int = 256
-    n_hiddens: int = 3
-    num_layers: int = 6
+    hidden_dim: int = 64
+    n_hiddens: int = 2
+    num_layers: int = 8
     scale_max: float = 1.0
     base_dist: str = "normal"
-    use_plu: bool = True
+    use_plu: bool = False
     use_layernorm: bool = False
-    dropout_rate: float = 0.0
+    dropout_rate: float = 0.1
     deterministic_layers: int = 2
     # training params
     learning_rate: float = 3e-4
     dataset_name: str = "halfcheetah-medium-v2"
-    batch_size: int = 1024
+    batch_size: int = 256
     num_epochs: int = 200
     num_updates_on_epoch: int = 1000
     normalize_reward: bool = False
@@ -107,6 +107,18 @@ def evaluate_nf(
         rtc_prefix_len = 0
 
     key = jax.random.PRNGKey(seed=seed)
+    sample_chunks = jax.jit(
+        lambda params, constants, obs_batch, prefix_batch, keys: jax.vmap(
+            lambda o, p, k: actor.apply_fn(
+                {"params": params, "constants": constants},
+                o,
+                p,
+                k,
+                train=False,
+                method=NFActor.sample,
+            )
+        )(obs_batch, prefix_batch, keys)
+    )
     eval_states = []
     eval_actions = []
     returns = []
@@ -121,6 +133,26 @@ def evaluate_nf(
         done = np.zeros(num_envs, dtype=bool)
 
         while len(returns) < num_episodes:
+            empty_mask = np.array([not buf for buf in action_buffers], dtype=bool)
+            need_sample = np.logical_and(~done, empty_mask)
+            if np.any(need_sample):
+                key, sample_key = jax.random.split(key)
+                keys = jax.random.split(sample_key, num_envs)
+                obs_batch = jnp.asarray(obs)
+                prefix_batch = jnp.asarray(prev_prefix)
+                action_chunks = np.asarray(
+                    sample_chunks(actor.params, actor.constants, obs_batch, prefix_batch, keys)
+                )
+                for i in np.where(need_sample)[0]:
+                    action_chunk = action_chunks[i]
+                    action_buffers[i] = (
+                        list(action_chunk) if action_chunk.ndim > 1 else [action_chunk]
+                    )
+                    if rtc_prefix_len > 0:
+                        prev_prefix[i] = action_chunk[-rtc_prefix_len:].reshape(
+                            rtc_prefix_len, action_dim
+                        )
+
             actions = []
             for i in range(num_envs):
                 if done[i]:
@@ -129,25 +161,6 @@ def evaluate_nf(
                 key, action_key, noise_key = jax.random.split(key, 3)
                 obs_i = obs[i]
                 eval_states.append(obs_i)
-
-                if not action_buffers[i]:
-                    action_chunk = np.asarray(
-                        actor.apply_fn(
-                            {"params": actor.params, "constants": actor.constants},
-                            obs_i,
-                            prev_prefix[i],
-                            action_key,
-                            train=False,
-                            method=NFActor.sample,
-                        )
-                    )
-                    action_buffers[i] = (
-                        list(action_chunk) if action_chunk.ndim > 1 else [action_chunk]
-                    )
-                    if rtc_prefix_len > 0:
-                        prev_prefix[i] = action_chunk[-rtc_prefix_len:].reshape(
-                            rtc_prefix_len, action_dim
-                        )
 
                 action = action_buffers[i].pop(0)
                 eval_actions.append(action)
