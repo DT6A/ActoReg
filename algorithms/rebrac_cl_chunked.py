@@ -3,8 +3,8 @@
 
 import os
 
-os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # For reproducibility
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+#os.environ["TF_CUDNN_DETERMINISTIC"] = "1"  # For reproducibility
+#os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 import math
 import uuid
@@ -38,9 +38,9 @@ default_bias_init = nn.initializers.zeros
 @dataclass
 class Config:
     # wandb params
-    project: str = "ActReg"
-    group: str = "rebrac"
-    name: str = "rebrac-ce"
+    project: str = "ReBRAC2"
+    group: str = "rebrac2"
+    name: str = "rebrac-2"
     # model params
     actor_learning_rate: float = 1e-3
     critic_learning_rate: float = 1e-3
