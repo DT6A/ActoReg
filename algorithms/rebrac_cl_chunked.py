@@ -83,6 +83,7 @@ class Config:
     policy_freq: int = 2
     normalize_q: bool = True
     decay_schedule: str = None
+    num_critics: int = 2
     # training params
     dataset_name: str = "halfcheetah-medium-v2"
     batch_size: int = 1024
@@ -1733,7 +1734,7 @@ def train(config: Config):
 
     critic_module = EnsembleCritic(
         hidden_dim=config.hidden_dim,
-        num_critics=2,
+        num_critics=config.num_critics,
         layernorm=config.critic_ln,
         n_hiddens=config.critic_n_hiddens,
         n_classes=config.n_classes,
