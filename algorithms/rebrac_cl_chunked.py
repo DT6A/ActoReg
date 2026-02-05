@@ -534,6 +534,7 @@ def qlearning_dataset(
     c_reward = []
     c_done = []
     c_prev_action = []
+    c_valid = []
 
     discount_powers = discount ** np.arange(chunk_len)
     action_dim = action_[0].shape[-1] if action_ else 0
@@ -541,29 +542,52 @@ def qlearning_dataset(
 
     for ep_start, ep_end in intervals:
         ep_len = ep_end - ep_start
-        if ep_len < chunk_len:
+        if ep_len <= 0:
             continue
         last_start = ep_end - chunk_len
-        for t in range(ep_start, last_start + 1, chunk_stride):
-            action_chunk = np.asarray(action_[t:t + chunk_len])
-            reward_chunk = np.asarray(reward_[t:t + chunk_len])
-            done_chunk = np.asarray(done_[t:t + chunk_len])
-            done_flag = bool(np.any(done_chunk))
+        if last_start < ep_start:
+            starts = [ep_start]
+        else:
+            starts = range(ep_start, last_start + 1, chunk_stride)
+        for t in starts:
+            slice_end = min(t + chunk_len, ep_end + 1)
+            length = slice_end - t
+            action_chunk = np.zeros((chunk_len, action_dim), dtype=np.float32)
+            reward_chunk = np.zeros((chunk_len,), dtype=np.float32)
+            done_chunk = np.zeros((chunk_len,), dtype=np.float32)
+            if length > 0:
+                action_chunk[:length] = np.asarray(action_[t:slice_end])
+                reward_chunk[:length] = np.asarray(reward_[t:slice_end])
+                done_chunk[:length] = np.asarray(done_[t:slice_end]).astype(np.float32)
 
+            no_next = length < chunk_len
+            done_flag = bool(np.any(done_chunk)) or no_next
             if done_flag:
                 next_action_chunk = zero_next_action
             else:
                 next_action_end = t + 2 * chunk_len
-                if next_action_end > ep_end:
-                    continue
-                next_action_chunk = np.asarray(action_[t + chunk_len:next_action_end])
+                if next_action_end > ep_end + 1:
+                    no_next = True
+                    done_flag = True
+                    next_action_chunk = zero_next_action
+                else:
+                    next_action_chunk = np.asarray(action_[t + chunk_len:next_action_end])
+
+            cum_done = np.cumsum(done_chunk)
+            done_mask = (cum_done - done_chunk) > 0
+            reward_mask = 1.0 - done_mask.astype(np.float32)
+            discounted_reward = np.sum(discount_powers * reward_chunk * reward_mask)
+            valid = np.zeros((chunk_len,), dtype=np.float32)
+            if length > 0:
+                valid[:length] = 1.0 - done_mask[:length].astype(np.float32)
 
             c_obs.append(obs_[t])
             c_action.append(action_chunk)
-            c_next_obs.append(next_obs_[t + chunk_len - 1])
+            c_next_obs.append(next_obs_[min(t + chunk_len - 1, ep_end)])
             c_next_action.append(next_action_chunk)
-            c_reward.append(np.sum(discount_powers * reward_chunk))
+            c_reward.append(discounted_reward)
             c_done.append(done_flag)
+            c_valid.append(valid)
             if rtc_prefix_len > 0:
                 prev = np.zeros((rtc_prefix_len, action_dim), dtype=np.float32)
                 available = t - ep_start
@@ -582,6 +606,7 @@ def qlearning_dataset(
         "next_actions": np.asarray(c_next_action),
         "rewards": np.asarray(c_reward),
         "terminals": np.asarray(c_done),
+        "valid": np.asarray(c_valid),
     }
     print("Trains obs size:", len(train_data['observations']))
 
@@ -637,6 +662,7 @@ class ReplayBuffer:
             ),
             "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
             "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
+            "valid": jnp.asarray(d4rl_data["valid"], dtype=jnp.float32),
         }
 
         if is_normalize:
@@ -1061,6 +1087,10 @@ def update_actor(
                 rngs={'dropout': dropout_log_key},
             )
             bc_penalty = -log_probs
+            valid = batch.get("valid", None)
+            if valid is not None:
+                valid_ratio = jnp.clip(jnp.mean(valid, axis=1), 0.0, 1.0)
+                bc_penalty = bc_penalty * valid_ratio
             nll = jnp.mean(bc_penalty)
         else:
             (actions, preact), updates = actor.apply_fn(
@@ -1070,7 +1100,14 @@ def update_actor(
                 True, rngs={'dropout': dropout_key},
                 mutable=['batch_stats'],
             )
-            bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+            valid = batch.get("valid", None)
+            if valid is None:
+                bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+            else:
+                bc_penalty = jnp.sum(
+                    (actions - batch["actions"] + b_noise) ** 2 * valid[..., None],
+                    axis=(-1, -2),
+                )
             nll = None
 
         logits = critic.apply_fn(critic.params, batch["states"], actions)
@@ -1087,12 +1124,25 @@ def update_actor(
         random_actions = jax.random.uniform(
             random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0
         )
-        bc_mse_policy = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2)).mean()
+        if valid is None:
+            bc_mse_policy = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2)).mean()
+            action_mse = ((actions - batch["actions"]) ** 2).mean()
+            bc_mse_random = jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2)).mean()
+        else:
+            bc_mse_policy = jnp.sum(
+                (actions - batch["actions"] + b_noise) ** 2 * valid[..., None], axis=(-1, -2)
+            ).mean()
+            action_mse = jnp.sum(
+                (actions - batch["actions"]) ** 2 * valid[..., None], axis=(-1, -2)
+            ).mean()
+            bc_mse_random = jnp.sum(
+                (random_actions - batch["actions"]) ** 2 * valid[..., None], axis=(-1, -2)
+            ).mean()
         metrics_payload = {
             "actor_loss": loss,
             "bc_mse_policy": bc_mse_policy,
-            "bc_mse_random": jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2)).mean(),
-            "action_mse": ((actions - batch["actions"]) ** 2).mean(),
+            "bc_mse_random": bc_mse_random,
+            "action_mse": action_mse,
         }
         if nll is not None:
             metrics_payload["nll"] = nll
@@ -1182,6 +1232,10 @@ def update_actor_bc(
                 rngs={'dropout': dropout_log_key},
             )
             bc_penalty = -log_probs
+            valid = batch.get("valid", None)
+            if valid is not None:
+                valid_ratio = jnp.clip(jnp.mean(valid, axis=1), 0.0, 1.0)
+                bc_penalty = bc_penalty * valid_ratio
             nll = jnp.mean(bc_penalty)
         else:
             (actions, _), updates = actor.apply_fn(
@@ -1191,7 +1245,14 @@ def update_actor_bc(
                 True, rngs={'dropout': dropout_key},
                 mutable=['batch_stats'],
             )
-            bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+            valid = batch.get("valid", None)
+            if valid is None:
+                bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+            else:
+                bc_penalty = jnp.sum(
+                    (actions - batch["actions"] + b_noise) ** 2 * valid[..., None],
+                    axis=(-1, -2),
+                )
             nll = None
 
         loss = (beta * bc_penalty).mean()
@@ -1199,12 +1260,25 @@ def update_actor_bc(
         random_actions = jax.random.uniform(
             random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0
         )
-        bc_mse_policy = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2)).mean()
+        if valid is None:
+            bc_mse_policy = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2)).mean()
+            action_mse = ((actions - batch["actions"]) ** 2).mean()
+            bc_mse_random = jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2)).mean()
+        else:
+            bc_mse_policy = jnp.sum(
+                (actions - batch["actions"] + b_noise) ** 2 * valid[..., None], axis=(-1, -2)
+            ).mean()
+            action_mse = jnp.sum(
+                (actions - batch["actions"]) ** 2 * valid[..., None], axis=(-1, -2)
+            ).mean()
+            bc_mse_random = jnp.sum(
+                (random_actions - batch["actions"]) ** 2 * valid[..., None], axis=(-1, -2)
+            ).mean()
         metrics_payload = {
             "actor_loss": loss,
             "bc_mse_policy": bc_mse_policy,
-            "bc_mse_random": jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2)).mean(),
-            "action_mse": ((actions - batch["actions"]) ** 2).mean(),
+            "bc_mse_random": bc_mse_random,
+            "action_mse": action_mse,
         }
         if nll is not None:
             metrics_payload["nll"] = nll
