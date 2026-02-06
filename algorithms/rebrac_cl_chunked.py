@@ -550,7 +550,7 @@ def qlearning_dataset(
         else:
             starts = range(ep_start, last_start + 1, chunk_stride)
         for t in starts:
-            slice_end = min(t + chunk_len, ep_end + 1)
+            slice_end = min(t + chunk_len, ep_end)
             length = slice_end - t
             action_chunk = np.zeros((chunk_len, action_dim), dtype=np.float32)
             reward_chunk = np.zeros((chunk_len,), dtype=np.float32)
@@ -562,16 +562,17 @@ def qlearning_dataset(
 
             no_next = length < chunk_len
             done_flag = bool(np.any(done_chunk)) or no_next
-            if done_flag:
-                next_action_chunk = zero_next_action
-            else:
-                next_action_end = t + 2 * chunk_len
-                if next_action_end > ep_end + 1:
-                    no_next = True
+            next_action_chunk = np.zeros((chunk_len, action_dim), dtype=np.float32)
+            if not done_flag:
+                next_start = t + chunk_len
+                next_action_end = min(next_start + chunk_len, ep_end)
+                next_len = max(0, next_action_end - next_start)
+                if next_len < chunk_len:
                     done_flag = True
-                    next_action_chunk = zero_next_action
-                else:
-                    next_action_chunk = np.asarray(action_[t + chunk_len:next_action_end])
+                if next_len > 0:
+                    next_action_chunk[:next_len] = np.asarray(
+                        action_[next_start:next_start + next_len]
+                    )
 
             cum_done = np.cumsum(done_chunk)
             done_mask = (cum_done - done_chunk) > 0
@@ -583,7 +584,7 @@ def qlearning_dataset(
 
             c_obs.append(obs_[t])
             c_action.append(action_chunk)
-            c_next_obs.append(next_obs_[min(t + chunk_len - 1, ep_end)])
+            c_next_obs.append(next_obs_[min(t + chunk_len - 1, ep_end - 1)])
             c_next_action.append(next_action_chunk)
             c_reward.append(discounted_reward)
             c_done.append(done_flag)
