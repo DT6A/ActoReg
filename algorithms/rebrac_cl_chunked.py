@@ -243,7 +243,7 @@ class DetActor(nn.Module):
                 kernel_init=pytorch_init(s_d),
                 bias_init=nn.initializers.constant(0.1),
             ),
-            nn.relu,
+            nn.silu,
             nn.LayerNorm() if self.layernorm else identity,
             nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
             nn.GroupNorm() if self.groupnorm else identity,
@@ -257,7 +257,7 @@ class DetActor(nn.Module):
                     kernel_init=pytorch_init(h_d),
                     bias_init=nn.initializers.constant(0.1),
                 ),
-                nn.relu,
+                nn.silu,
                 nn.LayerNorm() if self.layernorm else identity,
                 nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
                 nn.GroupNorm() if self.groupnorm else identity,
@@ -282,7 +282,7 @@ class DetActor(nn.Module):
 
         last_layer = nn.Sequential(
             [
-                nn.relu,
+                nn.silu,
                 nn.LayerNorm() if self.layernorm else identity,
                 nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
                 nn.GroupNorm() if self.groupnorm else identity,
@@ -317,32 +317,32 @@ class Critic(nn.Module):
             action = action.reshape(action.shape[0], -1)
         s_d, a_d, h_d = state.shape[-1], action.shape[-1], self.hidden_dim
         # Initialization as in the EDAC paper
-        layers = [
-            nn.Dense(
-                self.hidden_dim,
-                kernel_init=pytorch_init(s_d + a_d),
-                bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.relu,
-            nn.LayerNorm() if self.layernorm else identity,
-        ]
-        for _ in range(self.n_hiddens - 1):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.relu,
-                nn.LayerNorm() if self.layernorm else identity,
-            ]
-        layers += [
-            # nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))
-            nn.Dense(self.n_classes, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))
-        ]
-        network = nn.Sequential(layers)
         state_action = jnp.hstack([state, action])
-        out = network(state_action)  # .squeeze(-1)
+
+        x = nn.Dense(
+            self.hidden_dim,
+            kernel_init=pytorch_init(s_d + a_d),
+            bias_init=nn.initializers.constant(0.1),
+        )(state_action)
+        x = nn.silu(x)
+        x = nn.LayerNorm()(x) if self.layernorm else x
+
+        # Residual MLP blocks
+        for _ in range(self.n_hiddens - 1):
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=pytorch_init(h_d),
+                bias_init=nn.initializers.constant(0.1),
+            )(x)
+            h = nn.silu(h)
+            h = nn.LayerNorm()(h) if self.layernorm else h
+            x = x + h
+
+        out = nn.Dense(
+            self.n_classes,
+            kernel_init=uniform_init(3e-3),
+            bias_init=uniform_init(3e-3),
+        )(x)
         return out
 
 
@@ -360,7 +360,7 @@ class Value(nn.Module):
                 kernel_init=pytorch_init(s_d),
                 bias_init=nn.initializers.constant(0.1),
             ),
-            nn.relu,
+            nn.silu,
             nn.LayerNorm() if self.layernorm else identity,
         ]
         for _ in range(self.n_hiddens - 1):
@@ -370,7 +370,7 @@ class Value(nn.Module):
                     kernel_init=pytorch_init(h_d),
                     bias_init=nn.initializers.constant(0.1),
                 ),
-                nn.relu,
+                nn.silu,
                 nn.LayerNorm() if self.layernorm else identity,
             ]
         layers += [nn.Dense(1, kernel_init=uniform_init(3e-3), bias_init=uniform_init(3e-3))]
