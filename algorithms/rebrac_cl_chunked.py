@@ -50,6 +50,8 @@ class Config:
     gamma: float = 0.99
     tau: float = 5e-3
     actor_bc_coef: float = 0.1
+    actor_bc_aux_weight: float = 0.0
+    actor_bc_aux_loss: str = "mse"  # "mse" or "mae"
     critic_bc_coef: float = 0.0
     actor_ln: bool = False
     actor_fn: bool = False
@@ -1050,6 +1052,8 @@ def update_actor(
         critic: TrainState,
         batch: Dict[str, jax.Array],
         beta: float,
+        aux_weight: float,
+        aux_loss: str,
         tau: float,
         normalize_q: bool,
         input_noise: float,
@@ -1111,6 +1115,21 @@ def update_actor(
                 )
             nll = None
 
+        # auxiliary BC term (MSE/MAE) without noise
+        diff = actions - batch["actions"]
+        if valid is None:
+            mse = jnp.mean(diff ** 2, axis=(-1, -2))
+            mae = jnp.mean(jnp.abs(diff), axis=(-1, -2))
+        else:
+            mask = valid[..., None]
+            denom = jnp.sum(mask, axis=(-1, -2)) + 1e-6
+            mse = jnp.sum((diff ** 2) * mask, axis=(-1, -2)) / denom
+            mae = jnp.sum(jnp.abs(diff) * mask, axis=(-1, -2)) / denom
+        if aux_loss == "mae":
+            aux_bc = mae
+        else:
+            aux_bc = mse
+
         logits = critic.apply_fn(critic.params, batch["states"], actions)
         probs = nn.softmax(logits, axis=-1)
         q_values = transform_from_probs(probs, critic.support).min(0)
@@ -1119,7 +1138,10 @@ def update_actor(
         if normalize_q:
             lmbda = jax.lax.stop_gradient(1 / jnp.abs(q_values).mean())
 
-        loss = (beta * bc_penalty - lmbda * q_values).mean()
+        bc_term = beta * bc_penalty
+        aux_term = aux_weight * aux_bc
+        q_term = -lmbda * q_values
+        loss = (bc_term + aux_term + q_term).mean()
 
         # logging stuff
         random_actions = jax.random.uniform(
@@ -1141,9 +1163,14 @@ def update_actor(
             ).mean()
         metrics_payload = {
             "actor_loss": loss,
+            "actor_loss_bc_term": bc_term.mean(),
+            "actor_loss_aux_term": aux_term.mean(),
+            "actor_loss_q_term": q_term.mean(),
+            "actor_loss_lmbda": lmbda,
             "bc_mse_policy": bc_mse_policy,
             "bc_mse_random": bc_mse_random,
             "action_mse": action_mse,
+            "aux_bc": aux_bc.mean(),
         }
         if nll is not None:
             metrics_payload["nll"] = nll
@@ -1180,14 +1207,6 @@ def update_actor(
         target_params=optax.incremental_update(critic.params, critic.target_params, tau)
     )
 
-    actor_params = new_actor.params
-    actor_params = jax.tree_util.tree_map(lambda x: x.reshape(-1), actor_params)
-    flat_vals, _ = jax.tree_util.tree_flatten(actor_params)
-    flat_mean = jnp.mean(jnp.concatenate(flat_vals))
-
-    new_metrics = new_metrics.update(
-        {"weights/actor_weights_mean": flat_mean}
-    )
     return key, new_actor, new_critic, new_metrics
 
 
@@ -1196,6 +1215,8 @@ def update_actor_bc(
         actor: TrainState,
         batch: Dict[str, jax.Array],
         beta: float,
+        aux_weight: float,
+        aux_loss: str,
         tau: float,
         input_noise: float,
         bc_noise: float,
@@ -1256,7 +1277,24 @@ def update_actor_bc(
                 )
             nll = None
 
-        loss = (beta * bc_penalty).mean()
+        # auxiliary BC term (MSE/MAE) without noise
+        diff = actions - batch["actions"]
+        if valid is None:
+            mse = jnp.mean(diff ** 2, axis=(-1, -2))
+            mae = jnp.mean(jnp.abs(diff), axis=(-1, -2))
+        else:
+            mask = valid[..., None]
+            denom = jnp.sum(mask, axis=(-1, -2)) + 1e-6
+            mse = jnp.sum((diff ** 2) * mask, axis=(-1, -2)) / denom
+            mae = jnp.sum(jnp.abs(diff) * mask, axis=(-1, -2)) / denom
+        if aux_loss == "mae":
+            aux_bc = mae
+        else:
+            aux_bc = mse
+
+        bc_term = beta * bc_penalty
+        aux_term = aux_weight * aux_bc
+        loss = (bc_term + aux_term).mean()
 
         random_actions = jax.random.uniform(
             random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0
@@ -1277,9 +1315,12 @@ def update_actor_bc(
             ).mean()
         metrics_payload = {
             "actor_loss": loss,
+            "actor_loss_bc_term": bc_term.mean(),
+            "actor_loss_aux_term": aux_term.mean(),
             "bc_mse_policy": bc_mse_policy,
             "bc_mse_random": bc_mse_random,
             "action_mse": action_mse,
+            "aux_bc": aux_bc.mean(),
         }
         if nll is not None:
             metrics_payload["nll"] = nll
@@ -1309,14 +1350,6 @@ def update_actor_bc(
         dropout_key=new_dropout_key,
     )
 
-    actor_params = new_actor.params
-    actor_params = jax.tree_util.tree_map(lambda x: x.reshape(-1), actor_params)
-    flat_vals, _ = jax.tree_util.tree_flatten(actor_params)
-    flat_mean = jnp.mean(jnp.concatenate(flat_vals))
-
-    new_metrics = new_metrics.update(
-        {"weights/actor_weights_mean": flat_mean}
-    )
     return key, new_actor, new_metrics
 
 
@@ -1452,6 +1485,8 @@ def update_td3(
         metrics: Metrics,
         gamma: float,
         actor_bc_coef: float,
+        actor_bc_aux_weight: float,
+        actor_bc_aux_loss: str,
         critic_bc_coef: float,
         tau: float,
         policy_noise: float,
@@ -1480,8 +1515,20 @@ def update_td3(
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
-        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise,
-        actor_grad_noise, use_nf, new_metrics
+        key,
+        actor,
+        new_critic,
+        batch,
+        actor_bc_coef,
+        actor_bc_aux_weight,
+        actor_bc_aux_loss,
+        tau,
+        normalize_q,
+        actor_input_noise,
+        actor_bc_noise,
+        actor_grad_noise,
+        use_nf,
+        new_metrics,
     )
     return key, new_actor, new_critic, new_metrics
 
@@ -1495,6 +1542,8 @@ def update_iql(
         metrics: Metrics,
         gamma: float,
         actor_bc_coef: float,
+        actor_bc_aux_weight: float,
+        actor_bc_aux_loss: str,
         tau: float,
         chunk_len: int,
         iql_expectile: float,
@@ -1509,8 +1558,20 @@ def update_iql(
         critic, new_value, batch, gamma, chunk_len
     )
     key, new_actor, new_critic, new_metrics = update_actor(
-        key, actor, new_critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise,
-        actor_grad_noise, use_nf, metrics
+        key,
+        actor,
+        new_critic,
+        batch,
+        actor_bc_coef,
+        actor_bc_aux_weight,
+        actor_bc_aux_loss,
+        tau,
+        normalize_q,
+        actor_input_noise,
+        actor_bc_noise,
+        actor_grad_noise,
+        use_nf,
+        metrics,
     )
     new_metrics = new_metrics.update(
         {
@@ -1625,6 +1686,8 @@ def update_refinement(
         metrics: Metrics,
         gamma: float,
         actor_bc_coef: float,
+        actor_bc_aux_weight: float,
+        actor_bc_aux_loss: str,
         critic_bc_coef: float,
         tau: float,
         policy_noise: float,
@@ -1636,8 +1699,20 @@ def update_refinement(
         use_nf: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_actor, new_critic, new_metrics = update_actor(
-        key, actor, critic, batch, actor_bc_coef, tau, normalize_q, actor_input_noise, actor_bc_noise,
-        actor_grad_noise, use_nf, metrics
+        key,
+        actor,
+        critic,
+        batch,
+        actor_bc_coef,
+        actor_bc_aux_weight,
+        actor_bc_aux_loss,
+        tau,
+        normalize_q,
+        actor_input_noise,
+        actor_bc_noise,
+        actor_grad_noise,
+        use_nf,
+        metrics,
     )
     return key, new_actor, new_critic, new_metrics
 
@@ -1668,6 +1743,8 @@ def train(config: Config):
         raise ValueError("rtc_prefix_len must be <= action_chunk_len")
     if config.use_iql and config.num_refinement_epochs > 0:
         raise ValueError("IQL mode does not support refinement epochs")
+    if config.actor_bc_aux_loss not in {"mse", "mae"}:
+        raise ValueError("actor_bc_aux_loss must be 'mse' or 'mae'")
 
     wandb.init(
         config=dict_config,
@@ -1862,6 +1939,8 @@ def train(config: Config):
         update_td3,
         gamma=config.gamma,
         actor_bc_coef=config.actor_bc_coef,
+        actor_bc_aux_weight=config.actor_bc_aux_weight,
+        actor_bc_aux_loss=config.actor_bc_aux_loss,
         critic_bc_coef=config.critic_bc_coef,
         tau=config.tau,
         policy_noise=config.policy_noise,
@@ -1891,6 +1970,8 @@ def train(config: Config):
         update_iql,
         gamma=config.gamma,
         actor_bc_coef=config.actor_bc_coef,
+        actor_bc_aux_weight=config.actor_bc_aux_weight,
+        actor_bc_aux_loss=config.actor_bc_aux_loss,
         tau=config.tau,
         chunk_len=config.action_chunk_len,
         iql_expectile=config.iql_expectile,
@@ -1911,6 +1992,8 @@ def train(config: Config):
         update_refinement,
         gamma=config.gamma,
         actor_bc_coef=config.actor_bc_coef / config.refinement_div,
+        actor_bc_aux_weight=config.actor_bc_aux_weight,
+        actor_bc_aux_loss=config.actor_bc_aux_loss,
         critic_bc_coef=config.critic_bc_coef,
         tau=config.tau,
         policy_noise=config.policy_noise,
@@ -1924,6 +2007,8 @@ def train(config: Config):
     update_actor_bc_partial = partial(
         update_actor_bc,
         beta=config.actor_bc_coef,
+        aux_weight=config.actor_bc_aux_weight,
+        aux_loss=config.actor_bc_aux_loss,
         tau=config.tau,
         input_noise=config.actor_input_noise * reset_mods,
         bc_noise=config.actor_bc_noise * reset_mods,
@@ -1947,20 +2032,28 @@ def train(config: Config):
         "critic_loss",
         "q_min",
         "actor_loss",
+        "actor_loss_bc_term",
+        "actor_loss_aux_term",
+        "actor_loss_q_term",
+        "actor_loss_lmbda",
+        "aux_bc",
         "batch_entropy",
         "bc_mse_policy",
         "bc_mse_random",
         "action_mse",
-        "weights/actor_weights_mean",
     ]
     if config.use_iql:
         full_metrics_to_log.append("value_loss")
     actor_metrics_to_log = [
         "actor_loss",
+        "actor_loss_bc_term",
+        "actor_loss_aux_term",
+        "actor_loss_q_term",
+        "actor_loss_lmbda",
+        "aux_bc",
         "bc_mse_policy",
         "bc_mse_random",
         "action_mse",
-        "weights/actor_weights_mean",
     ]
     if config.use_nf:
         full_metrics_to_log.append("nll")
