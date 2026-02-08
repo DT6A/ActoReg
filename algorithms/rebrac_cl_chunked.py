@@ -9,6 +9,8 @@ import os
 import math
 import uuid
 import random
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Any, Callable, Dict, Sequence, Tuple, Union, Optional
@@ -141,6 +143,7 @@ class Config:
 
     noisy_eval: bool = False
     mlc_job_name: str = None
+    watchdog_timeout_s: int = 3600
 
     def __post_init__(self):
         self.name = f"{self.name}-{self.dataset_name}-{str(uuid.uuid4())[:8]}"
@@ -1786,6 +1789,25 @@ def train(config: Config):
         id=str(uuid.uuid4()),
     )
     wandb.mark_preempting()
+
+    last_activity = {"t": time.monotonic()}
+
+    def touch() -> None:
+        last_activity["t"] = time.monotonic()
+
+    def watchdog() -> None:
+        timeout_s = max(1, int(config.watchdog_timeout_s))
+        while True:
+            time.sleep(60)
+            if time.monotonic() - last_activity["t"] > timeout_s:
+                print(f"Watchdog timeout after {timeout_s}s of inactivity.", flush=True)
+                try:
+                    wandb.finish(exit_code=1)
+                finally:
+                    os._exit(1)
+
+    if config.watchdog_timeout_s and config.watchdog_timeout_s > 0:
+        threading.Thread(target=watchdog, daemon=True).start()
     buffer = ReplayBuffer()
     buffer.create_from_d4rl(
         config.dataset_name, config.normalize_reward, config.normalize_states, discount=config.gamma,
@@ -2396,6 +2418,7 @@ def train(config: Config):
     critic_end = il_end + config.critic_warmup_epochs
 
     for epoch in trange(config.num_epochs, desc="ReBRAC Epochs"):
+        touch()
         stage = "rl"
         if epoch < il_end:
             stage = "il"
@@ -2449,6 +2472,7 @@ def train(config: Config):
         wandb.log(
             {"epoch": epoch, **{f"ReBRAC/{k}": v for k, v in mean_metrics.items()}}
         )
+        touch()
 
         force_eval = epoch == il_end - 1 or epoch == critic_end - 1
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1 or force_eval:
@@ -2534,6 +2558,10 @@ def train(config: Config):
             wandb.log(
                 eval_metrics
             )
+            touch()
+
+    wandb.finish()
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":
