@@ -34,6 +34,21 @@ from nf_policy import NFActor
 default_kernel_init = nn.initializers.lecun_normal()
 default_bias_init = nn.initializers.zeros
 
+try:
+    from mujoco_py.builder import MujocoException as _MujocoException
+except Exception:  # pragma: no cover - optional dependency
+    _MujocoException = None
+
+
+def _is_mujoco_exception(exc: Exception) -> bool:
+    if _MujocoException is not None and isinstance(exc, _MujocoException):
+        return True
+    name = type(exc).__name__
+    if "MujocoException" in name:
+        return True
+    msg = str(exc)
+    return "Check for NaN in simulation" in msg
+
 
 @dataclass
 class Config:
@@ -107,6 +122,7 @@ class Config:
     eval_episodes: int = 10
     eval_every: int = 100
     eval_num_envs: int = 1
+    eval_first_action_only: bool = False
     # general params
     train_seed: int = 0
     eval_seed: int = 42
@@ -811,6 +827,7 @@ def evaluate(
         nf_eval_z_scale: float = 1.0,
         nf_eval_z_clip: float = 0.0,
         nf_eval_select: str = "q",
+        eval_first_action_only: bool = False,
 ) -> Tuple[np.ndarray, Dict]:
     if rtc_prefix_len is None:
         rtc_prefix_len = 0
@@ -907,8 +924,11 @@ def evaluate(
                             q_vals = eval_q(obs_rep, cand_actions)
                             best_idx = int(jax.device_get(jnp.argmax(q_vals)))
                         action_chunk = np.asarray(jax.device_get(cand_actions[best_idx]))
-                    action_buffers[i] = list(action_chunk) if action_chunk.ndim > 1 else [action_chunk]
-                    if rtc_prefix_len > 0:
+                    if action_chunk.ndim > 1:
+                        action_buffers[i] = [action_chunk[0]] if eval_first_action_only else list(action_chunk)
+                    else:
+                        action_buffers[i] = [action_chunk]
+                    if (not eval_first_action_only) and rtc_prefix_len > 0:
                         prev_prefix[i] = action_chunk[-rtc_prefix_len:].reshape(rtc_prefix_len, action_dim)
 
                     if use_refine:
@@ -918,12 +938,18 @@ def evaluate(
                             action_j = action_j[None, ...]
                         action_j = refine_action_chunk(obs_j, action_j)
                         action_chunk = np.asarray(action_j[0])
-                        action_buffers[i] = list(action_chunk)
-                        if rtc_prefix_len > 0:
+                        if action_chunk.ndim > 1:
+                            action_buffers[i] = [action_chunk[0]] if eval_first_action_only else list(action_chunk)
+                        else:
+                            action_buffers[i] = [action_chunk]
+                        if (not eval_first_action_only) and rtc_prefix_len > 0:
                             prev_prefix[i] = action_chunk[-rtc_prefix_len:]
 
                 action = action_buffers[i].pop(0)
                 eval_actions.append(action)
+                if eval_first_action_only and rtc_prefix_len > 0:
+                    prev_prefix[i][:-1] = prev_prefix[i][1:]
+                    prev_prefix[i][-1] = np.asarray(action)
                 action = jnp.clip(action + jax.random.normal(actions_key, action.shape) * action_noise, -1, 1)
                 actions.append(action)
 
@@ -997,8 +1023,8 @@ def evaluate(
                     if action_chunk.ndim == 1:
                         action_buffer = [action_chunk]
                     else:
-                        action_buffer = list(action_chunk)
-                    if rtc_prefix_len > 0:
+                        action_buffer = [action_chunk[0]] if eval_first_action_only else list(action_chunk)
+                    if (not eval_first_action_only) and rtc_prefix_len > 0:
                         if action_chunk.ndim == 1:
                             prev_prefix = action_chunk[-rtc_prefix_len:].reshape(rtc_prefix_len, action_dim)
                         else:
@@ -1010,11 +1036,17 @@ def evaluate(
                             action_j = action_j[None, ...]
                         action_j = refine_action_chunk(obs_j, action_j)
                         action_chunk = np.asarray(action_j[0])
-                        action_buffer = list(action_chunk)
-                        if rtc_prefix_len > 0:
+                        if action_chunk.ndim == 1:
+                            action_buffer = [action_chunk]
+                        else:
+                            action_buffer = [action_chunk[0]] if eval_first_action_only else list(action_chunk)
+                        if (not eval_first_action_only) and rtc_prefix_len > 0:
                             prev_prefix = action_chunk[-rtc_prefix_len:]
                 action = action_buffer.pop(0)
                 eval_actions.append(action)
+                if eval_first_action_only and rtc_prefix_len > 0:
+                    prev_prefix[:-1] = prev_prefix[1:]
+                    prev_prefix[-1] = np.asarray(action)
                 action = jnp.clip(action + jax.random.normal(actions_key, action.shape) * action_noise, -1, 1)
                 obs, reward, done, _ = env.step(action)
                 total_reward += reward
@@ -2423,24 +2455,32 @@ def train(config: Config):
             eval_select = "likelihood" if stage == "il" else "q"
             eval_q_step_size = 0.0 if stage == "il" else config.q_infer_step_size
             eval_q_steps = 0 if stage == "il" else config.q_infer_steps
-            eval_returns, eval_batch = evaluate(
-                eval_env,
-                update_carry["actor"].params,
-                update_carry["actor"].batch_stats,
-                update_carry["critic"],
-                actor_action_fn,
-                actor_logprob_fn if config.use_nf else None,
-                config.eval_episodes,
-                seed=config.eval_seed,
-                rtc_prefix_len=config.rtc_prefix_len,
-                q_infer_step_size=eval_q_step_size,
-                q_infer_steps=eval_q_steps,
-                use_nf=config.use_nf,
-                nf_eval_num_samples=config.nf_eval_num_samples,
-                nf_eval_z_scale=config.nf_eval_z_scale,
-                nf_eval_z_clip=config.nf_eval_z_clip,
-                nf_eval_select=eval_select,
-            )
+            try:
+                eval_returns, eval_batch = evaluate(
+                    eval_env,
+                    update_carry["actor"].params,
+                    update_carry["actor"].batch_stats,
+                    update_carry["critic"],
+                    actor_action_fn,
+                    actor_logprob_fn if config.use_nf else None,
+                    config.eval_episodes,
+                    seed=config.eval_seed,
+                    rtc_prefix_len=config.rtc_prefix_len,
+                    q_infer_step_size=eval_q_step_size,
+                    q_infer_steps=eval_q_steps,
+                    use_nf=config.use_nf,
+                    nf_eval_num_samples=config.nf_eval_num_samples,
+                    nf_eval_z_scale=config.nf_eval_z_scale,
+                    nf_eval_z_clip=config.nf_eval_z_clip,
+                    nf_eval_select=eval_select,
+                    eval_first_action_only=config.eval_first_action_only,
+                )
+            except Exception as exc:
+                if _is_mujoco_exception(exc):
+                    print(f"MujocoException during evaluation: {exc}", flush=True)
+                    wandb.finish(exit_code=1)
+                    raise SystemExit(1)
+                raise
 
             if hasattr(eval_env, "get_normalized_score"):
                 normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
@@ -2458,26 +2498,34 @@ def train(config: Config):
                 for (sn, an) in [
                     (0.0, 0.2), (0.05, 0.0)
                 ]:
-                    returns, _ = evaluate(
-                        eval_env,
-                        update_carry["actor"].params,
-                        update_carry["actor"].batch_stats,
-                        update_carry["critic"],
-                        actor_action_fn,
-                        actor_logprob_fn if config.use_nf else None,
-                        config.eval_episodes,
-                        seed=config.eval_seed,
-                        action_noise=an,
-                        state_noise=sn,
-                        rtc_prefix_len=config.rtc_prefix_len,
-                        q_infer_step_size=eval_q_step_size,
-                        q_infer_steps=eval_q_steps,
-                        use_nf=config.use_nf,
-                        nf_eval_num_samples=config.nf_eval_num_samples,
-                        nf_eval_z_scale=config.nf_eval_z_scale,
-                        nf_eval_z_clip=config.nf_eval_z_clip,
-                        nf_eval_select=eval_select,
-                    )
+                    try:
+                        returns, _ = evaluate(
+                            eval_env,
+                            update_carry["actor"].params,
+                            update_carry["actor"].batch_stats,
+                            update_carry["critic"],
+                            actor_action_fn,
+                            actor_logprob_fn if config.use_nf else None,
+                            config.eval_episodes,
+                            seed=config.eval_seed,
+                            action_noise=an,
+                            state_noise=sn,
+                            rtc_prefix_len=config.rtc_prefix_len,
+                            q_infer_step_size=eval_q_step_size,
+                            q_infer_steps=eval_q_steps,
+                            use_nf=config.use_nf,
+                            nf_eval_num_samples=config.nf_eval_num_samples,
+                            nf_eval_z_scale=config.nf_eval_z_scale,
+                            nf_eval_z_clip=config.nf_eval_z_clip,
+                            nf_eval_select=eval_select,
+                            eval_first_action_only=config.eval_first_action_only,
+                        )
+                    except Exception as exc:
+                        if _is_mujoco_exception(exc):
+                            print(f"MujocoException during evaluation: {exc}", flush=True)
+                            wandb.finish(exit_code=1)
+                            raise SystemExit(1)
+                        raise
                     if hasattr(eval_env, "get_normalized_score"):
                         normalized_returns = eval_env.get_normalized_score(returns) * 100.0
                     else:
