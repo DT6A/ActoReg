@@ -24,7 +24,7 @@ from jax import tree_util
 import jax.numpy as jnp
 import numpy as np
 import optax
-from optax._src import base, combine, transform
+from optax._src import base, combine, transform, wrappers
 import pyrallis
 import wandb
 from flax.core import FrozenDict
@@ -513,8 +513,9 @@ def qlearning_dataset(
             if last_transition_idx >= 0 and (not episode_ends or episode_ends[-1] != last_transition_idx):
                 episode_ends.append(last_transition_idx)
             continue
+        next_episode_step = episode_step + 1
         if done_bool or final_timestep:
-            episode_step = 0
+            next_episode_step = 0
 
         episode_rewards.append(reward)
         episode_terminals.append(done_bool)
@@ -528,10 +529,12 @@ def qlearning_dataset(
         if done_bool or final_timestep:
             if not episode_ends or episode_ends[-1] != last_transition_idx:
                 episode_ends.append(last_transition_idx)
-        episode_step += 1
+        episode_step = next_episode_step
 
     if episode_step != 0:
         mc_returns_ += calc_return_to_go(is_sparse, episode_rewards, episode_terminals, discount)
+    if last_transition_idx >= 0 and (not episode_ends or episode_ends[-1] != last_transition_idx):
+        episode_ends.append(last_transition_idx)
 
     print("SHAPE", np.array(mc_returns_).shape, np.array(reward_).shape, np.array(done_).shape)
     assert np.array(mc_returns_).shape == np.array(reward_).shape
@@ -2503,9 +2506,9 @@ def train(config: Config):
                     reset_params = reset_module.init(actor_key, init_state, init_prev_actions, False)
                 actor = ActorTrainState.create(
                     apply_fn=reset_module.apply,
-                    params=reset_params,
+                    params=reset_params["params"],
                     batch_stats=reset_params['batch_stats'] if 'batch_stats' in reset_params else {},
-                    target_params=reset_params,
+                    target_params=reset_params["params"],
                     target_batch_stats=reset_params['batch_stats'] if 'batch_stats' in reset_params else {},
                     constants=reset_params.get("constants", {}),
                     target_constants=reset_params.get("constants", {}),
