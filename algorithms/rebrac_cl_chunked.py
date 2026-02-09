@@ -752,7 +752,10 @@ class Metrics:
 
     def compute(self) -> Dict[str, np.ndarray]:
         # cumulative_value / total_steps
-        return {k: np.array(v[0] / v[1]) for k, v in self.accumulators.items()}
+        return {
+            k: np.array(jnp.where(v[1] > 0, v[0] / v[1], 0.0))
+            for k, v in self.accumulators.items()
+        }
 
 
 def normalize(
@@ -1247,8 +1250,8 @@ def update_actor(
         batch_stats=updates['batch_stats'],
     )
     new_actor = new_actor.replace(
-        target_params=optax.incremental_update(actor.params, actor.target_params, tau),
-        target_batch_stats=optax.incremental_update(actor.batch_stats, actor.target_batch_stats, tau),
+        target_params=optax.incremental_update(new_actor.params, actor.target_params, tau),
+        target_batch_stats=optax.incremental_update(new_actor.batch_stats, actor.target_batch_stats, tau),
         dropout_key=new_dropout_key,
     )
     new_critic = critic.replace(
@@ -1390,8 +1393,8 @@ def update_actor_bc(
     new_actor = actor.apply_gradients(grads=grads)
     new_actor = new_actor.replace(
         batch_stats=updates['batch_stats'],
-        target_params=optax.incremental_update(actor.params, actor.target_params, tau),
-        target_batch_stats=optax.incremental_update(actor.batch_stats, actor.target_batch_stats, tau),
+        target_params=optax.incremental_update(new_actor.params, actor.target_params, tau),
+        target_batch_stats=optax.incremental_update(new_actor.batch_stats, actor.target_batch_stats, tau),
         dropout_key=new_dropout_key,
     )
 
@@ -2142,7 +2145,6 @@ def train(config: Config):
         "actor_loss_q_term",
         "actor_loss_lmbda",
         "aux_bc",
-        "batch_entropy",
         "bc_mse_policy",
         "bc_mse_random",
         "action_mse",
@@ -2153,8 +2155,6 @@ def train(config: Config):
         "actor_loss",
         "actor_loss_bc_term",
         "actor_loss_aux_term",
-        "actor_loss_q_term",
-        "actor_loss_lmbda",
         "aux_bc",
         "bc_mse_policy",
         "bc_mse_random",
