@@ -130,6 +130,7 @@ class Config:
     eval_seed: int = 42
     # classification
 
+    use_distributional: bool = True
     n_classes: int = 101
     sigma_frac: float = 0.75
     v_min: float = float('inf')
@@ -255,49 +256,35 @@ class DetActor(nn.Module):
         prev_flat = prev_actions.reshape(prev_actions.shape[0], -1)
         state = jnp.hstack([state, prev_flat])
         s_d = state.shape[-1]
-        # Initialization as in the EDAC paper
-        layers = [
-            nn.Dense(
+        def dense_layer(x, fan_in):
+            dense = nn.Dense(
                 self.hidden_dim,
-                kernel_init=pytorch_init(s_d),
+                kernel_init=pytorch_init(fan_in),
                 bias_init=nn.initializers.constant(0.1),
-            ),
-            nn.silu,
-            nn.LayerNorm() if self.layernorm else identity,
-            nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
-            nn.GroupNorm() if self.groupnorm else identity,
-            nn.BatchNorm(use_running_average=not train) if self.batchnorm else identity,
-            nn.Dropout(rate=self.dropout_rate, deterministic=not train),
-        ]
-        for _ in range(self.n_hiddens - 2):
-            layers += [
-                nn.Dense(
-                    self.hidden_dim,
-                    kernel_init=pytorch_init(h_d),
-                    bias_init=nn.initializers.constant(0.1),
-                ),
-                nn.silu,
-                nn.LayerNorm() if self.layernorm else identity,
-                nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
-                nn.GroupNorm() if self.groupnorm else identity,
-                nn.BatchNorm(use_running_average=not train) if self.batchnorm else identity,
-                nn.Dropout(rate=self.dropout_rate, deterministic=not train),
-            ]
+            )
+            if self.spectralnorm:
+                x = nn.SpectralNorm(dense)(x, update_stats=train)
+            else:
+                x = dense(x)
+            return x
 
+        def apply_block(x):
+            x = nn.silu(x)
+            x = nn.LayerNorm()(x) if self.layernorm else x
+            x = nn.LayerNorm(use_bias=False, use_scale=False)(x) if self.featurenorm else x
+            x = nn.GroupNorm()(x) if self.groupnorm else x
+            x = nn.BatchNorm(use_running_average=not train)(x) if self.batchnorm else x
+            x = nn.Dropout(rate=self.dropout_rate, deterministic=not train)(x)
+            return x
 
-        net = nn.Sequential(layers)
+        x = dense_layer(state, s_d)
+        x = apply_block(x)
+        for _ in range(max(self.n_hiddens - 1, 0)):
+            h = dense_layer(x, h_d)
+            h = apply_block(h)
+            x = x + h
 
-        trunk = nn.Dense(
-            self.hidden_dim,
-            kernel_init=pytorch_init(h_d),
-            bias_init=nn.initializers.constant(0.1),
-        )(net(state)) if not self.spectralnorm else nn.SpectralNorm(nn.Dense(
-            self.hidden_dim,
-            kernel_init=pytorch_init(h_d),
-            bias_init=nn.initializers.constant(0.1),
-        ))(net(state), update_stats=train)
-
-        # trunk = net(state)
+        trunk = x
 
         last_layer = nn.Sequential(
             [
@@ -329,6 +316,7 @@ class Critic(nn.Module):
     layernorm: bool = True
     n_hiddens: int = 3
     n_classes: int = 21
+    use_distributional: bool = True
 
     @nn.compact
     def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
@@ -358,7 +346,7 @@ class Critic(nn.Module):
             x = x + h
 
         out = nn.Dense(
-            self.n_classes,
+            self.n_classes if self.use_distributional else 1,
             kernel_init=uniform_init(3e-3),
             bias_init=uniform_init(3e-3),
         )(x)
@@ -404,6 +392,7 @@ class EnsembleCritic(nn.Module):
     layernorm: bool = True
     n_hiddens: int = 3
     n_classes: int = 21
+    use_distributional: bool = True
 
     @nn.compact
     def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
@@ -415,9 +404,13 @@ class EnsembleCritic(nn.Module):
             split_rngs={"params": True},
             axis_size=self.num_critics,
         )
-        q_values = ensemble(self.hidden_dim, self.layernorm, self.n_hiddens, self.n_classes)(
-            state, action
-        )
+        q_values = ensemble(
+            self.hidden_dim,
+            self.layernorm,
+            self.n_hiddens,
+            self.n_classes,
+            self.use_distributional,
+        )(state, action)
         return q_values
 
 
@@ -826,6 +819,7 @@ def evaluate(
         q_infer_step_size: float = 0.0,
         q_infer_steps: int = 0,
         use_nf: bool = False,
+        use_distributional: bool = True,
         nf_eval_num_samples: int = 1,
         nf_eval_z_scale: float = 1.0,
         nf_eval_z_clip: float = 0.0,
@@ -854,8 +848,13 @@ def evaluate(
     @jax.jit
     def eval_q(obs_j, action_j):
         logits = critic.apply_fn(critic.params, obs_j, action_j)
-        probs = nn.softmax(logits, axis=-1)
-        q_values = transform_from_probs(probs, critic.support).min(0)
+        if use_distributional:
+            probs = nn.softmax(logits, axis=-1)
+            q_values = transform_from_probs(probs, critic.support).min(0)
+        else:
+            q_values = jnp.squeeze(logits, axis=-1)
+            if q_values.ndim > 1:
+                q_values = q_values.min(0)
         return q_values
 
     def _refine_action_chunk(obs_j, action_j):
@@ -1052,6 +1051,7 @@ def evaluate(
                     prev_prefix[-1] = np.asarray(action)
                 action = jnp.clip(action + jax.random.normal(actions_key, action.shape) * action_noise, -1, 1)
                 obs, reward, done, _ = env.step(action)
+                # print(reward, end=" ", flush=True)
                 total_reward += reward
             returns.append(total_reward)
 
@@ -1095,6 +1095,7 @@ def update_actor(
         bc_noise: float,
         grad_noise: float,
         use_nf: bool,
+        use_distributional: bool,
         metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, random_action_key, input_noise_key, bc_noise_key, grad_noise_key = jax.random.split(key, 5)
@@ -1166,8 +1167,13 @@ def update_actor(
             aux_bc = mse
 
         logits = critic.apply_fn(critic.params, batch["states"], actions)
-        probs = nn.softmax(logits, axis=-1)
-        q_values = transform_from_probs(probs, critic.support).min(0)
+        if use_distributional:
+            probs = nn.softmax(logits, axis=-1)
+            q_values = transform_from_probs(probs, critic.support).min(0)
+        else:
+            q_values = jnp.squeeze(logits, axis=-1)
+            if q_values.ndim > 1:
+                q_values = q_values.min(0)
 
         lmbda = 1
         if normalize_q:
@@ -1393,12 +1399,18 @@ def update_value(
         critic: CriticTrainState,
         batch: Dict[str, jax.Array],
         expectile: float,
+        use_distributional: bool,
 ) -> Tuple[ValueTrainState, jax.Array]:
     def value_loss_fn(value_params: jax.Array) -> Tuple[jax.Array, jax.Array]:
         v = value.apply_fn(value_params, batch["states"])
         logits = critic.apply_fn(critic.params, batch["states"], batch["actions"])
-        probs = nn.softmax(logits, axis=-1)
-        q_values = transform_from_probs(probs, critic.support).min(0)
+        if use_distributional:
+            probs = nn.softmax(logits, axis=-1)
+            q_values = transform_from_probs(probs, critic.support).min(0)
+        else:
+            q_values = jnp.squeeze(logits, axis=-1)
+            if q_values.ndim > 1:
+                q_values = q_values.min(0)
         diff = q_values - v
         weight = jnp.where(diff > 0, expectile, 1 - expectile)
         loss = (weight * (diff ** 2)).mean()
@@ -1415,15 +1427,21 @@ def update_critic_iql(
         batch: Dict[str, jax.Array],
         gamma: float,
         chunk_len: int,
+        use_distributional: bool,
 ) -> Tuple[CriticTrainState, jax.Array, jax.Array]:
     v_next = value.apply_fn(value.params, batch["next_states"])
     target_q = batch["rewards"] + (1 - batch["dones"]) * (gamma ** chunk_len) * v_next
 
     def critic_loss_fn(critic_params: jax.Array) -> Tuple[jax.Array, jax.Array]:
         q = critic.apply_fn(critic_params, batch["states"], batch["actions"])
-        q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
-        target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
-        loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
+        if use_distributional:
+            q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
+            target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
+            loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
+        else:
+            q = jnp.squeeze(q, axis=-1)
+            q_min = q.min(0).mean() if q.ndim > 1 else q.mean()
+            loss = jnp.mean((q - target_q) ** 2, axis=1).sum(0) if q.ndim > 1 else jnp.mean((q - target_q) ** 2)
         return loss, q_min
 
     (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic.params)
@@ -1443,6 +1461,7 @@ def update_critic(
         chunk_len: int,
         rtc_prefix_len: int,
         use_nf: bool,
+        use_distributional: bool,
         metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, TrainState, Metrics]:
     key, actions_key, noise_key = jax.random.split(key, 3)
@@ -1484,19 +1503,27 @@ def update_critic(
     next_actions = jnp.clip(next_actions + noise, -1, 1)
     bc_penalty = jnp.sum((next_actions - batch["next_actions"]) ** 2, axis=(-1, -2))
     logits = critic.apply_fn(critic.target_params, batch["next_states"], next_actions)
-    probs = nn.softmax(logits, axis=-1)
-    next_q = transform_from_probs(probs, critic.support).min(0)
+    if use_distributional:
+        probs = nn.softmax(logits, axis=-1)
+        next_q = transform_from_probs(probs, critic.support).min(0)
+    else:
+        next_q = jnp.squeeze(logits, axis=-1)
+        if next_q.ndim > 1:
+            next_q = next_q.min(0)
     next_q = next_q - beta * bc_penalty
 
     target_q = batch["rewards"] + (1 - batch["dones"]) * (gamma ** chunk_len) * next_q
 
     def critic_loss_fn(critic_params: jax.Array) -> Tuple[jax.Array, jax.Array]:
-        # [N, batch_size] - [1, batch_size]
         q = critic.apply_fn(critic_params, batch["states"], batch["actions"])
-        q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
-        target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
-
-        loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
+        if use_distributional:
+            q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
+            target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
+            loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
+        else:
+            q = jnp.squeeze(q, axis=-1)
+            q_min = q.min(0).mean() if q.ndim > 1 else q.mean()
+            loss = jnp.mean((q - target_q) ** 2, axis=1).sum(0) if q.ndim > 1 else jnp.mean((q - target_q) ** 2)
         return loss, q_min
 
     (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(
@@ -1533,6 +1560,7 @@ def update_td3(
         chunk_len: int,
         rtc_prefix_len: int,
         use_nf: bool,
+        use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1547,6 +1575,7 @@ def update_td3(
         chunk_len,
         rtc_prefix_len,
         use_nf,
+        use_distributional,
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
@@ -1563,6 +1592,7 @@ def update_td3(
         actor_bc_noise,
         actor_grad_noise,
         use_nf,
+        use_distributional,
         new_metrics,
     )
     return key, new_actor, new_critic, new_metrics
@@ -1587,10 +1617,11 @@ def update_iql(
         actor_bc_noise: float,
         actor_grad_noise: float,
         use_nf: bool,
+        use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, CriticTrainState, ValueTrainState, Metrics]:
-    new_value, value_loss = update_value(value, critic, batch, iql_expectile)
+    new_value, value_loss = update_value(value, critic, batch, iql_expectile, use_distributional)
     new_critic, critic_loss, q_min = update_critic_iql(
-        critic, new_value, batch, gamma, chunk_len
+        critic, new_value, batch, gamma, chunk_len, use_distributional
     )
     key, new_actor, new_critic, new_metrics = update_actor(
         key,
@@ -1606,6 +1637,7 @@ def update_iql(
         actor_bc_noise,
         actor_grad_noise,
         use_nf,
+        use_distributional,
         metrics,
     )
     new_metrics = new_metrics.update(
@@ -1628,10 +1660,11 @@ def update_iql_no_actor(
         gamma: float,
         chunk_len: int,
         iql_expectile: float,
+        use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, CriticTrainState, ValueTrainState, Metrics]:
-    new_value, value_loss = update_value(value, critic, batch, iql_expectile)
+    new_value, value_loss = update_value(value, critic, batch, iql_expectile, use_distributional)
     new_critic, critic_loss, q_min = update_critic_iql(
-        critic, new_value, batch, gamma, chunk_len
+        critic, new_value, batch, gamma, chunk_len, use_distributional
     )
     new_metrics = metrics.update(
         {
@@ -1658,6 +1691,7 @@ def update_td3_no_targets(
         chunk_len: int,
         rtc_prefix_len: int,
         use_nf: bool,
+        use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1672,6 +1706,7 @@ def update_td3_no_targets(
         chunk_len,
         rtc_prefix_len,
         use_nf,
+        use_distributional,
         metrics,
     )
     return key, actor, new_critic, new_metrics
@@ -1691,6 +1726,7 @@ def update_critic_warmup(
         chunk_len: int,
         rtc_prefix_len: int,
         use_nf: bool,
+        use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1705,6 +1741,7 @@ def update_critic_warmup(
         chunk_len,
         rtc_prefix_len,
         use_nf,
+        use_distributional,
         metrics,
     )
     new_critic = new_critic.replace(
@@ -1732,6 +1769,7 @@ def update_refinement(
         actor_bc_noise: float,
         actor_grad_noise: float,
         use_nf: bool,
+        use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
     key, new_actor, new_critic, new_metrics = update_actor(
         key,
@@ -1747,6 +1785,7 @@ def update_refinement(
         actor_bc_noise,
         actor_grad_noise,
         use_nf,
+        use_distributional,
         metrics,
     )
     return key, new_actor, new_critic, new_metrics
@@ -1941,12 +1980,14 @@ def train(config: Config):
         tx=optimizer,
     )
 
+    n_classes_eff = config.n_classes if config.use_distributional else 1
     critic_module = EnsembleCritic(
         hidden_dim=config.hidden_dim,
         num_critics=config.num_critics,
         layernorm=config.critic_ln,
         n_hiddens=config.critic_n_hiddens,
-        n_classes=config.n_classes,
+        n_classes=n_classes_eff,
+        use_distributional=config.use_distributional,
     )
 
     v_min, v_max = config.v_min, config.v_max
@@ -1970,8 +2011,8 @@ def train(config: Config):
         apply_fn=critic_module.apply,
         params=critic_module.init(critic_key, init_state, init_action),
         target_params=critic_module.init(critic_key, init_state, init_action),
-        support=jnp.linspace(v_min, v_max, config.n_classes + 1, dtype=jnp.float32),
-        sigma=config.sigma_frac * (v_max - v_min) / config.n_classes,
+        support=jnp.linspace(v_min, v_max, n_classes_eff + 1, dtype=jnp.float32),
+        sigma=config.sigma_frac * (v_max - v_min) / n_classes_eff,
         tx=optax.adam(learning_rate=config.critic_learning_rate),
     )
     value = None
@@ -2006,6 +2047,7 @@ def train(config: Config):
         chunk_len=config.action_chunk_len,
         rtc_prefix_len=config.rtc_prefix_len,
         use_nf=config.use_nf,
+        use_distributional=config.use_distributional,
     )
 
     update_td3_no_targets_partial = partial(
@@ -2019,6 +2061,7 @@ def train(config: Config):
         chunk_len=config.action_chunk_len,
         rtc_prefix_len=config.rtc_prefix_len,
         use_nf=config.use_nf,
+        use_distributional=config.use_distributional,
     )
     update_iql_partial = partial(
         update_iql,
@@ -2034,12 +2077,14 @@ def train(config: Config):
         actor_bc_noise=config.actor_bc_noise * reset_mods,
         actor_grad_noise=config.actor_grad_noise * reset_mods,
         use_nf=config.use_nf,
+        use_distributional=config.use_distributional,
     )
     update_iql_no_actor_partial = partial(
         update_iql_no_actor,
         gamma=config.gamma,
         chunk_len=config.action_chunk_len,
         iql_expectile=config.iql_expectile,
+        use_distributional=config.use_distributional,
     )
 
     update_refinement_partial = partial(
@@ -2057,6 +2102,7 @@ def train(config: Config):
         actor_bc_noise=config.actor_bc_noise,
         actor_grad_noise=config.actor_grad_noise,
         use_nf=config.use_nf,
+        use_distributional=config.use_distributional,
     )
     update_actor_bc_partial = partial(
         update_actor_bc,
@@ -2079,6 +2125,7 @@ def train(config: Config):
         chunk_len=config.action_chunk_len,
         rtc_prefix_len=config.rtc_prefix_len,
         use_nf=config.use_nf,
+        use_distributional=config.use_distributional,
     )
 
     # metrics
@@ -2493,6 +2540,7 @@ def train(config: Config):
                     q_infer_step_size=eval_q_step_size,
                     q_infer_steps=eval_q_steps,
                     use_nf=config.use_nf,
+                    use_distributional=config.use_distributional,
                     nf_eval_num_samples=config.nf_eval_num_samples,
                     nf_eval_z_scale=config.nf_eval_z_scale,
                     nf_eval_z_clip=config.nf_eval_z_clip,
@@ -2538,6 +2586,7 @@ def train(config: Config):
                             q_infer_step_size=eval_q_step_size,
                             q_infer_steps=eval_q_steps,
                             use_nf=config.use_nf,
+                            use_distributional=config.use_distributional,
                             nf_eval_num_samples=config.nf_eval_num_samples,
                             nf_eval_z_scale=config.nf_eval_z_scale,
                             nf_eval_z_clip=config.nf_eval_z_clip,
