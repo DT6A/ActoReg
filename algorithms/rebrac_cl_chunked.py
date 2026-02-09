@@ -565,7 +565,10 @@ def qlearning_dataset(
         if last_start < ep_start:
             starts = [ep_start]
         else:
-            starts = range(ep_start, last_start + 1, chunk_stride)
+            starts = list(range(ep_start, last_start + 1, chunk_stride))
+            if starts and starts[-1] != last_start:
+                # Always include the final full chunk start.
+                starts.append(last_start)
         for t in starts:
             slice_end = min(t + chunk_len, ep_end)
             length = slice_end - t
@@ -1109,6 +1112,11 @@ def update_actor(
     b_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
 
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
+        valid = batch.get("valid", None)
+        full_valid = None
+        if valid is not None:
+            full_valid = (jnp.min(valid, axis=1) > 0.5).astype(jnp.float32)
+
         if use_nf:
             actions = actor.apply_fn(
                 {'params': params, 'batch_stats': actor.batch_stats, 'constants': actor.constants},
@@ -1131,10 +1139,8 @@ def update_actor(
                 rngs={'dropout': dropout_log_key},
             )
             bc_penalty = -log_probs
-            valid = batch.get("valid", None)
-            if valid is not None:
-                valid_ratio = jnp.clip(jnp.mean(valid, axis=1), 0.0, 1.0)
-                bc_penalty = bc_penalty * valid_ratio
+            if full_valid is not None:
+                bc_penalty = bc_penalty * full_valid
             nll = jnp.mean(bc_penalty)
         else:
             (actions, preact), updates = actor.apply_fn(
@@ -1144,14 +1150,9 @@ def update_actor(
                 True, rngs={'dropout': dropout_key},
                 mutable=['batch_stats'],
             )
-            valid = batch.get("valid", None)
-            if valid is None:
-                bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
-            else:
-                bc_penalty = jnp.sum(
-                    (actions - batch["actions"] + b_noise) ** 2 * valid[..., None],
-                    axis=(-1, -2),
-                )
+            bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+            if full_valid is not None:
+                bc_penalty = bc_penalty * full_valid
             nll = None
 
         # auxiliary BC term (MSE/MAE) without noise
@@ -1169,7 +1170,11 @@ def update_actor(
         else:
             aux_bc = mse
 
-        logits = critic.apply_fn(critic.params, batch["states"], actions)
+        actions_for_q = actions
+        if valid is not None:
+            actions_for_q = jnp.where(valid[..., None] > 0.0, actions, batch["actions"])
+
+        logits = critic.apply_fn(critic.params, batch["states"], actions_for_q)
         if use_distributional:
             probs = nn.softmax(logits, axis=-1)
             q_values = transform_from_probs(probs, critic.support).min(0)
@@ -1196,15 +1201,14 @@ def update_actor(
             action_mse = ((actions - batch["actions"]) ** 2).mean()
             bc_mse_random = jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2)).mean()
         else:
-            bc_mse_policy = jnp.sum(
-                (actions - batch["actions"] + b_noise) ** 2 * valid[..., None], axis=(-1, -2)
-            ).mean()
+            mse_policy = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+            mse_random = jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2))
+            weight = full_valid
+            bc_mse_policy = (mse_policy * weight).mean()
             action_mse = jnp.sum(
                 (actions - batch["actions"]) ** 2 * valid[..., None], axis=(-1, -2)
             ).mean()
-            bc_mse_random = jnp.sum(
-                (random_actions - batch["actions"]) ** 2 * valid[..., None], axis=(-1, -2)
-            ).mean()
+            bc_mse_random = (mse_random * weight).mean()
         metrics_payload = {
             "actor_loss": loss,
             "actor_loss_bc_term": bc_term.mean(),
@@ -1276,6 +1280,11 @@ def update_actor_bc(
     b_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
 
     def actor_loss_fn(params: jax.Array) -> Tuple[jax.Array, Metrics]:
+        valid = batch.get("valid", None)
+        full_valid = None
+        if valid is not None:
+            full_valid = (jnp.min(valid, axis=1) > 0.5).astype(jnp.float32)
+
         if use_nf:
             actions = actor.apply_fn(
                 {'params': params, 'batch_stats': actor.batch_stats, 'constants': actor.constants},
@@ -1298,10 +1307,8 @@ def update_actor_bc(
                 rngs={'dropout': dropout_log_key},
             )
             bc_penalty = -log_probs
-            valid = batch.get("valid", None)
-            if valid is not None:
-                valid_ratio = jnp.clip(jnp.mean(valid, axis=1), 0.0, 1.0)
-                bc_penalty = bc_penalty * valid_ratio
+            if full_valid is not None:
+                bc_penalty = bc_penalty * full_valid
             nll = jnp.mean(bc_penalty)
         else:
             (actions, _), updates = actor.apply_fn(
@@ -1311,14 +1318,9 @@ def update_actor_bc(
                 True, rngs={'dropout': dropout_key},
                 mutable=['batch_stats'],
             )
-            valid = batch.get("valid", None)
-            if valid is None:
-                bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
-            else:
-                bc_penalty = jnp.sum(
-                    (actions - batch["actions"] + b_noise) ** 2 * valid[..., None],
-                    axis=(-1, -2),
-                )
+            bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+            if full_valid is not None:
+                bc_penalty = bc_penalty * full_valid
             nll = None
 
         # auxiliary BC term (MSE/MAE) without noise
@@ -1348,15 +1350,14 @@ def update_actor_bc(
             action_mse = ((actions - batch["actions"]) ** 2).mean()
             bc_mse_random = jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2)).mean()
         else:
-            bc_mse_policy = jnp.sum(
-                (actions - batch["actions"] + b_noise) ** 2 * valid[..., None], axis=(-1, -2)
-            ).mean()
+            mse_policy = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=(-1, -2))
+            mse_random = jnp.sum((random_actions - batch["actions"]) ** 2, axis=(-1, -2))
+            weight = full_valid
+            bc_mse_policy = (mse_policy * weight).mean()
             action_mse = jnp.sum(
                 (actions - batch["actions"]) ** 2 * valid[..., None], axis=(-1, -2)
             ).mean()
-            bc_mse_random = jnp.sum(
-                (random_actions - batch["actions"]) ** 2 * valid[..., None], axis=(-1, -2)
-            ).mean()
+            bc_mse_random = (mse_random * weight).mean()
         metrics_payload = {
             "actor_loss": loss,
             "actor_loss_bc_term": bc_term.mean(),
