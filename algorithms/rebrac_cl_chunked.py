@@ -2261,6 +2261,7 @@ def train(config: Config):
         buffer_size = buffer_data["states"].shape[0]
 
         key, indices_key = jax.random.split(carry["key"])
+        value_state = carry.get("value")
         batch_indices = jax.random.randint(
             indices_key,
             shape=(config.num_updates_on_epoch, config.batch_size),
@@ -2282,6 +2283,8 @@ def train(config: Config):
                 "critic": carry["critic"],
                 "metrics": new_metrics,
             }
+            if config.use_iql:
+                new_carry["value"] = carry["value"]
             return new_carry, None
 
         carry = {
@@ -2290,6 +2293,8 @@ def train(config: Config):
             "critic": carry["critic"],
             "metrics": carry["metrics"],
         }
+        if config.use_iql:
+            carry["value"] = value_state
         carry, _ = jax.lax.scan(body, carry, batch_indices)
         return carry
 
