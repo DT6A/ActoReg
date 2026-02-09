@@ -529,6 +529,10 @@ def qlearning_dataset(
         if done_bool or final_timestep:
             if not episode_ends or episode_ends[-1] != last_transition_idx:
                 episode_ends.append(last_transition_idx)
+            # Flush RTG for completed episodes (terminal or kept timeout step).
+            mc_returns_ += calc_return_to_go(
+                is_sparse, episode_rewards, episode_terminals, discount
+            )
         episode_step = next_episode_step
 
     if episode_step != 0:
