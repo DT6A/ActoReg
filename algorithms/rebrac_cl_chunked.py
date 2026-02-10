@@ -98,6 +98,7 @@ class Config:
     nf_eval_num_samples: int = 8
     nf_eval_z_scale: float = 1.0
     nf_eval_z_clip: float = 0.0
+    use_target_actor: bool = False
     policy_noise: float = 0.0
     noise_clip: float = 0.0
     policy_freq: int = 2
@@ -1471,6 +1472,7 @@ def update_critic(
         noise_clip: float,
         chunk_len: int,
         rtc_prefix_len: int,
+        use_target_actor: bool,
         use_nf: bool,
         use_distributional: bool,
         metrics: Metrics,
@@ -1483,12 +1485,16 @@ def update_critic(
         action_dim = batch["actions"].shape[-1]
         next_prev_actions = jnp.zeros((batch["actions"].shape[0], 0, action_dim), dtype=batch["actions"].dtype)
 
+    actor_params = actor.target_params if use_target_actor else actor.params
+    actor_batch_stats = actor.target_batch_stats if use_target_actor else actor.batch_stats
+    actor_constants = actor.target_constants if use_target_actor else actor.constants
+
     if use_nf:
         next_actions = actor.apply_fn(
             {
-                'params': actor.target_params,
-                'batch_stats': actor.target_batch_stats,
-                'constants': actor.target_constants,
+                'params': actor_params,
+                'batch_stats': actor_batch_stats,
+                'constants': actor_constants,
             },
             batch["next_states"],
             next_prev_actions,
@@ -1499,8 +1505,8 @@ def update_critic(
     else:
         next_actions, preact = actor.apply_fn(
             {
-                'params': actor.target_params,
-                'batch_stats': actor.target_batch_stats,
+                'params': actor_params,
+                'batch_stats': actor_batch_stats,
             },
             batch["next_states"],
             next_prev_actions,
@@ -1570,6 +1576,7 @@ def update_td3(
         actor_grad_noise: float,
         chunk_len: int,
         rtc_prefix_len: int,
+        use_target_actor: bool,
         use_nf: bool,
         use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
@@ -1585,6 +1592,7 @@ def update_td3(
         noise_clip,
         chunk_len,
         rtc_prefix_len,
+        use_target_actor,
         use_nf,
         use_distributional,
         metrics,
@@ -1701,6 +1709,7 @@ def update_td3_no_targets(
         noise_clip: float,
         chunk_len: int,
         rtc_prefix_len: int,
+        use_target_actor: bool,
         use_nf: bool,
         use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
@@ -1716,6 +1725,7 @@ def update_td3_no_targets(
         noise_clip,
         chunk_len,
         rtc_prefix_len,
+        use_target_actor,
         use_nf,
         use_distributional,
         metrics,
@@ -1736,6 +1746,7 @@ def update_critic_warmup(
         noise_clip: float,
         chunk_len: int,
         rtc_prefix_len: int,
+        use_target_actor: bool,
         use_nf: bool,
         use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, TrainState, TrainState, Metrics]:
@@ -1751,6 +1762,7 @@ def update_critic_warmup(
         noise_clip,
         chunk_len,
         rtc_prefix_len,
+        use_target_actor,
         use_nf,
         use_distributional,
         metrics,
@@ -2057,6 +2069,7 @@ def train(config: Config):
         actor_grad_noise=config.actor_grad_noise * reset_mods,
         chunk_len=config.action_chunk_len,
         rtc_prefix_len=config.rtc_prefix_len,
+        use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
     )
@@ -2071,6 +2084,7 @@ def train(config: Config):
         noise_clip=config.noise_clip,
         chunk_len=config.action_chunk_len,
         rtc_prefix_len=config.rtc_prefix_len,
+        use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
     )
@@ -2135,6 +2149,7 @@ def train(config: Config):
         noise_clip=config.noise_clip,
         chunk_len=config.action_chunk_len,
         rtc_prefix_len=config.rtc_prefix_len,
+        use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
     )
