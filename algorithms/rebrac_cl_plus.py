@@ -797,7 +797,7 @@ def update_actor(
                 mutable=["batch_stats"],
             )
             bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=-1)
-            nll = None
+            nll = jnp.mean(bc_penalty)
 
         diff = actions - batch["actions"]
         mse = jnp.mean(diff ** 2, axis=-1)
@@ -833,9 +833,8 @@ def update_actor(
             "bc_mse_random": jnp.mean((random_actions - batch["actions"]) ** 2),
             "action_mse": jnp.mean((actions - batch["actions"]) ** 2),
             "aux_bc": aux_bc.mean(),
+            "nll": nll,
         }
-        if nll is not None:
-            metrics_payload["nll"] = nll
         new_metrics = metrics.update(metrics_payload)
         return loss, (updates, new_metrics)
 
@@ -916,7 +915,7 @@ def update_actor_bc(
                 mutable=["batch_stats"],
             )
             bc_penalty = jnp.sum((actions - batch["actions"] + b_noise) ** 2, axis=-1)
-            nll = None
+            nll = jnp.mean(bc_penalty)
 
         diff = actions - batch["actions"]
         mse = jnp.mean(diff ** 2, axis=-1)
@@ -936,9 +935,8 @@ def update_actor_bc(
             "bc_mse_random": jnp.mean((random_actions - batch["actions"]) ** 2),
             "action_mse": jnp.mean((actions - batch["actions"]) ** 2),
             "aux_bc": aux_bc.mean(),
+            "nll": nll,
         }
-        if nll is not None:
-            metrics_payload["nll"] = nll
         new_metrics = metrics.update(metrics_payload)
         return loss, (updates, new_metrics)
 
@@ -1613,11 +1611,9 @@ def train(config: Config):
         "bc_mse_policy",
         "bc_mse_random",
         "action_mse",
+        "nll",
     ]
-
-    if config.use_nf:
-        full_metrics_to_log.append("nll")
-        actor_metrics_to_log.append("nll")
+    full_metrics_to_log.append("nll")
 
     critic_metrics_to_log = ["critic_loss", "q_min"]
     if config.use_iql:
