@@ -53,7 +53,7 @@ class Config:
 
     actor_bc_coef: float = 0.1
     actor_bc_aux_weight: float = 0.0
-    actor_bc_aux_loss: str = "mse"  # mse | mae
+    actor_bc_aux_loss: str = "mse"  # mse | mae | sum
     critic_bc_coef: float = 0.0
 
     actor_ln: bool = False
@@ -802,7 +802,12 @@ def update_actor(
         diff = actions - batch["actions"]
         mse = jnp.mean(diff ** 2, axis=-1)
         mae = jnp.mean(jnp.abs(diff), axis=-1)
-        aux_bc = mae if aux_loss == "mae" else mse
+        if aux_loss == "mae":
+            aux_bc = mae
+        elif aux_loss == "sum":
+            aux_bc = mse + mae
+        else:
+            aux_bc = mse
 
         logits = critic.apply_fn(critic.params, batch["states"], actions)
         if use_distributional:
@@ -920,7 +925,12 @@ def update_actor_bc(
         diff = actions - batch["actions"]
         mse = jnp.mean(diff ** 2, axis=-1)
         mae = jnp.mean(jnp.abs(diff), axis=-1)
-        aux_bc = mae if aux_loss == "mae" else mse
+        if aux_loss == "mae":
+            aux_bc = mae
+        elif aux_loss == "sum":
+            aux_bc = mse + mae
+        else:
+            aux_bc = mse
 
         bc_term = beta * bc_penalty
         aux_term = aux_weight * aux_bc
@@ -1322,8 +1332,8 @@ def train(config: Config):
 
     if config.use_iql and config.num_refinement_epochs > 0:
         raise ValueError("IQL mode does not support refinement epochs")
-    if config.actor_bc_aux_loss not in {"mse", "mae"}:
-        raise ValueError("actor_bc_aux_loss must be 'mse' or 'mae'")
+    if config.actor_bc_aux_loss not in {"mse", "mae", "sum"}:
+        raise ValueError("actor_bc_aux_loss must be 'mse', 'mae', or 'sum'")
 
     wandb.init(config=dict_config, project=config.project, group=config.group, name=config.name, id=str(uuid.uuid4()))
     wandb.mark_preempting()
