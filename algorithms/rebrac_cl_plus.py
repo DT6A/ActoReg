@@ -48,6 +48,7 @@ class Config:
     hidden_dim: int = 256
     actor_n_hiddens: int = 3
     critic_n_hiddens: int = 3
+    critic_dropout: float = 0.0
     gamma: float = 0.99
     tau: float = 5e-3
 
@@ -65,10 +66,14 @@ class Config:
 
     actor_dropout: float = 0.1
     actor_wd: float = 0.0
+    critic_wd: float = 0.0
+    value_wd: float = 0.0
     l1_ratio: float = 0.0
     actor_input_noise: float = 0.0
     actor_bc_noise: float = 0.0
     actor_grad_noise: float = 0.01
+    critic_objective_noise: float = 0.0
+    critic_grad_noise: float = 0.0
 
     actor_reset: bool = False
     actor_prereset_mode: bool = True
@@ -92,6 +97,7 @@ class Config:
     noise_clip: float = 0.5
     policy_freq: int = 2
     normalize_q: bool = True
+    optimizer_type: str = "adam"  # adam | adan
     decay_schedule: Optional[str] = None
     num_critics: int = 2
 
@@ -279,9 +285,10 @@ class Critic(nn.Module):
     n_hiddens: int = 3
     n_classes: int = 21
     use_distributional: bool = True
+    dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
+    def __call__(self, state: jax.Array, action: jax.Array, train: bool = False) -> jax.Array:
         s_d, a_d, h_d = state.shape[-1], action.shape[-1], self.hidden_dim
         state_action = jnp.hstack([state, action])
 
@@ -292,6 +299,7 @@ class Critic(nn.Module):
         )(state_action)
         x = nn.silu(x)
         x = nn.LayerNorm()(x) if self.layernorm else x
+        x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not train)
 
         for _ in range(self.n_hiddens - 1):
             h = nn.Dense(
@@ -301,6 +309,7 @@ class Critic(nn.Module):
             )(x)
             h = nn.silu(h)
             h = nn.LayerNorm()(h) if self.layernorm else h
+            h = nn.Dropout(rate=self.dropout_rate)(h, deterministic=not train)
             x = x + h
 
         out = nn.Dense(
@@ -342,15 +351,16 @@ class EnsembleCritic(nn.Module):
     n_hiddens: int = 3
     n_classes: int = 21
     use_distributional: bool = True
+    dropout_rate: float = 0.0
 
     @nn.compact
-    def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
+    def __call__(self, state: jax.Array, action: jax.Array, train: bool = False) -> jax.Array:
         ensemble = nn.vmap(
             target=Critic,
             in_axes=None,
             out_axes=0,
             variable_axes={"params": 0},
-            split_rngs={"params": True},
+            split_rngs={"params": True, "dropout": True},
             axis_size=self.num_critics,
         )
         return ensemble(
@@ -359,7 +369,8 @@ class EnsembleCritic(nn.Module):
             self.n_hiddens,
             self.n_classes,
             self.use_distributional,
-        )(state, action)
+            self.dropout_rate,
+        )(state, action, train)
 
 
 def calc_return_to_go(is_sparse_reward, rewards, terminals, gamma):
@@ -809,7 +820,7 @@ def update_actor(
         else:
             aux_bc = mse
 
-        logits = critic.apply_fn(critic.params, batch["states"], actions)
+        logits = critic.apply_fn(critic.params, batch["states"], actions, False)
         if use_distributional:
             probs = nn.softmax(logits, axis=-1)
             q_values = transform_from_probs(probs, critic.support).min(0)
@@ -983,7 +994,7 @@ def update_value(
 ) -> Tuple[ValueTrainState, jax.Array]:
     def value_loss_fn(value_params: jax.Array):
         v = value.apply_fn(value_params, batch["states"])
-        logits = critic.apply_fn(critic.params, batch["states"], batch["actions"])
+        logits = critic.apply_fn(critic.params, batch["states"], batch["actions"], False)
         if use_distributional:
             probs = nn.softmax(logits, axis=-1)
             q_values = transform_from_probs(probs, critic.support).min(0)
@@ -1002,17 +1013,30 @@ def update_value(
 
 
 def update_critic_iql(
+    key: jax.random.PRNGKey,
     critic: CriticTrainState,
     value: ValueTrainState,
     batch: Dict[str, jax.Array],
     gamma: float,
+    objective_noise: float,
+    grad_noise: float,
     use_distributional: bool,
-) -> Tuple[CriticTrainState, jax.Array, jax.Array]:
+) -> Tuple[jax.random.PRNGKey, CriticTrainState, jax.Array, jax.Array]:
+    key, critic_dropout_key, objective_noise_key, grad_noise_key = jax.random.split(key, 4)
+    state_noise_key, action_noise_key = jax.random.split(objective_noise_key)
+    state_noise = jax.random.normal(state_noise_key, batch["states"].shape) * objective_noise
+    action_noise = jax.random.normal(action_noise_key, batch["actions"].shape) * objective_noise
     v_next = value.apply_fn(value.params, batch["next_states"])
     target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * v_next
 
     def critic_loss_fn(critic_params: jax.Array):
-        q = critic.apply_fn(critic_params, batch["states"], batch["actions"])
+        q = critic.apply_fn(
+            critic_params,
+            batch["states"] + state_noise,
+            jnp.clip(batch["actions"] + action_noise, -1.0, 1.0),
+            True,
+            rngs={"dropout": critic_dropout_key},
+        )
         if use_distributional:
             q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
             target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
@@ -1024,8 +1048,20 @@ def update_critic_iql(
         return loss, q_min
 
     (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic.params)
+
+    def add_gaussian_noise(gr, noise_std, rng_key):
+        def add_noise_to_grad(g, k):
+            noise = jax.random.normal(k, g.shape) * noise_std / ((1 + critic.step) ** 0.55)
+            return g + noise
+
+        leaves, tree = jax.tree_util.tree_flatten(gr)
+        rng_keys = jax.random.split(rng_key, num=len(leaves))
+        rng_keys = jax.tree_util.tree_unflatten(tree, rng_keys)
+        return jax.tree_util.tree_map(lambda g, k: add_noise_to_grad(g, k), gr, rng_keys)
+
+    grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
     new_critic = critic.apply_gradients(grads=grads)
-    return new_critic, loss, q_min
+    return key, new_critic, loss, q_min
 
 
 def update_critic(
@@ -1038,12 +1074,17 @@ def update_critic(
     tau: float,
     policy_noise: float,
     noise_clip: float,
+    objective_noise: float,
+    grad_noise: float,
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, CriticTrainState, Metrics]:
-    key, actions_key, noise_key = jax.random.split(key, 3)
+    key, actions_key, noise_key, critic_dropout_key, objective_noise_key, grad_noise_key = jax.random.split(key, 6)
+    state_noise_key, action_noise_key = jax.random.split(objective_noise_key)
+    state_noise = jax.random.normal(state_noise_key, batch["states"].shape) * objective_noise
+    action_noise = jax.random.normal(action_noise_key, batch["actions"].shape) * objective_noise
 
     actor_params = actor.target_params if use_target_actor else actor.params
     actor_batch_stats = actor.target_batch_stats if use_target_actor else actor.batch_stats
@@ -1068,7 +1109,7 @@ def update_critic(
     next_actions = jnp.clip(next_actions + noise, -1, 1)
     bc_penalty = jnp.sum((next_actions - batch["next_actions"]) ** 2, axis=-1)
 
-    logits = critic.apply_fn(critic.target_params, batch["next_states"], next_actions)
+    logits = critic.apply_fn(critic.target_params, batch["next_states"], next_actions, False)
     if use_distributional:
         probs = nn.softmax(logits, axis=-1)
         next_q = transform_from_probs(probs, critic.support).min(0)
@@ -1081,7 +1122,13 @@ def update_critic(
     target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
 
     def critic_loss_fn(critic_params: jax.Array):
-        q = critic.apply_fn(critic_params, batch["states"], batch["actions"])
+        q = critic.apply_fn(
+            critic_params,
+            batch["states"] + state_noise,
+            jnp.clip(batch["actions"] + action_noise, -1.0, 1.0),
+            True,
+            rngs={"dropout": critic_dropout_key},
+        )
         if use_distributional:
             q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
             target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
@@ -1093,6 +1140,18 @@ def update_critic(
         return loss, q_min
 
     (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic.params)
+
+    def add_gaussian_noise(gr, noise_std, rng_key):
+        def add_noise_to_grad(g, k):
+            noise = jax.random.normal(k, g.shape) * noise_std / ((1 + critic.step) ** 0.55)
+            return g + noise
+
+        leaves, tree = jax.tree_util.tree_flatten(gr)
+        rng_keys = jax.random.split(rng_key, num=len(leaves))
+        rng_keys = jax.tree_util.tree_unflatten(tree, rng_keys)
+        return jax.tree_util.tree_map(lambda g, k: add_noise_to_grad(g, k), gr, rng_keys)
+
+    grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
     new_critic = critic.apply_gradients(grads=grads)
     new_metrics = metrics.update({"critic_loss": loss, "q_min": q_min})
     return key, new_critic, new_metrics
@@ -1112,6 +1171,8 @@ def update_td3(
     tau: float,
     policy_noise: float,
     noise_clip: float,
+    critic_objective_noise: float,
+    critic_grad_noise: float,
     normalize_q: bool,
     actor_input_noise: float,
     actor_bc_noise: float,
@@ -1130,6 +1191,8 @@ def update_td3(
         tau,
         policy_noise,
         noise_clip,
+        critic_objective_noise,
+        critic_grad_noise,
         use_target_actor,
         use_nf,
         use_distributional,
@@ -1168,6 +1231,8 @@ def update_iql(
     actor_bc_aux_loss: str,
     tau: float,
     iql_expectile: float,
+    critic_objective_noise: float,
+    critic_grad_noise: float,
     normalize_q: bool,
     actor_input_noise: float,
     actor_bc_noise: float,
@@ -1176,7 +1241,17 @@ def update_iql(
     use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, ValueTrainState, Metrics]:
     new_value, value_loss = update_value(value, critic, batch, iql_expectile, use_distributional)
-    new_critic, critic_loss, q_min = update_critic_iql(critic, new_value, batch, gamma, use_distributional)
+    key, critic_key = jax.random.split(key)
+    key, new_critic, critic_loss, q_min = update_critic_iql(
+        critic_key,
+        critic,
+        new_value,
+        batch,
+        gamma,
+        critic_objective_noise,
+        critic_grad_noise,
+        use_distributional,
+    )
     key, new_actor, new_critic, new_metrics = update_actor(
         key,
         actor,
@@ -1207,10 +1282,22 @@ def update_iql_no_actor(
     metrics: Metrics,
     gamma: float,
     iql_expectile: float,
+    critic_objective_noise: float,
+    critic_grad_noise: float,
     use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, ValueTrainState, Metrics]:
     new_value, value_loss = update_value(value, critic, batch, iql_expectile, use_distributional)
-    new_critic, critic_loss, q_min = update_critic_iql(critic, new_value, batch, gamma, use_distributional)
+    key, critic_key = jax.random.split(key)
+    key, new_critic, critic_loss, q_min = update_critic_iql(
+        critic_key,
+        critic,
+        new_value,
+        batch,
+        gamma,
+        critic_objective_noise,
+        critic_grad_noise,
+        use_distributional,
+    )
     new_metrics = metrics.update({"critic_loss": critic_loss, "q_min": q_min, "value_loss": value_loss})
     return key, actor, new_critic, new_value, new_metrics
 
@@ -1227,6 +1314,8 @@ def update_td3_no_targets(
     tau: float,
     policy_noise: float,
     noise_clip: float,
+    critic_objective_noise: float,
+    critic_grad_noise: float,
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
@@ -1241,6 +1330,8 @@ def update_td3_no_targets(
         tau,
         policy_noise,
         noise_clip,
+        critic_objective_noise,
+        critic_grad_noise,
         use_target_actor,
         use_nf,
         use_distributional,
@@ -1260,6 +1351,8 @@ def update_critic_warmup(
     tau: float,
     policy_noise: float,
     noise_clip: float,
+    critic_objective_noise: float,
+    critic_grad_noise: float,
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
@@ -1274,6 +1367,8 @@ def update_critic_warmup(
         tau,
         policy_noise,
         noise_clip,
+        critic_objective_noise,
+        critic_grad_noise,
         use_target_actor,
         use_nf,
         use_distributional,
@@ -1412,23 +1507,30 @@ def train(config: Config):
 
     if config.decay_schedule == "cosine":
         schedule_fn = optax.cosine_decay_schedule(config.actor_learning_rate, config.num_epochs * config.num_updates_on_epoch)
-        optimizer = adamw_elastic(learning_rate=schedule_fn, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
+        actor_lr = schedule_fn
     elif config.decay_schedule == "linear":
         schedule_fn = optax.linear_schedule(
             config.actor_learning_rate,
             config.actor_learning_rate / 10,
             config.num_epochs * config.num_updates_on_epoch,
         )
-        optimizer = adamw_elastic(learning_rate=schedule_fn, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
+        actor_lr = schedule_fn
     elif config.decay_schedule == "exp":
         schedule_fn = optax.exponential_decay(
             config.actor_learning_rate,
             config.num_epochs * config.num_updates_on_epoch,
             0.99,
         )
-        optimizer = adamw_elastic(learning_rate=schedule_fn, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
+        actor_lr = schedule_fn
     else:
-        optimizer = adamw_elastic(learning_rate=config.actor_learning_rate, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
+        actor_lr = config.actor_learning_rate
+
+    if config.optimizer_type == "adan":
+        optimizer = optax.adan(learning_rate=actor_lr, weight_decay=config.actor_wd)
+    elif config.optimizer_type == "adam":
+        optimizer = adamw_elastic(learning_rate=actor_lr, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
+    else:
+        raise ValueError("optimizer_type must be 'adam' or 'adan'")
 
     if config.use_nf:
         init_vars = actor_module.init(
@@ -1461,6 +1563,7 @@ def train(config: Config):
         n_hiddens=config.critic_n_hiddens,
         n_classes=n_classes_eff,
         use_distributional=config.use_distributional,
+        dropout_rate=config.critic_dropout,
     )
 
     v_min, v_max = config.v_min, config.v_max
@@ -1480,22 +1583,31 @@ def train(config: Config):
     else:
         raise ValueError("Invalid expansion")
 
+    if config.optimizer_type == "adan":
+        critic_tx = optax.adan(learning_rate=config.critic_learning_rate, weight_decay=config.critic_wd)
+    else:
+        critic_tx = optax.adam(learning_rate=config.critic_learning_rate)
+
     critic = CriticTrainState.create(
         apply_fn=critic_module.apply,
         params=critic_module.init(critic_key, init_state, init_action),
         target_params=critic_module.init(critic_key, init_state, init_action),
         support=jnp.linspace(v_min, v_max, n_classes_eff + 1, dtype=jnp.float32),
         sigma=config.sigma_frac * (v_max - v_min) / n_classes_eff,
-        tx=optax.adam(learning_rate=config.critic_learning_rate),
+        tx=critic_tx,
     )
 
     value = None
     if config.use_iql:
+        if config.optimizer_type == "adan":
+            value_tx = optax.adan(learning_rate=config.value_learning_rate, weight_decay=config.value_wd)
+        else:
+            value_tx = optax.adam(learning_rate=config.value_learning_rate)
         value_module = Value(hidden_dim=config.hidden_dim, layernorm=config.critic_ln, n_hiddens=config.critic_n_hiddens)
         value = ValueTrainState.create(
             apply_fn=value_module.apply,
             params=value_module.init(critic_key, init_state),
-            tx=optax.adam(learning_rate=config.value_learning_rate),
+            tx=value_tx,
         )
 
     reset_mods = 1 if config.actor_prereset_mode else 0
@@ -1510,6 +1622,8 @@ def train(config: Config):
         tau=config.tau,
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
+        critic_objective_noise=config.critic_objective_noise,
+        critic_grad_noise=config.critic_grad_noise,
         normalize_q=config.normalize_q,
         actor_input_noise=config.actor_input_noise * reset_mods,
         actor_bc_noise=config.actor_bc_noise * reset_mods,
@@ -1527,6 +1641,8 @@ def train(config: Config):
         tau=config.tau,
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
+        critic_objective_noise=config.critic_objective_noise,
+        critic_grad_noise=config.critic_grad_noise,
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
@@ -1540,6 +1656,8 @@ def train(config: Config):
         actor_bc_aux_loss=config.actor_bc_aux_loss,
         tau=config.tau,
         iql_expectile=config.iql_expectile,
+        critic_objective_noise=config.critic_objective_noise,
+        critic_grad_noise=config.critic_grad_noise,
         normalize_q=config.normalize_q,
         actor_input_noise=config.actor_input_noise * reset_mods,
         actor_bc_noise=config.actor_bc_noise * reset_mods,
@@ -1552,6 +1670,8 @@ def train(config: Config):
         update_iql_no_actor,
         gamma=config.gamma,
         iql_expectile=config.iql_expectile,
+        critic_objective_noise=config.critic_objective_noise,
+        critic_grad_noise=config.critic_grad_noise,
         use_distributional=config.use_distributional,
     )
 
@@ -1592,6 +1712,8 @@ def train(config: Config):
         tau=config.tau,
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
+        critic_objective_noise=config.critic_objective_noise,
+        critic_grad_noise=config.critic_grad_noise,
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
