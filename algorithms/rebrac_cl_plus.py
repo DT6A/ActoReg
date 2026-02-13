@@ -74,6 +74,8 @@ class Config:
     actor_grad_noise: float = 0.01
     critic_objective_noise: float = 0.0
     critic_grad_noise: float = 0.0
+    use_prev_action: bool = False
+    use_prev_state: bool = False
 
     actor_reset: bool = False
     actor_prereset_mode: bool = True
@@ -407,6 +409,7 @@ def qlearning_dataset(
     is_sparse = "antmaze" in dataset_name
 
     obs_, next_obs_, action_, next_action_, reward_, done_, mc_returns_ = [], [], [], [], [], [], []
+    prev_obs_, prev_action_, prev_valid_ = [], [], []
 
     use_timeouts = "timeouts" in dataset
     episode_step = 0
@@ -424,6 +427,14 @@ def qlearning_dataset(
         new_action = dataset["actions"][i + 1].astype(np.float32)
         reward = dataset["rewards"][i].astype(np.float32)
         done_bool = bool(dataset["terminals"][i])
+        if episode_step == 0:
+            prev_obs = np.zeros_like(obs, dtype=np.float32)
+            prev_action = np.zeros_like(action, dtype=np.float32)
+            prev_valid = 0.0
+        else:
+            prev_obs = dataset["observations"][i - 1].astype(np.float32)
+            prev_action = dataset["actions"][i - 1].astype(np.float32)
+            prev_valid = 1.0
 
         if use_timeouts:
             final_timestep = bool(dataset["timeouts"][i])
@@ -446,6 +457,9 @@ def qlearning_dataset(
         next_obs_.append(new_obs)
         action_.append(action)
         next_action_.append(new_action)
+        prev_obs_.append(prev_obs)
+        prev_action_.append(prev_action)
+        prev_valid_.append(prev_valid)
         reward_.append(reward)
         done_.append(done_bool)
 
@@ -463,6 +477,9 @@ def qlearning_dataset(
     train_data = {
         "observations": np.array(obs_),
         "actions": np.array(action_),
+        "prev_observations": np.array(prev_obs_),
+        "prev_actions": np.array(prev_action_),
+        "prev_valid": np.array(prev_valid_),
         "next_observations": np.array(next_obs_),
         "next_actions": np.array(next_action_),
         "rewards": np.array(reward_),
@@ -509,6 +526,9 @@ class ReplayBuffer:
         buffer = {
             "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
             "actions": jnp.asarray(d4rl_data["actions"], dtype=jnp.float32),
+            "prev_states": jnp.asarray(d4rl_data["prev_observations"], dtype=jnp.float32),
+            "prev_actions": jnp.asarray(d4rl_data["prev_actions"], dtype=jnp.float32),
+            "prev_valid": jnp.asarray(d4rl_data["prev_valid"], dtype=jnp.float32),
             "rewards": jnp.asarray(d4rl_data["rewards"], dtype=jnp.float32),
             "next_states": jnp.asarray(d4rl_data["next_observations"], dtype=jnp.float32),
             "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
@@ -519,6 +539,8 @@ class ReplayBuffer:
             self.mean, self.std = compute_mean_std(buffer["states"], eps=1e-3)
             buffer["states"] = normalize_states(buffer["states"], self.mean, self.std)
             buffer["next_states"] = normalize_states(buffer["next_states"], self.mean, self.std)
+            prev_states_norm = normalize_states(buffer["prev_states"], self.mean, self.std)
+            buffer["prev_states"] = jnp.where(buffer["prev_valid"][:, None] > 0.5, prev_states_norm, 0.0)
         self.data = buffer
 
     @property
@@ -560,6 +582,21 @@ class Metrics:
 
 def normalize(arr: jax.Array, mean: jax.Array, std: jax.Array, eps: float = 1e-8) -> jax.Array:
     return (arr - mean) / (std + eps)
+
+
+def build_actor_inputs(
+    states: jax.Array,
+    prev_states: jax.Array,
+    prev_actions: jax.Array,
+    use_prev_state: bool,
+    use_prev_action: bool,
+) -> jax.Array:
+    parts = [states]
+    if use_prev_state:
+        parts.append(prev_states)
+    if use_prev_action:
+        parts.append(prev_actions)
+    return jnp.concatenate(parts, axis=-1) if len(parts) > 1 else states
 
 
 def transform_to_probs(target: jax.Array, support: jax.Array, sigma: float) -> jax.Array:
@@ -621,6 +658,8 @@ def evaluate(
     state_noise: float = 0.0,
     q_infer_step_size: float = 0.0,
     q_infer_steps: int = 0,
+    use_prev_state: bool = False,
+    use_prev_action: bool = False,
     use_nf: bool = False,
     use_distributional: bool = True,
     nf_eval_num_samples: int = 1,
@@ -677,31 +716,45 @@ def evaluate(
     returns = []
     eval_states = []
     eval_actions = []
+    eval_prev_states = []
+    eval_prev_actions = []
 
     for _ in trange(num_episodes, desc="Eval", leave=False):
         reset_out = env.reset()
         obs = reset_out[0] if isinstance(reset_out, tuple) else reset_out
         done = False
         total_reward = 0.0
+        prev_obs = np.zeros_like(obs, dtype=np.float32)
+        prev_action = np.zeros(env.action_space.shape, dtype=np.float32)
 
         while not done:
             key, actions_key, states_key = jax.random.split(key, 3)
-            obs = obs + jax.random.normal(states_key, obs.shape) * state_noise
-            eval_states.append(obs)
+            obs_for_actor = obs + jax.random.normal(states_key, obs.shape) * state_noise
+            actor_obs = build_actor_inputs(
+                jnp.asarray(obs_for_actor),
+                jnp.asarray(prev_obs),
+                jnp.asarray(prev_action),
+                use_prev_state,
+                use_prev_action,
+            )
+            eval_states.append(obs_for_actor)
+            eval_prev_states.append(prev_obs)
+            eval_prev_actions.append(prev_action)
 
             action = np.asarray(
                 jax.device_get(
-                    policy_action(params, batch_stats, constants, obs, actions_key, nf_eval_num_samples)
+                    policy_action(params, batch_stats, constants, actor_obs, actions_key, nf_eval_num_samples)
                 )
             )
             if use_nf and nf_eval_num_samples > 1:
                 candidates = jnp.asarray(action)
-                obs_j = jnp.asarray(obs)[None, ...]
+                obs_j = jnp.asarray(obs_for_actor)[None, ...]
+                actor_obs_j = jnp.asarray(actor_obs)[None, ...]
                 if nf_eval_select == "likelihood":
                     if log_prob_fn is None:
                         raise ValueError("nf_eval_select='likelihood' requires log_prob_fn")
-                    obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
-                    logp = log_prob_fn(params, batch_stats, constants, obs_rep, candidates)
+                    actor_obs_rep = jnp.repeat(actor_obs_j, nf_eval_num_samples, axis=0)
+                    logp = log_prob_fn(params, batch_stats, constants, actor_obs_rep, candidates)
                     best_idx = int(jax.device_get(jnp.argmax(logp)))
                 else:
                     obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
@@ -710,19 +763,23 @@ def evaluate(
                 action = np.asarray(jax.device_get(candidates[best_idx]))
 
             if use_refine:
-                obs_j = jnp.asarray(obs)[None, ...]
+                obs_j = jnp.asarray(obs_for_actor)[None, ...]
                 action_j = jnp.asarray(action)[None, ...]
                 action = np.asarray(jax.device_get(refine_action(obs_j, action_j)[0]))
 
             eval_actions.append(action)
-            action = jnp.clip(action + jax.random.normal(actions_key, action.shape) * action_noise, -1, 1)
+            executed_action = np.asarray(
+                jax.device_get(jnp.clip(action + jax.random.normal(actions_key, action.shape) * action_noise, -1, 1))
+            )
 
-            step_result = env.step(action)
+            step_result = env.step(executed_action)
             if len(step_result) == 5:
                 obs, reward, terminated, truncated, _ = step_result
                 done = bool(terminated or truncated)
             else:
                 obs, reward, done, _ = step_result
+            prev_obs = np.asarray(obs_for_actor, dtype=np.float32)
+            prev_action = np.asarray(executed_action, dtype=np.float32)
             total_reward += reward
 
         returns.append(total_reward)
@@ -730,6 +787,8 @@ def evaluate(
     eval_batch = {
         "states": jnp.array(eval_states),
         "actions": jnp.array(eval_actions),
+        "prev_states": jnp.array(eval_prev_states),
+        "prev_actions": jnp.array(eval_prev_actions),
     }
     return np.array(returns), eval_batch
 
@@ -766,6 +825,8 @@ def update_actor(
     input_noise: float,
     bc_noise: float,
     grad_noise: float,
+    use_prev_state: bool,
+    use_prev_action: bool,
     use_nf: bool,
     use_distributional: bool,
     metrics: Metrics,
@@ -776,12 +837,19 @@ def update_actor(
 
     in_noise = jax.random.normal(input_noise_key, batch["states"].shape) * input_noise
     b_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
+    actor_inputs = build_actor_inputs(
+        batch["states"] + in_noise,
+        batch["prev_states"],
+        batch["prev_actions"],
+        use_prev_state,
+        use_prev_action,
+    )
 
     def actor_loss_fn(params: jax.Array):
         if use_nf:
             actions = actor.apply_fn(
                 {"params": params, "constants": actor.constants},
-                batch["states"] + in_noise,
+                actor_inputs,
                 rng=sample_key,
                 train=True,
                 method=NFActorFlat.sample,
@@ -792,7 +860,7 @@ def update_actor(
             log_probs = actor.apply_fn(
                 {"params": params, "constants": actor.constants},
                 bc_actions,
-                batch["states"] + in_noise,
+                actor_inputs,
                 train=True,
                 method=NFActorFlat.log_prob,
                 rngs={"dropout": dropout_log_key},
@@ -802,7 +870,7 @@ def update_actor(
         else:
             (actions, _), updates = actor.apply_fn(
                 {"params": params, "batch_stats": actor.batch_stats},
-                batch["states"] + in_noise,
+                actor_inputs,
                 True,
                 rngs={"dropout": dropout_key},
                 mutable=["batch_stats"],
@@ -890,6 +958,8 @@ def update_actor_bc(
     input_noise: float,
     bc_noise: float,
     grad_noise: float,
+    use_prev_state: bool,
+    use_prev_action: bool,
     use_nf: bool,
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, Metrics]:
@@ -899,12 +969,19 @@ def update_actor_bc(
 
     in_noise = jax.random.normal(input_noise_key, batch["states"].shape) * input_noise
     b_noise = jax.random.normal(bc_noise_key, batch["actions"].shape) * bc_noise
+    actor_inputs = build_actor_inputs(
+        batch["states"] + in_noise,
+        batch["prev_states"],
+        batch["prev_actions"],
+        use_prev_state,
+        use_prev_action,
+    )
 
     def actor_loss_fn(params: jax.Array):
         if use_nf:
             actions = actor.apply_fn(
                 {"params": params, "constants": actor.constants},
-                batch["states"] + in_noise,
+                actor_inputs,
                 rng=sample_key,
                 train=True,
                 method=NFActorFlat.sample,
@@ -915,7 +992,7 @@ def update_actor_bc(
             log_probs = actor.apply_fn(
                 {"params": params, "constants": actor.constants},
                 bc_actions,
-                batch["states"] + in_noise,
+                actor_inputs,
                 train=True,
                 method=NFActorFlat.log_prob,
                 rngs={"dropout": dropout_log_key},
@@ -925,7 +1002,7 @@ def update_actor_bc(
         else:
             (actions, _), updates = actor.apply_fn(
                 {"params": params, "batch_stats": actor.batch_stats},
-                batch["states"] + in_noise,
+                actor_inputs,
                 True,
                 rngs={"dropout": dropout_key},
                 mutable=["batch_stats"],
@@ -1076,6 +1153,8 @@ def update_critic(
     noise_clip: float,
     objective_noise: float,
     grad_noise: float,
+    use_prev_state: bool,
+    use_prev_action: bool,
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
@@ -1089,11 +1168,20 @@ def update_critic(
     actor_params = actor.target_params if use_target_actor else actor.params
     actor_batch_stats = actor.target_batch_stats if use_target_actor else actor.batch_stats
     actor_constants = actor.target_constants if use_target_actor else actor.constants
+    next_prev_states = jnp.where(batch["dones"][:, None] > 0.5, jnp.zeros_like(batch["states"]), batch["states"])
+    next_prev_actions = jnp.where(batch["dones"][:, None] > 0.5, jnp.zeros_like(batch["actions"]), batch["actions"])
+    next_actor_inputs = build_actor_inputs(
+        batch["next_states"],
+        next_prev_states,
+        next_prev_actions,
+        use_prev_state,
+        use_prev_action,
+    )
 
     if use_nf:
         next_actions = actor.apply_fn(
             {"params": actor_params, "constants": actor_constants},
-            batch["next_states"],
+            next_actor_inputs,
             rng=actions_key,
             train=False,
             method=NFActorFlat.sample,
@@ -1101,7 +1189,7 @@ def update_critic(
     else:
         next_actions, _ = actor.apply_fn(
             {"params": actor_params, "batch_stats": actor_batch_stats},
-            batch["next_states"],
+            next_actor_inputs,
             False,
         )
 
@@ -1173,6 +1261,8 @@ def update_td3(
     noise_clip: float,
     critic_objective_noise: float,
     critic_grad_noise: float,
+    use_prev_state: bool,
+    use_prev_action: bool,
     normalize_q: bool,
     actor_input_noise: float,
     actor_bc_noise: float,
@@ -1193,6 +1283,8 @@ def update_td3(
         noise_clip,
         critic_objective_noise,
         critic_grad_noise,
+        use_prev_state,
+        use_prev_action,
         use_target_actor,
         use_nf,
         use_distributional,
@@ -1211,6 +1303,8 @@ def update_td3(
         actor_input_noise,
         actor_bc_noise,
         actor_grad_noise,
+        use_prev_state,
+        use_prev_action,
         use_nf,
         use_distributional,
         new_metrics,
@@ -1233,6 +1327,8 @@ def update_iql(
     iql_expectile: float,
     critic_objective_noise: float,
     critic_grad_noise: float,
+    use_prev_state: bool,
+    use_prev_action: bool,
     normalize_q: bool,
     actor_input_noise: float,
     actor_bc_noise: float,
@@ -1265,6 +1361,8 @@ def update_iql(
         actor_input_noise,
         actor_bc_noise,
         actor_grad_noise,
+        use_prev_state,
+        use_prev_action,
         use_nf,
         use_distributional,
         metrics,
@@ -1316,6 +1414,8 @@ def update_td3_no_targets(
     noise_clip: float,
     critic_objective_noise: float,
     critic_grad_noise: float,
+    use_prev_state: bool,
+    use_prev_action: bool,
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
@@ -1332,6 +1432,8 @@ def update_td3_no_targets(
         noise_clip,
         critic_objective_noise,
         critic_grad_noise,
+        use_prev_state,
+        use_prev_action,
         use_target_actor,
         use_nf,
         use_distributional,
@@ -1353,6 +1455,8 @@ def update_critic_warmup(
     noise_clip: float,
     critic_objective_noise: float,
     critic_grad_noise: float,
+    use_prev_state: bool,
+    use_prev_action: bool,
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
@@ -1369,6 +1473,8 @@ def update_critic_warmup(
         noise_clip,
         critic_objective_noise,
         critic_grad_noise,
+        use_prev_state,
+        use_prev_action,
         use_target_actor,
         use_nf,
         use_distributional,
@@ -1396,6 +1502,8 @@ def update_refinement(
     actor_input_noise: float,
     actor_bc_noise: float,
     actor_grad_noise: float,
+    use_prev_state: bool,
+    use_prev_action: bool,
     use_nf: bool,
     use_distributional: bool,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
@@ -1412,6 +1520,8 @@ def update_refinement(
         actor_input_noise,
         actor_bc_noise,
         actor_grad_noise,
+        use_prev_state,
+        use_prev_action,
         use_nf,
         use_distributional,
         metrics,
@@ -1445,6 +1555,15 @@ def train(config: Config):
 
     init_state = buffer.data["states"][0][None, ...]
     init_action = buffer.data["actions"][0][None, ...]
+    init_prev_state = buffer.data["prev_states"][0][None, ...]
+    init_prev_action = buffer.data["prev_actions"][0][None, ...]
+    init_actor_state = build_actor_inputs(
+        init_state,
+        init_prev_state,
+        init_prev_action,
+        config.use_prev_state,
+        config.use_prev_action,
+    )
 
     if config.use_nf:
         actor_module = NFActorFlat(
@@ -1535,13 +1654,13 @@ def train(config: Config):
     if config.use_nf:
         init_vars = actor_module.init(
             {"params": actor_key, "mask": actor_key},
-            init_state,
+            init_actor_state,
             rng=actor_key,
             train=False,
             method=NFActorFlat.sample,
         )
     else:
-        init_vars = actor_module.init(actor_key, init_state, False)
+        init_vars = actor_module.init(actor_key, init_actor_state, False)
 
     actor = ActorTrainState.create(
         apply_fn=actor_module.apply,
@@ -1624,6 +1743,8 @@ def train(config: Config):
         noise_clip=config.noise_clip,
         critic_objective_noise=config.critic_objective_noise,
         critic_grad_noise=config.critic_grad_noise,
+        use_prev_state=config.use_prev_state,
+        use_prev_action=config.use_prev_action,
         normalize_q=config.normalize_q,
         actor_input_noise=config.actor_input_noise * reset_mods,
         actor_bc_noise=config.actor_bc_noise * reset_mods,
@@ -1643,6 +1764,8 @@ def train(config: Config):
         noise_clip=config.noise_clip,
         critic_objective_noise=config.critic_objective_noise,
         critic_grad_noise=config.critic_grad_noise,
+        use_prev_state=config.use_prev_state,
+        use_prev_action=config.use_prev_action,
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
@@ -1658,6 +1781,8 @@ def train(config: Config):
         iql_expectile=config.iql_expectile,
         critic_objective_noise=config.critic_objective_noise,
         critic_grad_noise=config.critic_grad_noise,
+        use_prev_state=config.use_prev_state,
+        use_prev_action=config.use_prev_action,
         normalize_q=config.normalize_q,
         actor_input_noise=config.actor_input_noise * reset_mods,
         actor_bc_noise=config.actor_bc_noise * reset_mods,
@@ -1689,6 +1814,8 @@ def train(config: Config):
         actor_input_noise=config.actor_input_noise,
         actor_bc_noise=config.actor_bc_noise,
         actor_grad_noise=config.actor_grad_noise,
+        use_prev_state=config.use_prev_state,
+        use_prev_action=config.use_prev_action,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
     )
@@ -1702,6 +1829,8 @@ def train(config: Config):
         input_noise=config.actor_input_noise * reset_mods,
         bc_noise=config.actor_bc_noise * reset_mods,
         grad_noise=config.actor_grad_noise * reset_mods,
+        use_prev_state=config.use_prev_state,
+        use_prev_action=config.use_prev_action,
         use_nf=config.use_nf,
     )
 
@@ -1714,6 +1843,8 @@ def train(config: Config):
         noise_clip=config.noise_clip,
         critic_objective_noise=config.critic_objective_noise,
         critic_grad_noise=config.critic_grad_noise,
+        use_prev_state=config.use_prev_state,
+        use_prev_action=config.use_prev_action,
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
@@ -2050,13 +2181,13 @@ def train(config: Config):
                 if config.use_nf:
                     reset_vars = reset_module.init(
                         {"params": actor_key, "mask": actor_key},
-                        init_state,
+                        init_actor_state,
                         rng=actor_key,
                         train=False,
                         method=NFActorFlat.sample,
                     )
                 else:
-                    reset_vars = reset_module.init(actor_key, init_state, False)
+                    reset_vars = reset_module.init(actor_key, init_actor_state, False)
                 actor = ActorTrainState.create(
                     apply_fn=reset_module.apply,
                     params=reset_vars["params"],
@@ -2093,6 +2224,8 @@ def train(config: Config):
                 seed=config.eval_seed,
                 q_infer_step_size=eval_q_step_size,
                 q_infer_steps=eval_q_steps,
+                use_prev_state=config.use_prev_state,
+                use_prev_action=config.use_prev_action,
                 use_nf=config.use_nf,
                 use_distributional=config.use_distributional,
                 nf_eval_num_samples=config.nf_eval_num_samples,
@@ -2125,6 +2258,8 @@ def train(config: Config):
                         state_noise=sn,
                         q_infer_step_size=eval_q_step_size,
                         q_infer_steps=eval_q_steps,
+                        use_prev_state=config.use_prev_state,
+                        use_prev_action=config.use_prev_action,
                         use_nf=config.use_nf,
                         use_distributional=config.use_distributional,
                         nf_eval_num_samples=config.nf_eval_num_samples,
