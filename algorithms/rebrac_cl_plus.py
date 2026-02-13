@@ -76,6 +76,8 @@ class Config:
     critic_grad_noise: float = 0.0
     use_prev_action: bool = False
     use_prev_state: bool = False
+    use_actor_ema: bool = False
+    actor_ema_tau: float = 5e-3
 
     actor_reset: bool = False
     actor_prereset_mode: bool = True
@@ -801,11 +803,14 @@ class CriticTrainState(TrainState):
 
 class ActorTrainState(TrainState):
     target_params: FrozenDict
+    ema_params: FrozenDict
     dropout_key: jax.Array
     batch_stats: Any
     target_batch_stats: Any
+    ema_batch_stats: Any
     constants: Any = None
     target_constants: Any = None
+    ema_constants: Any = None
 
 
 class ValueTrainState(TrainState):
@@ -821,6 +826,7 @@ def update_actor(
     aux_weight: float,
     aux_loss: str,
     tau: float,
+    ema_tau: float,
     normalize_q: bool,
     input_noise: float,
     bc_noise: float,
@@ -940,7 +946,10 @@ def update_actor(
     new_actor = new_actor.replace(
         target_params=optax.incremental_update(new_actor.params, actor.target_params, tau),
         target_batch_stats=optax.incremental_update(new_actor.batch_stats, actor.target_batch_stats, tau),
+        ema_params=optax.incremental_update(new_actor.params, actor.ema_params, ema_tau),
+        ema_batch_stats=optax.incremental_update(new_actor.batch_stats, actor.ema_batch_stats, ema_tau),
         target_constants=actor.target_constants,
+        ema_constants=actor.ema_constants,
         dropout_key=new_dropout_key,
     )
     new_critic = critic.replace(target_params=optax.incremental_update(critic.params, critic.target_params, tau))
@@ -955,6 +964,7 @@ def update_actor_bc(
     aux_weight: float,
     aux_loss: str,
     tau: float,
+    ema_tau: float,
     input_noise: float,
     bc_noise: float,
     grad_noise: float,
@@ -1056,7 +1066,10 @@ def update_actor_bc(
         batch_stats=updates["batch_stats"],
         target_params=optax.incremental_update(new_actor.params, actor.target_params, tau),
         target_batch_stats=optax.incremental_update(new_actor.batch_stats, actor.target_batch_stats, tau),
+        ema_params=optax.incremental_update(new_actor.params, actor.ema_params, ema_tau),
+        ema_batch_stats=optax.incremental_update(new_actor.batch_stats, actor.ema_batch_stats, ema_tau),
         target_constants=actor.target_constants,
+        ema_constants=actor.ema_constants,
         dropout_key=new_dropout_key,
     )
     return key, new_actor, new_metrics
@@ -1257,6 +1270,7 @@ def update_td3(
     actor_bc_aux_loss: str,
     critic_bc_coef: float,
     tau: float,
+    actor_ema_tau: float,
     policy_noise: float,
     noise_clip: float,
     critic_objective_noise: float,
@@ -1299,6 +1313,7 @@ def update_td3(
         actor_bc_aux_weight,
         actor_bc_aux_loss,
         tau,
+        actor_ema_tau,
         normalize_q,
         actor_input_noise,
         actor_bc_noise,
@@ -1324,6 +1339,7 @@ def update_iql(
     actor_bc_aux_weight: float,
     actor_bc_aux_loss: str,
     tau: float,
+    actor_ema_tau: float,
     iql_expectile: float,
     critic_objective_noise: float,
     critic_grad_noise: float,
@@ -1357,6 +1373,7 @@ def update_iql(
         actor_bc_aux_weight,
         actor_bc_aux_loss,
         tau,
+        actor_ema_tau,
         normalize_q,
         actor_input_noise,
         actor_bc_noise,
@@ -1496,6 +1513,7 @@ def update_refinement(
     actor_bc_aux_loss: str,
     critic_bc_coef: float,
     tau: float,
+    actor_ema_tau: float,
     policy_noise: float,
     noise_clip: float,
     normalize_q: bool,
@@ -1516,6 +1534,7 @@ def update_refinement(
         actor_bc_aux_weight,
         actor_bc_aux_loss,
         tau,
+        actor_ema_tau,
         normalize_q,
         actor_input_noise,
         actor_bc_noise,
@@ -1667,9 +1686,12 @@ def train(config: Config):
         params=init_vars["params"],
         batch_stats=init_vars["batch_stats"] if "batch_stats" in init_vars else {},
         target_params=init_vars["params"],
+        ema_params=init_vars["params"],
         target_batch_stats=init_vars["batch_stats"] if "batch_stats" in init_vars else {},
+        ema_batch_stats=init_vars["batch_stats"] if "batch_stats" in init_vars else {},
         constants=init_vars.get("constants", {}),
         target_constants=init_vars.get("constants", {}),
+        ema_constants=init_vars.get("constants", {}),
         dropout_key=dropout_key,
         tx=optimizer,
     )
@@ -1739,6 +1761,7 @@ def train(config: Config):
         actor_bc_aux_loss=config.actor_bc_aux_loss,
         critic_bc_coef=config.critic_bc_coef,
         tau=config.tau,
+        actor_ema_tau=config.actor_ema_tau,
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
         critic_objective_noise=config.critic_objective_noise,
@@ -1778,6 +1801,7 @@ def train(config: Config):
         actor_bc_aux_weight=config.actor_bc_aux_weight,
         actor_bc_aux_loss=config.actor_bc_aux_loss,
         tau=config.tau,
+        actor_ema_tau=config.actor_ema_tau,
         iql_expectile=config.iql_expectile,
         critic_objective_noise=config.critic_objective_noise,
         critic_grad_noise=config.critic_grad_noise,
@@ -1808,6 +1832,7 @@ def train(config: Config):
         actor_bc_aux_loss=config.actor_bc_aux_loss,
         critic_bc_coef=config.critic_bc_coef,
         tau=config.tau,
+        actor_ema_tau=config.actor_ema_tau,
         policy_noise=config.policy_noise,
         noise_clip=config.noise_clip,
         normalize_q=config.normalize_q,
@@ -1826,6 +1851,7 @@ def train(config: Config):
         aux_weight=config.actor_bc_aux_weight,
         aux_loss=config.actor_bc_aux_loss,
         tau=config.tau,
+        ema_tau=config.actor_ema_tau,
         input_noise=config.actor_input_noise * reset_mods,
         bc_noise=config.actor_bc_noise * reset_mods,
         grad_noise=config.actor_grad_noise * reset_mods,
@@ -2193,9 +2219,12 @@ def train(config: Config):
                     params=reset_vars["params"],
                     batch_stats=reset_vars["batch_stats"] if "batch_stats" in reset_vars else {},
                     target_params=reset_vars["params"],
+                    ema_params=reset_vars["params"],
                     target_batch_stats=reset_vars["batch_stats"] if "batch_stats" in reset_vars else {},
+                    ema_batch_stats=reset_vars["batch_stats"] if "batch_stats" in reset_vars else {},
                     constants=reset_vars.get("constants", {}),
                     target_constants=reset_vars.get("constants", {}),
+                    ema_constants=reset_vars.get("constants", {}),
                     dropout_key=dropout_key,
                     tx=optimizer,
                 )
@@ -2209,14 +2238,21 @@ def train(config: Config):
 
         force_eval = epoch == il_end - 1 or epoch == critic_end - 1
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1 or force_eval:
+            eval_actor_params = update_carry["actor"].ema_params if config.use_actor_ema else update_carry["actor"].params
+            eval_actor_batch_stats = (
+                update_carry["actor"].ema_batch_stats if config.use_actor_ema else update_carry["actor"].batch_stats
+            )
+            eval_actor_constants = (
+                update_carry["actor"].ema_constants if config.use_actor_ema else update_carry["actor"].constants
+            )
             eval_select = "likelihood" if stage == "il" else "q"
             eval_q_step_size = 0.0 if stage == "il" else config.q_infer_step_size
             eval_q_steps = 0 if stage == "il" else config.q_infer_steps
             eval_returns, eval_batch = evaluate(
                 eval_env,
-                update_carry["actor"].params,
-                update_carry["actor"].batch_stats,
-                update_carry["actor"].constants,
+                eval_actor_params,
+                eval_actor_batch_stats,
+                eval_actor_constants,
                 update_carry["critic"],
                 actor_action_fn,
                 actor_logprob_fn if config.use_nf else None,
@@ -2246,9 +2282,9 @@ def train(config: Config):
                 for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
                     returns, _ = evaluate(
                         eval_env,
-                        update_carry["actor"].params,
-                        update_carry["actor"].batch_stats,
-                        update_carry["actor"].constants,
+                        eval_actor_params,
+                        eval_actor_batch_stats,
+                        eval_actor_constants,
                         update_carry["critic"],
                         actor_action_fn,
                         actor_logprob_fn if config.use_nf else None,
