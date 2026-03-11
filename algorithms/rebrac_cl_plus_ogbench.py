@@ -3,6 +3,7 @@
 
 import os
 import math
+import re
 import uuid
 import random
 import time
@@ -113,7 +114,7 @@ class Config:
     nf_use_layernorm: bool = True
     nf_dropout: float = 0.1
     nf_det_layers: int = 2
-    nf_eval_num_samples: int = 8
+    nf_eval_num_samples: Union[int, Sequence[int], str] = 8
     nf_eval_z_scale: float = 1.0
     nf_eval_z_clip: float = 0.0
     use_target_actor: bool = False
@@ -125,6 +126,7 @@ class Config:
     optimizer_type: str = "adam"  # adam | adan
     decay_schedule: Optional[str] = None
     num_critics: int = 2
+    activation: str = "silu"  # silu | gsp
 
     # training params
     dataset_name: str = "antmaze-large-navigate-singletask-v0"
@@ -139,6 +141,7 @@ class Config:
     refinement_div: float = 1.0
     il_warmup_epochs: int = 0
     critic_warmup_epochs: int = 0
+    critic_next_state_pred_epochs: int = 0
     num_updates_on_epoch: int = 1000
     normalize_reward: bool = False
     normalize_states: bool = False
@@ -193,6 +196,21 @@ def uniform_init(bound: float) -> Callable:
 
 def identity(x: Any) -> Any:
     return x
+
+
+def GSP(x: jax.typing.ArrayLike) -> jax.typing.ArrayLike:
+    # GELU-Sinc-Perturbation (GSP)
+    alpha = 0.5
+    return jax.nn.gelu(x) * (1.0 + alpha * jax.numpy.sinc(x))
+
+
+def resolve_activation(name: str):
+    name = name.lower()
+    if name == "silu":
+        return nn.silu
+    if name == "gsp":
+        return GSP
+    raise ValueError(f"Unsupported activation '{name}'. Expected one of: silu, gsp")
 
 
 AddDecayedWeightsState = base.EmptyState
@@ -259,10 +277,12 @@ class DetActor(nn.Module):
     spectralnorm: bool = False
     dropout_rate: float = 0.0
     n_hiddens: int = 3
+    activation: str = "silu"
 
     @nn.compact
     def __call__(self, state: jax.Array, train: bool) -> Tuple[jax.Array, jax.Array]:
         s_d, h_d = state.shape[-1], self.hidden_dim
+        activation_fn = resolve_activation(self.activation)
 
         def dense_layer(x, fan_in):
             dense = nn.Dense(
@@ -277,7 +297,7 @@ class DetActor(nn.Module):
             return x
 
         def apply_block(x):
-            x = nn.silu(x)
+            x = activation_fn(x)
             x = nn.LayerNorm()(x) if self.layernorm else x
             x = nn.LayerNorm(use_bias=False, use_scale=False)(x) if self.featurenorm else x
             x = nn.GroupNorm()(x) if self.groupnorm else x
@@ -295,7 +315,7 @@ class DetActor(nn.Module):
         trunk = x
         last_layer = nn.Sequential(
             [
-                nn.silu,
+                activation_fn,
                 nn.LayerNorm() if self.layernorm else identity,
                 nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
                 nn.GroupNorm() if self.groupnorm else identity,
@@ -316,18 +336,26 @@ class Critic(nn.Module):
     n_classes: int = 21
     use_distributional: bool = True
     dropout_rate: float = 0.0
+    activation: str = "silu"
 
     @nn.compact
-    def __call__(self, state: jax.Array, action: jax.Array, train: bool = False) -> jax.Array:
+    def __call__(
+        self,
+        state: jax.Array,
+        action: jax.Array,
+        train: bool = False,
+        predict_next_state: bool = False,
+    ) -> jax.Array:
         s_d, a_d, h_d = state.shape[-1], action.shape[-1], self.hidden_dim
         state_action = jnp.hstack([state, action])
+        activation_fn = resolve_activation(self.activation)
 
         x = nn.Dense(
             self.hidden_dim,
             kernel_init=pytorch_init(s_d + a_d),
             bias_init=nn.initializers.constant(0.1),
         )(state_action)
-        x = nn.silu(x)
+        x = activation_fn(x)
         x = nn.LayerNorm()(x) if self.layernorm else x
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not train)
 
@@ -337,17 +365,44 @@ class Critic(nn.Module):
                 kernel_init=pytorch_init(h_d),
                 bias_init=nn.initializers.constant(0.1),
             )(x)
-            h = nn.silu(h)
+            h = activation_fn(h)
             h = nn.LayerNorm()(h) if self.layernorm else h
             h = nn.Dropout(rate=self.dropout_rate)(h, deterministic=not train)
             x = x + h
 
-        out = nn.Dense(
-            self.n_classes if self.use_distributional else 1,
-            kernel_init=uniform_init(3e-3),
-            bias_init=uniform_init(3e-3),
-        )(x)
-        return out
+        def head_block(features: jax.Array, out_dim: int, name: str) -> jax.Array:
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=pytorch_init(h_d),
+                bias_init=nn.initializers.constant(0.1),
+                name=f"{name}_dense1",
+            )(features)
+            h = activation_fn(h)
+            h = nn.LayerNorm(name=f"{name}_ln1")(h) if self.layernorm else h
+            h = nn.Dropout(rate=self.dropout_rate, name=f"{name}_drop1")(h, deterministic=not train)
+
+            h = nn.Dense(
+                self.hidden_dim,
+                kernel_init=pytorch_init(h_d),
+                bias_init=nn.initializers.constant(0.1),
+                name=f"{name}_dense2",
+            )(h)
+            h = activation_fn(h)
+            h = nn.LayerNorm(name=f"{name}_ln2")(h) if self.layernorm else h
+            h = nn.Dropout(rate=self.dropout_rate, name=f"{name}_drop2")(h, deterministic=not train)
+
+            return nn.Dense(
+                out_dim,
+                kernel_init=uniform_init(3e-3),
+                bias_init=uniform_init(3e-3),
+                name=f"{name}_out",
+            )(h)
+
+        q_out = head_block(x, self.n_classes if self.use_distributional else 1, "q_head")
+        next_state_out = head_block(x, s_d, "next_state_head")
+        if predict_next_state:
+            return q_out, next_state_out
+        return q_out
 
 
 class Value(nn.Module):
@@ -382,9 +437,16 @@ class EnsembleCritic(nn.Module):
     n_classes: int = 21
     use_distributional: bool = True
     dropout_rate: float = 0.0
+    activation: str = "silu"
 
     @nn.compact
-    def __call__(self, state: jax.Array, action: jax.Array, train: bool = False) -> jax.Array:
+    def __call__(
+        self,
+        state: jax.Array,
+        action: jax.Array,
+        train: bool = False,
+        predict_next_state: bool = False,
+    ) -> jax.Array:
         ensemble = nn.vmap(
             target=Critic,
             in_axes=None,
@@ -400,7 +462,8 @@ class EnsembleCritic(nn.Module):
             self.n_classes,
             self.use_distributional,
             self.dropout_rate,
-        )(state, action, train)
+            self.activation,
+        )(state, action, train, predict_next_state)
 
 
 def calc_return_to_go(is_sparse_reward, rewards, terminals, gamma):
@@ -677,6 +740,31 @@ def build_actor_inputs(
     if use_prev_action:
         parts.append(prev_actions)
     return jnp.concatenate(parts, axis=-1) if len(parts) > 1 else states
+
+
+def parse_eval_num_samples(value: Union[int, Sequence[int], str]) -> Sequence[int]:
+    if isinstance(value, int):
+        parsed = [value]
+    elif isinstance(value, str):
+        tokens = [tok for tok in re.split(r"[\s,\[\]]+", value.strip()) if tok]
+        parsed = [int(tok) for tok in tokens] if tokens else []
+    elif isinstance(value, Sequence):
+        parsed = [int(v) for v in value]
+    else:
+        raise ValueError("nf_eval_num_samples must be an int, a sequence of ints, or a comma-separated string")
+
+    if not parsed:
+        raise ValueError("nf_eval_num_samples must contain at least one value")
+    if any(v < 1 for v in parsed):
+        raise ValueError("nf_eval_num_samples values must be >= 1")
+
+    unique = []
+    seen = set()
+    for v in parsed:
+        if v not in seen:
+            unique.append(v)
+            seen.add(v)
+    return unique
 
 
 def transform_to_probs(target: jax.Array, support: jax.Array, sigma: float) -> jax.Array:
@@ -1233,33 +1321,46 @@ def update_critic_iql(
     objective_noise: float,
     grad_noise: float,
     use_distributional: bool,
-) -> Tuple[jax.random.PRNGKey, CriticTrainState, jax.Array, jax.Array]:
+    epoch: jax.Array,
+    next_state_pred_epochs: int,
+) -> Tuple[jax.random.PRNGKey, CriticTrainState, jax.Array, jax.Array, jax.Array]:
     key, critic_dropout_key, objective_noise_key, grad_noise_key = jax.random.split(key, 4)
     state_noise_key, action_noise_key = jax.random.split(objective_noise_key)
     state_noise = jax.random.normal(state_noise_key, batch["states"].shape) * objective_noise
     action_noise = jax.random.normal(action_noise_key, batch["actions"].shape) * objective_noise
     v_next = value.apply_fn(value.params, batch["next_states"])
     target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * v_next
+    next_state_coef = jnp.where((next_state_pred_epochs > 0) & (epoch < next_state_pred_epochs), 1.0, 0.0)
 
     def critic_loss_fn(critic_params: jax.Array):
-        q = critic.apply_fn(
+        q, next_state_pred = critic.apply_fn(
             critic_params,
             batch["states"] + state_noise,
             jnp.clip(batch["actions"] + action_noise, -1.0, 1.0),
+            True,
             True,
             rngs={"dropout": critic_dropout_key},
         )
         if use_distributional:
             q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
             target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
-            loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
+            q_loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
         else:
             q = jnp.squeeze(q, axis=-1)
             q_min = q.min(0).mean() if q.ndim > 1 else q.mean()
-            loss = jnp.mean((q - target_q) ** 2, axis=1).sum(0) if q.ndim > 1 else jnp.mean((q - target_q) ** 2)
-        return loss, q_min
+            q_loss = jnp.mean((q - target_q) ** 2, axis=1).sum(0) if q.ndim > 1 else jnp.mean((q - target_q) ** 2)
 
-    (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic.params)
+        target_next_state = batch["next_states"]
+        if next_state_pred.ndim > 2:
+            next_state_loss = jnp.mean((next_state_pred - target_next_state[None, ...]) ** 2, axis=(1, 2)).sum(0)
+        else:
+            next_state_loss = jnp.mean((next_state_pred - target_next_state) ** 2)
+        next_state_loss = next_state_coef * next_state_loss
+
+        loss = q_loss + next_state_loss
+        return loss, (q_min, next_state_loss)
+
+    (loss, (q_min, next_state_loss)), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic.params)
 
     def add_gaussian_noise(gr, noise_std, rng_key):
         def add_noise_to_grad(g, k):
@@ -1273,7 +1374,7 @@ def update_critic_iql(
 
     grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
     new_critic = critic.apply_gradients(grads=grads)
-    return key, new_critic, loss, q_min
+    return key, new_critic, loss, q_min, next_state_loss
 
 
 def update_critic(
@@ -1293,6 +1394,8 @@ def update_critic(
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
+    epoch: jax.Array,
+    next_state_pred_epochs: int,
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, CriticTrainState, Metrics]:
     key, actions_key, noise_key, critic_dropout_key, objective_noise_key, grad_noise_key = jax.random.split(key, 6)
@@ -1343,26 +1446,37 @@ def update_critic(
     next_q = next_q - beta * bc_penalty
 
     target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
+    next_state_coef = jnp.where((next_state_pred_epochs > 0) & (epoch < next_state_pred_epochs), 1.0, 0.0)
 
     def critic_loss_fn(critic_params: jax.Array):
-        q = critic.apply_fn(
+        q, next_state_pred = critic.apply_fn(
             critic_params,
             batch["states"] + state_noise,
             jnp.clip(batch["actions"] + action_noise, -1.0, 1.0),
+            True,
             True,
             rngs={"dropout": critic_dropout_key},
         )
         if use_distributional:
             q_min = transform_from_probs(nn.softmax(q, axis=-1), critic.support).min(0).mean()
             target_probs = transform_to_probs(target_q, critic.support, critic.sigma)
-            loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
+            q_loss = optax.softmax_cross_entropy(logits=q, labels=target_probs[None, ...]).mean(1).sum(0)
         else:
             q = jnp.squeeze(q, axis=-1)
             q_min = q.min(0).mean() if q.ndim > 1 else q.mean()
-            loss = jnp.mean((q - target_q) ** 2, axis=1).sum(0) if q.ndim > 1 else jnp.mean((q - target_q) ** 2)
-        return loss, q_min
+            q_loss = jnp.mean((q - target_q) ** 2, axis=1).sum(0) if q.ndim > 1 else jnp.mean((q - target_q) ** 2)
 
-    (loss, q_min), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic.params)
+        target_next_state = batch["next_states"]
+        if next_state_pred.ndim > 2:
+            next_state_loss = jnp.mean((next_state_pred - target_next_state[None, ...]) ** 2, axis=(1, 2)).sum(0)
+        else:
+            next_state_loss = jnp.mean((next_state_pred - target_next_state) ** 2)
+        next_state_loss = next_state_coef * next_state_loss
+
+        loss = q_loss + next_state_loss
+        return loss, (q_min, next_state_loss)
+
+    (loss, (q_min, next_state_loss)), grads = jax.value_and_grad(critic_loss_fn, has_aux=True)(critic.params)
 
     def add_gaussian_noise(gr, noise_std, rng_key):
         def add_noise_to_grad(g, k):
@@ -1376,7 +1490,7 @@ def update_critic(
 
     grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
     new_critic = critic.apply_gradients(grads=grads)
-    new_metrics = metrics.update({"critic_loss": loss, "q_min": q_min})
+    new_metrics = metrics.update({"critic_loss": loss, "q_min": q_min, "critic_next_state_loss": next_state_loss})
     return key, new_critic, new_metrics
 
 
@@ -1386,6 +1500,7 @@ def update_td3(
     critic: CriticTrainState,
     batch: Dict[str, Any],
     metrics: Metrics,
+    epoch: jax.Array,
     gamma: float,
     actor_bc_coef: float,
     actor_bc_aux_weight: float,
@@ -1406,6 +1521,7 @@ def update_td3(
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
+    next_state_pred_epochs: int,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1424,6 +1540,8 @@ def update_td3(
         use_target_actor,
         use_nf,
         use_distributional,
+        epoch,
+        next_state_pred_epochs,
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
@@ -1456,6 +1574,7 @@ def update_iql(
     value: ValueTrainState,
     batch: Dict[str, Any],
     metrics: Metrics,
+    epoch: jax.Array,
     gamma: float,
     actor_bc_coef: float,
     actor_bc_aux_weight: float,
@@ -1473,10 +1592,11 @@ def update_iql(
     actor_grad_noise: float,
     use_nf: bool,
     use_distributional: bool,
+    next_state_pred_epochs: int,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, ValueTrainState, Metrics]:
     new_value, value_loss = update_value(value, critic, batch, iql_expectile, use_distributional)
     key, critic_key = jax.random.split(key)
-    key, new_critic, critic_loss, q_min = update_critic_iql(
+    key, new_critic, critic_loss, q_min, critic_next_state_loss = update_critic_iql(
         critic_key,
         critic,
         new_value,
@@ -1485,6 +1605,8 @@ def update_iql(
         critic_objective_noise,
         critic_grad_noise,
         use_distributional,
+        epoch,
+        next_state_pred_epochs,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
         key,
@@ -1506,7 +1628,9 @@ def update_iql(
         use_distributional,
         metrics,
     )
-    new_metrics = new_metrics.update({"critic_loss": critic_loss, "q_min": q_min, "value_loss": value_loss})
+    new_metrics = new_metrics.update(
+        {"critic_loss": critic_loss, "q_min": q_min, "critic_next_state_loss": critic_next_state_loss, "value_loss": value_loss}
+    )
     return key, new_actor, new_critic, new_value, new_metrics
 
 
@@ -1517,15 +1641,17 @@ def update_iql_no_actor(
     value: ValueTrainState,
     batch: Dict[str, Any],
     metrics: Metrics,
+    epoch: jax.Array,
     gamma: float,
     iql_expectile: float,
     critic_objective_noise: float,
     critic_grad_noise: float,
     use_distributional: bool,
+    next_state_pred_epochs: int,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, ValueTrainState, Metrics]:
     new_value, value_loss = update_value(value, critic, batch, iql_expectile, use_distributional)
     key, critic_key = jax.random.split(key)
-    key, new_critic, critic_loss, q_min = update_critic_iql(
+    key, new_critic, critic_loss, q_min, critic_next_state_loss = update_critic_iql(
         critic_key,
         critic,
         new_value,
@@ -1534,8 +1660,12 @@ def update_iql_no_actor(
         critic_objective_noise,
         critic_grad_noise,
         use_distributional,
+        epoch,
+        next_state_pred_epochs,
     )
-    new_metrics = metrics.update({"critic_loss": critic_loss, "q_min": q_min, "value_loss": value_loss})
+    new_metrics = metrics.update(
+        {"critic_loss": critic_loss, "q_min": q_min, "critic_next_state_loss": critic_next_state_loss, "value_loss": value_loss}
+    )
     return key, actor, new_critic, new_value, new_metrics
 
 
@@ -1546,6 +1676,7 @@ def update_td3_no_targets(
     batch: Dict[str, Any],
     gamma: float,
     metrics: Metrics,
+    epoch: jax.Array,
     actor_bc_coef: float,
     critic_bc_coef: float,
     tau: float,
@@ -1558,6 +1689,7 @@ def update_td3_no_targets(
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
+    next_state_pred_epochs: int,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1576,6 +1708,8 @@ def update_td3_no_targets(
         use_target_actor,
         use_nf,
         use_distributional,
+        epoch,
+        next_state_pred_epochs,
         metrics,
     )
     return key, actor, new_critic, new_metrics
@@ -1588,6 +1722,7 @@ def update_critic_warmup(
     batch: Dict[str, Any],
     gamma: float,
     metrics: Metrics,
+    epoch: jax.Array,
     critic_bc_coef: float,
     tau: float,
     policy_noise: float,
@@ -1599,6 +1734,7 @@ def update_critic_warmup(
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
+    next_state_pred_epochs: int,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1617,6 +1753,8 @@ def update_critic_warmup(
         use_target_actor,
         use_nf,
         use_distributional,
+        epoch,
+        next_state_pred_epochs,
         metrics,
     )
     new_critic = new_critic.replace(target_params=optax.incremental_update(new_critic.params, critic.target_params, tau))
@@ -1680,6 +1818,11 @@ def train(config: Config):
         raise ValueError("IQL mode does not support refinement epochs")
     if config.actor_bc_aux_loss not in {"mse", "mae", "sum"}:
         raise ValueError("actor_bc_aux_loss must be 'mse', 'mae', or 'sum'")
+    if config.critic_next_state_pred_epochs < 0:
+        raise ValueError("critic_next_state_pred_epochs must be >= 0")
+    if config.activation not in {"silu", "gsp"}:
+        raise ValueError("activation must be 'silu' or 'gsp'")
+    eval_num_samples_values = parse_eval_num_samples(config.nf_eval_num_samples)
 
     wandb.init(config=dict_config, project=config.project, group=config.group, name=config.name, id=str(uuid.uuid4()))
     wandb.mark_preempting()
@@ -1727,6 +1870,7 @@ def train(config: Config):
             use_layernorm=config.nf_use_layernorm,
             dropout_rate=config.nf_dropout,
             deterministic_layers=config.nf_det_layers,
+            activation=config.activation,
         )
         reset_module = NFActorFlat(
             action_dim=init_action.shape[-1],
@@ -1739,6 +1883,7 @@ def train(config: Config):
             use_layernorm=config.nf_use_layernorm,
             dropout_rate=config.nf_dropout,
             deterministic_layers=config.nf_det_layers,
+            activation=config.activation,
         )
     else:
         if config.actor_prereset_mode:
@@ -1752,6 +1897,7 @@ def train(config: Config):
                 spectralnorm=config.actor_sn,
                 dropout_rate=config.actor_dropout,
                 n_hiddens=config.actor_n_hiddens,
+                activation=config.activation,
             )
         else:
             actor_module = DetActor(
@@ -1763,6 +1909,7 @@ def train(config: Config):
                 spectralnorm=False,
                 dropout_rate=0.0,
                 n_hiddens=config.actor_n_hiddens,
+                activation=config.activation,
             )
         reset_module = DetActor(
             action_dim=init_action.shape[-1],
@@ -1772,6 +1919,7 @@ def train(config: Config):
             groupnorm=config.actor_gn,
             dropout_rate=config.actor_dropout,
             n_hiddens=config.actor_n_hiddens,
+            activation=config.activation,
         )
 
     if config.decay_schedule == "cosine":
@@ -1836,6 +1984,7 @@ def train(config: Config):
         n_classes=n_classes_eff,
         use_distributional=config.use_distributional,
         dropout_rate=config.critic_dropout,
+        activation=config.activation,
     )
 
     v_min, v_max = config.v_min, config.v_max
@@ -1906,6 +2055,7 @@ def train(config: Config):
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
+        next_state_pred_epochs=config.critic_next_state_pred_epochs,
     )
 
     update_td3_no_targets_partial = partial(
@@ -1923,6 +2073,7 @@ def train(config: Config):
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
+        next_state_pred_epochs=config.critic_next_state_pred_epochs,
     )
 
     update_iql_partial = partial(
@@ -1944,6 +2095,7 @@ def train(config: Config):
         actor_grad_noise=config.actor_grad_noise * reset_mods,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
+        next_state_pred_epochs=config.critic_next_state_pred_epochs,
     )
 
     update_iql_no_actor_partial = partial(
@@ -1953,6 +2105,7 @@ def train(config: Config):
         critic_objective_noise=config.critic_objective_noise,
         critic_grad_noise=config.critic_grad_noise,
         use_distributional=config.use_distributional,
+        next_state_pred_epochs=config.critic_next_state_pred_epochs,
     )
 
     update_refinement_partial = partial(
@@ -2005,10 +2158,12 @@ def train(config: Config):
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
+        next_state_pred_epochs=config.critic_next_state_pred_epochs,
     )
 
     full_metrics_to_log = [
         "critic_loss",
+        "critic_next_state_loss",
         "q_min",
         "actor_loss",
         "actor_loss_bc_term",
@@ -2035,7 +2190,7 @@ def train(config: Config):
     ]
     full_metrics_to_log.append("nll")
 
-    critic_metrics_to_log = ["critic_loss", "q_min"]
+    critic_metrics_to_log = ["critic_loss", "critic_next_state_loss", "q_min"]
     if config.use_iql:
         critic_metrics_to_log.append("value_loss")
 
@@ -2064,6 +2219,7 @@ def train(config: Config):
                     value=carry["value"],
                     batch=batch,
                     metrics=carry["metrics"],
+                    epoch=carry["epoch"],
                 )
                 update = partial(
                     update_iql_no_actor_partial,
@@ -2073,6 +2229,7 @@ def train(config: Config):
                     value=carry["value"],
                     batch=batch,
                     metrics=carry["metrics"],
+                    epoch=carry["epoch"],
                 )
                 key, new_actor, new_critic, new_value, new_metrics = jax.lax.cond(do_update, full_update, update)
                 new_carry = {
@@ -2081,6 +2238,7 @@ def train(config: Config):
                     "critic": new_critic,
                     "value": new_value,
                     "metrics": new_metrics,
+                    "epoch": carry["epoch"],
                 }
             else:
                 full_update = partial(
@@ -2090,6 +2248,7 @@ def train(config: Config):
                     critic=carry["critic"],
                     batch=batch,
                     metrics=carry["metrics"],
+                    epoch=carry["epoch"],
                 )
                 update = partial(
                     update_td3_no_targets_partial,
@@ -2098,6 +2257,7 @@ def train(config: Config):
                     critic=carry["critic"],
                     batch=batch,
                     metrics=carry["metrics"],
+                    epoch=carry["epoch"],
                 )
                 key, new_actor, new_critic, new_metrics = jax.lax.cond(do_update, full_update, update)
                 new_carry = {
@@ -2105,6 +2265,7 @@ def train(config: Config):
                     "actor": new_actor,
                     "critic": new_critic,
                     "metrics": new_metrics,
+                    "epoch": carry["epoch"],
                 }
             return new_carry, None
 
@@ -2113,6 +2274,7 @@ def train(config: Config):
             "actor": carry["actor"],
             "critic": carry["critic"],
             "metrics": carry["metrics"],
+            "epoch": carry["epoch"],
         }
         if config.use_iql:
             inner_carry["value"] = carry["value"]
@@ -2143,6 +2305,7 @@ def train(config: Config):
                 "actor": new_actor,
                 "critic": carry["critic"],
                 "metrics": new_metrics,
+                "epoch": carry["epoch"],
             }
             if config.use_iql:
                 new_carry["value"] = carry["value"]
@@ -2153,6 +2316,7 @@ def train(config: Config):
             "actor": carry["actor"],
             "critic": carry["critic"],
             "metrics": carry["metrics"],
+            "epoch": carry["epoch"],
         }
         if config.use_iql:
             carry["value"] = value_state
@@ -2180,6 +2344,7 @@ def train(config: Config):
                     value=carry["value"],
                     batch=batch,
                     metrics=carry["metrics"],
+                    epoch=carry["epoch"],
                 )
                 new_carry = {
                     "key": key,
@@ -2187,6 +2352,7 @@ def train(config: Config):
                     "critic": new_critic,
                     "value": new_value,
                     "metrics": new_metrics,
+                    "epoch": carry["epoch"],
                 }
             else:
                 key, new_actor, new_critic, new_metrics = update_critic_warmup_partial(
@@ -2195,12 +2361,14 @@ def train(config: Config):
                     critic=carry["critic"],
                     batch=batch,
                     metrics=carry["metrics"],
+                    epoch=carry["epoch"],
                 )
                 new_carry = {
                     "key": key,
                     "actor": new_actor,
                     "critic": new_critic,
                     "metrics": new_metrics,
+                    "epoch": carry["epoch"],
                 }
             return new_carry, None
 
@@ -2209,6 +2377,7 @@ def train(config: Config):
             "actor": carry["actor"],
             "critic": carry["critic"],
             "metrics": carry["metrics"],
+            "epoch": carry["epoch"],
         }
         if config.use_iql:
             carry["value"] = value_state
@@ -2241,6 +2410,7 @@ def train(config: Config):
                 "actor": new_actor,
                 "critic": new_critic,
                 "metrics": new_metrics,
+                "epoch": carry["epoch"],
             }
             return new_carry, None
 
@@ -2249,6 +2419,7 @@ def train(config: Config):
             "actor": carry["actor"],
             "critic": carry["critic"],
             "metrics": carry["metrics"],
+            "epoch": carry["epoch"],
         }
         carry, _ = jax.lax.scan(body, carry, batch_indices)
         return carry
@@ -2258,7 +2429,7 @@ def train(config: Config):
     run_critic_updates = jax.jit(run_critic_updates)
     run_refinement_updates = jax.jit(run_refinement_updates)
 
-    update_carry = {"key": key, "actor": actor, "critic": critic}
+    update_carry = {"key": key, "actor": actor, "critic": critic, "epoch": jnp.array(0, dtype=jnp.int32)}
     if config.use_iql:
         update_carry["value"] = value
 
@@ -2361,6 +2532,7 @@ def train(config: Config):
                 )
                 update_carry.update(actor=actor)
 
+        update_carry["epoch"] = jnp.array(epoch, dtype=jnp.int32)
         update_carry["metrics"] = Metrics.create(metrics_list)
         update_carry = update_fn(update_carry, buffer.data)
         mean_metrics = update_carry["metrics"].compute()
@@ -2379,73 +2551,76 @@ def train(config: Config):
             eval_select = "likelihood" if stage == "il" else "q"
             eval_q_step_size = 0.0 if stage == "il" else config.q_infer_step_size
             eval_q_steps = 0 if stage == "il" else config.q_infer_steps
-            eval_returns, eval_batch = evaluate(
-                eval_env,
-                eval_actor_params,
-                eval_actor_batch_stats,
-                eval_actor_constants,
-                update_carry["critic"],
-                actor_action_fn,
-                actor_logprob_fn if config.use_nf else None,
-                config.eval_episodes,
-                seed=config.eval_seed,
-                state_mean=buffer.mean,
-                state_std=buffer.std,
-                q_infer_step_size=eval_q_step_size,
-                q_infer_steps=eval_q_steps,
-                eval_task_ids=eval_task_ids,
-                append_goal=config.ogbench_append_goal,
-                goal_source=config.ogbench_goal_source,
-                use_prev_state=config.use_prev_state,
-                use_prev_action=config.use_prev_action,
-                use_nf=config.use_nf,
-                use_distributional=config.use_distributional,
-                nf_eval_num_samples=config.nf_eval_num_samples,
-                nf_eval_z_scale=config.nf_eval_z_scale,
-                nf_eval_z_clip=config.nf_eval_z_clip,
-                nf_eval_select=eval_select,
-            )
+            eval_metrics = {"epoch": epoch}
+            multi_eval = len(eval_num_samples_values) > 1
+            for ns in eval_num_samples_values:
+                suffix = f"_ns_{ns}" if multi_eval else ""
+                eval_returns, _ = evaluate(
+                    eval_env,
+                    eval_actor_params,
+                    eval_actor_batch_stats,
+                    eval_actor_constants,
+                    update_carry["critic"],
+                    actor_action_fn,
+                    actor_logprob_fn if config.use_nf else None,
+                    config.eval_episodes,
+                    seed=config.eval_seed,
+                    state_mean=buffer.mean,
+                    state_std=buffer.std,
+                    q_infer_step_size=eval_q_step_size,
+                    q_infer_steps=eval_q_steps,
+                    eval_task_ids=eval_task_ids,
+                    append_goal=config.ogbench_append_goal,
+                    goal_source=config.ogbench_goal_source,
+                    use_prev_state=config.use_prev_state,
+                    use_prev_action=config.use_prev_action,
+                    use_nf=config.use_nf,
+                    use_distributional=config.use_distributional,
+                    nf_eval_num_samples=ns,
+                    nf_eval_z_scale=config.nf_eval_z_scale,
+                    nf_eval_z_clip=config.nf_eval_z_clip,
+                    nf_eval_select=eval_select,
+                )
+                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+                eval_metrics[f"eval/return_mean{suffix}"] = np.mean(eval_returns)
+                eval_metrics[f"eval/return_std{suffix}"] = np.std(eval_returns)
+                eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(normalized_score)
+                eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(normalized_score)
 
-            normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-            eval_metrics = {
-                "epoch": epoch,
-                "eval/return_mean": np.mean(eval_returns),
-                "eval/return_std": np.std(eval_returns),
-                "eval/normalized_score_mean": np.mean(normalized_score),
-                "eval/normalized_score_std": np.std(normalized_score),
-            }
-            if config.noisy_eval:
-                for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
-                    returns, _ = evaluate(
-                        eval_env,
-                        eval_actor_params,
-                        eval_actor_batch_stats,
-                        eval_actor_constants,
-                        update_carry["critic"],
-                        actor_action_fn,
-                        actor_logprob_fn if config.use_nf else None,
-                        config.eval_episodes,
-                        seed=config.eval_seed,
-                        state_mean=buffer.mean,
-                        state_std=buffer.std,
-                        action_noise=an,
-                        state_noise=sn,
-                        q_infer_step_size=eval_q_step_size,
-                        q_infer_steps=eval_q_steps,
-                        eval_task_ids=eval_task_ids,
-                        append_goal=config.ogbench_append_goal,
-                        goal_source=config.ogbench_goal_source,
-                        use_prev_state=config.use_prev_state,
-                        use_prev_action=config.use_prev_action,
-                        use_nf=config.use_nf,
-                        use_distributional=config.use_distributional,
-                        nf_eval_num_samples=config.nf_eval_num_samples,
-                        nf_eval_z_scale=config.nf_eval_z_scale,
-                        nf_eval_z_clip=config.nf_eval_z_clip,
-                        nf_eval_select=eval_select,
-                    )
-                    normalized_returns = eval_env.get_normalized_score(returns) * 100.0
-                    eval_metrics[f"eval/normalized_score_mean_sn_{sn}_an_{an}"] = np.mean(normalized_returns)
+                if config.noisy_eval:
+                    for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
+                        returns, _ = evaluate(
+                            eval_env,
+                            eval_actor_params,
+                            eval_actor_batch_stats,
+                            eval_actor_constants,
+                            update_carry["critic"],
+                            actor_action_fn,
+                            actor_logprob_fn if config.use_nf else None,
+                            config.eval_episodes,
+                            seed=config.eval_seed,
+                            state_mean=buffer.mean,
+                            state_std=buffer.std,
+                            action_noise=an,
+                            state_noise=sn,
+                            q_infer_step_size=eval_q_step_size,
+                            q_infer_steps=eval_q_steps,
+                            eval_task_ids=eval_task_ids,
+                            append_goal=config.ogbench_append_goal,
+                            goal_source=config.ogbench_goal_source,
+                            use_prev_state=config.use_prev_state,
+                            use_prev_action=config.use_prev_action,
+                            use_nf=config.use_nf,
+                            use_distributional=config.use_distributional,
+                            nf_eval_num_samples=ns,
+                            nf_eval_z_scale=config.nf_eval_z_scale,
+                            nf_eval_z_clip=config.nf_eval_z_clip,
+                            nf_eval_select=eval_select,
+                        )
+                        normalized_returns = eval_env.get_normalized_score(returns) * 100.0
+                        eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
+                            normalized_returns
+                        )
 
             wandb.log(eval_metrics)
 

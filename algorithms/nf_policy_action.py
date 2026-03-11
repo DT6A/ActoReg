@@ -16,19 +16,36 @@ def _normal_log_prob(z: jax.Array) -> jax.Array:
     return -0.5 * (z ** 2 + math.log(2 * math.pi))
 
 
+def GSP(x: jax.typing.ArrayLike) -> jax.typing.ArrayLike:
+    # GELU-Sinc-Perturbation (GSP)
+    alpha = 0.5
+    return jax.nn.gelu(x) * (1.0 + alpha * jax.numpy.sinc(x))
+
+
+def resolve_activation(name: str):
+    name = name.lower()
+    if name == "silu":
+        return nn.silu
+    if name == "gsp":
+        return GSP
+    raise ValueError(f"Unsupported activation '{name}'. Expected one of: silu, gsp")
+
+
 class Conditioner(nn.Module):
     out_dim: int
     hidden_dim: int
     n_hiddens: int
     use_layernorm: bool = True
     dropout_rate: float = 0.0
+    activation: str = "silu"
 
     @nn.compact
     def __call__(self, x: jax.Array, train: bool) -> Tuple[jax.Array, jax.Array]:
+        activation_fn = resolve_activation(self.activation)
         h = x
         for _ in range(max(self.n_hiddens, 1)):
             z = nn.Dense(self.hidden_dim)(h)
-            z = nn.silu(z)
+            z = activation_fn(z)
             if self.use_layernorm:
                 z = nn.LayerNorm()(z)
             z = nn.Dropout(rate=self.dropout_rate)(z, deterministic=not train)
@@ -56,6 +73,7 @@ class CouplingLayer(nn.Module):
     scale_max: float = 1.0
     use_layernorm: bool = True
     dropout_rate: float = 0.0
+    activation: str = "silu"
 
     @nn.compact
     def __call__(self, x: jax.Array, cond: jax.Array, train: bool, reverse: bool) -> Tuple[jax.Array, jax.Array]:
@@ -68,6 +86,7 @@ class CouplingLayer(nn.Module):
             n_hiddens=self.n_hiddens,
             use_layernorm=self.use_layernorm,
             dropout_rate=self.dropout_rate,
+            activation=self.activation,
         )(cond_in, train)
         log_scale = jnp.tanh(log_scale) * self.scale_max
 
@@ -141,6 +160,7 @@ class NFActorFlat(nn.Module):
     use_layernorm: bool = True
     dropout_rate: float = 0.0
     deterministic_layers: int = 2
+    activation: str = "silu"
 
     def setup(self) -> None:
         half = self.action_dim // 2
@@ -196,6 +216,7 @@ class NFActorFlat(nn.Module):
                     scale_max=self.scale_max,
                     use_layernorm=self.use_layernorm,
                     dropout_rate=self.dropout_rate,
+                    activation=self.activation,
                 )
             )
         self.couplings = couplings

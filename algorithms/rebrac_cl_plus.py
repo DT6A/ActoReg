@@ -3,6 +3,7 @@
 
 import os
 import math
+import re
 import uuid
 import random
 import time
@@ -92,7 +93,7 @@ class Config:
     nf_use_layernorm: bool = True
     nf_dropout: float = 0.1
     nf_det_layers: int = 2
-    nf_eval_num_samples: int = 8
+    nf_eval_num_samples: Union[int, str] = 8
     nf_eval_z_scale: float = 1.0
     nf_eval_z_clip: float = 0.0
     use_target_actor: bool = False
@@ -104,6 +105,7 @@ class Config:
     optimizer_type: str = "adam"  # adam | adan
     decay_schedule: Optional[str] = None
     num_critics: int = 2
+    activation: str = "silu"  # silu | gsp
 
     # training params
     dataset_name: str = "halfcheetah-medium-v2"
@@ -170,6 +172,21 @@ def identity(x: Any) -> Any:
     return x
 
 
+def GSP(x: jax.typing.ArrayLike) -> jax.typing.ArrayLike:
+    # GELU-Sinc-Perturbation (GSP)
+    alpha = 0.5
+    return jax.nn.gelu(x) * (1.0 + alpha * jax.numpy.sinc(x))
+
+
+def resolve_activation(name: str):
+    name = name.lower()
+    if name == "silu":
+        return nn.silu
+    if name == "gsp":
+        return GSP
+    raise ValueError(f"Unsupported activation '{name}'. Expected one of: silu, gsp")
+
+
 AddDecayedWeightsState = base.EmptyState
 
 
@@ -234,10 +251,12 @@ class DetActor(nn.Module):
     spectralnorm: bool = False
     dropout_rate: float = 0.0
     n_hiddens: int = 3
+    activation: str = "silu"
 
     @nn.compact
     def __call__(self, state: jax.Array, train: bool) -> Tuple[jax.Array, jax.Array]:
         s_d, h_d = state.shape[-1], self.hidden_dim
+        activation_fn = resolve_activation(self.activation)
 
         def dense_layer(x, fan_in):
             dense = nn.Dense(
@@ -252,7 +271,7 @@ class DetActor(nn.Module):
             return x
 
         def apply_block(x):
-            x = nn.silu(x)
+            x = activation_fn(x)
             x = nn.LayerNorm()(x) if self.layernorm else x
             x = nn.LayerNorm(use_bias=False, use_scale=False)(x) if self.featurenorm else x
             x = nn.GroupNorm()(x) if self.groupnorm else x
@@ -270,7 +289,7 @@ class DetActor(nn.Module):
         trunk = x
         last_layer = nn.Sequential(
             [
-                nn.silu,
+                activation_fn,
                 nn.LayerNorm() if self.layernorm else identity,
                 nn.LayerNorm(use_bias=False, use_scale=False) if self.featurenorm else identity,
                 nn.GroupNorm() if self.groupnorm else identity,
@@ -291,6 +310,7 @@ class Critic(nn.Module):
     n_classes: int = 21
     use_distributional: bool = True
     dropout_rate: float = 0.0
+    activation: str = "silu"
 
     @nn.compact
     def __call__(
@@ -302,13 +322,14 @@ class Critic(nn.Module):
     ) -> jax.Array:
         s_d, a_d, h_d = state.shape[-1], action.shape[-1], self.hidden_dim
         state_action = jnp.hstack([state, action])
+        activation_fn = resolve_activation(self.activation)
 
         x = nn.Dense(
             self.hidden_dim,
             kernel_init=pytorch_init(s_d + a_d),
             bias_init=nn.initializers.constant(0.1),
         )(state_action)
-        x = nn.silu(x)
+        x = activation_fn(x)
         x = nn.LayerNorm()(x) if self.layernorm else x
         x = nn.Dropout(rate=self.dropout_rate)(x, deterministic=not train)
 
@@ -318,7 +339,7 @@ class Critic(nn.Module):
                 kernel_init=pytorch_init(h_d),
                 bias_init=nn.initializers.constant(0.1),
             )(x)
-            h = nn.silu(h)
+            h = activation_fn(h)
             h = nn.LayerNorm()(h) if self.layernorm else h
             h = nn.Dropout(rate=self.dropout_rate)(h, deterministic=not train)
             x = x + h
@@ -330,7 +351,7 @@ class Critic(nn.Module):
                 bias_init=nn.initializers.constant(0.1),
                 name=f"{name}_dense1",
             )(features)
-            h = nn.silu(h)
+            h = activation_fn(h)
             h = nn.LayerNorm(name=f"{name}_ln1")(h) if self.layernorm else h
             h = nn.Dropout(rate=self.dropout_rate, name=f"{name}_drop1")(h, deterministic=not train)
 
@@ -340,7 +361,7 @@ class Critic(nn.Module):
                 bias_init=nn.initializers.constant(0.1),
                 name=f"{name}_dense2",
             )(h)
-            h = nn.silu(h)
+            h = activation_fn(h)
             h = nn.LayerNorm(name=f"{name}_ln2")(h) if self.layernorm else h
             h = nn.Dropout(rate=self.dropout_rate, name=f"{name}_drop2")(h, deterministic=not train)
 
@@ -390,6 +411,7 @@ class EnsembleCritic(nn.Module):
     n_classes: int = 21
     use_distributional: bool = True
     dropout_rate: float = 0.0
+    activation: str = "silu"
 
     @nn.compact
     def __call__(
@@ -414,6 +436,7 @@ class EnsembleCritic(nn.Module):
             self.n_classes,
             self.use_distributional,
             self.dropout_rate,
+            self.activation,
         )(state, action, train, predict_next_state)
 
 
@@ -639,6 +662,31 @@ def build_actor_inputs(
     if use_prev_action:
         parts.append(prev_actions)
     return jnp.concatenate(parts, axis=-1) if len(parts) > 1 else states
+
+
+def parse_eval_num_samples(value: Union[int, Sequence[int], str]) -> Sequence[int]:
+    if isinstance(value, int):
+        parsed = [value]
+    elif isinstance(value, str):
+        tokens = [tok for tok in re.split(r"[\s,\[\]]+", value.strip()) if tok]
+        parsed = [int(tok) for tok in tokens] if tokens else []
+    elif isinstance(value, Sequence):
+        parsed = [int(v) for v in value]
+    else:
+        raise ValueError("nf_eval_num_samples must be an int, a sequence of ints, or a comma-separated string")
+
+    if not parsed:
+        raise ValueError("nf_eval_num_samples must contain at least one value")
+    if any(v < 1 for v in parsed):
+        raise ValueError("nf_eval_num_samples values must be >= 1")
+
+    unique = []
+    seen = set()
+    for v in parsed:
+        if v not in seen:
+            unique.append(v)
+            seen.add(v)
+    return unique
 
 
 def transform_to_probs(target: jax.Array, support: jax.Array, sigma: float) -> jax.Array:
@@ -1650,6 +1698,9 @@ def train(config: Config):
         raise ValueError("actor_bc_aux_loss must be 'mse', 'mae', or 'sum'")
     if config.critic_next_state_pred_epochs < 0:
         raise ValueError("critic_next_state_pred_epochs must be >= 0")
+    if config.activation not in {"silu", "gsp"}:
+        raise ValueError("activation must be 'silu' or 'gsp'")
+    eval_num_samples_values = parse_eval_num_samples(config.nf_eval_num_samples)
 
     wandb.init(config=dict_config, project=config.project, group=config.group, name=config.name, id=str(uuid.uuid4()))
     wandb.mark_preempting()
@@ -1688,6 +1739,7 @@ def train(config: Config):
             use_layernorm=config.nf_use_layernorm,
             dropout_rate=config.nf_dropout,
             deterministic_layers=config.nf_det_layers,
+            activation=config.activation,
         )
         reset_module = NFActorFlat(
             action_dim=init_action.shape[-1],
@@ -1700,6 +1752,7 @@ def train(config: Config):
             use_layernorm=config.nf_use_layernorm,
             dropout_rate=config.nf_dropout,
             deterministic_layers=config.nf_det_layers,
+            activation=config.activation,
         )
     else:
         if config.actor_prereset_mode:
@@ -1713,6 +1766,7 @@ def train(config: Config):
                 spectralnorm=config.actor_sn,
                 dropout_rate=config.actor_dropout,
                 n_hiddens=config.actor_n_hiddens,
+                activation=config.activation,
             )
         else:
             actor_module = DetActor(
@@ -1724,6 +1778,7 @@ def train(config: Config):
                 spectralnorm=False,
                 dropout_rate=0.0,
                 n_hiddens=config.actor_n_hiddens,
+                activation=config.activation,
             )
         reset_module = DetActor(
             action_dim=init_action.shape[-1],
@@ -1733,6 +1788,7 @@ def train(config: Config):
             groupnorm=config.actor_gn,
             dropout_rate=config.actor_dropout,
             n_hiddens=config.actor_n_hiddens,
+            activation=config.activation,
         )
 
     if config.decay_schedule == "cosine":
@@ -1797,6 +1853,7 @@ def train(config: Config):
         n_classes=n_classes_eff,
         use_distributional=config.use_distributional,
         dropout_rate=config.critic_dropout,
+        activation=config.activation,
     )
 
     v_min, v_max = config.v_min, config.v_max
@@ -2363,63 +2420,66 @@ def train(config: Config):
             eval_select = "likelihood" if stage == "il" else "q"
             eval_q_step_size = 0.0 if stage == "il" else config.q_infer_step_size
             eval_q_steps = 0 if stage == "il" else config.q_infer_steps
-            eval_returns, eval_batch = evaluate(
-                eval_env,
-                eval_actor_params,
-                eval_actor_batch_stats,
-                eval_actor_constants,
-                update_carry["critic"],
-                actor_action_fn,
-                actor_logprob_fn if config.use_nf else None,
-                config.eval_episodes,
-                seed=config.eval_seed,
-                q_infer_step_size=eval_q_step_size,
-                q_infer_steps=eval_q_steps,
-                use_prev_state=config.use_prev_state,
-                use_prev_action=config.use_prev_action,
-                use_nf=config.use_nf,
-                use_distributional=config.use_distributional,
-                nf_eval_num_samples=config.nf_eval_num_samples,
-                nf_eval_z_scale=config.nf_eval_z_scale,
-                nf_eval_z_clip=config.nf_eval_z_clip,
-                nf_eval_select=eval_select,
-            )
+            eval_metrics = {"epoch": epoch}
+            multi_eval = len(eval_num_samples_values) > 1
+            for ns in eval_num_samples_values:
+                suffix = f"_ns_{ns}" if multi_eval else ""
+                eval_returns, _ = evaluate(
+                    eval_env,
+                    eval_actor_params,
+                    eval_actor_batch_stats,
+                    eval_actor_constants,
+                    update_carry["critic"],
+                    actor_action_fn,
+                    actor_logprob_fn if config.use_nf else None,
+                    config.eval_episodes,
+                    seed=config.eval_seed,
+                    q_infer_step_size=eval_q_step_size,
+                    q_infer_steps=eval_q_steps,
+                    use_prev_state=config.use_prev_state,
+                    use_prev_action=config.use_prev_action,
+                    use_nf=config.use_nf,
+                    use_distributional=config.use_distributional,
+                    nf_eval_num_samples=ns,
+                    nf_eval_z_scale=config.nf_eval_z_scale,
+                    nf_eval_z_clip=config.nf_eval_z_clip,
+                    nf_eval_select=eval_select,
+                )
+                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+                eval_metrics[f"eval/return_mean{suffix}"] = np.mean(eval_returns)
+                eval_metrics[f"eval/return_std{suffix}"] = np.std(eval_returns)
+                eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(normalized_score)
+                eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(normalized_score)
 
-            normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-            eval_metrics = {
-                "epoch": epoch,
-                "eval/return_mean": np.mean(eval_returns),
-                "eval/return_std": np.std(eval_returns),
-                "eval/normalized_score_mean": np.mean(normalized_score),
-                "eval/normalized_score_std": np.std(normalized_score),
-            }
-            if config.noisy_eval:
-                for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
-                    returns, _ = evaluate(
-                        eval_env,
-                        eval_actor_params,
-                        eval_actor_batch_stats,
-                        eval_actor_constants,
-                        update_carry["critic"],
-                        actor_action_fn,
-                        actor_logprob_fn if config.use_nf else None,
-                        config.eval_episodes,
-                        seed=config.eval_seed,
-                        action_noise=an,
-                        state_noise=sn,
-                        q_infer_step_size=eval_q_step_size,
-                        q_infer_steps=eval_q_steps,
-                        use_prev_state=config.use_prev_state,
-                        use_prev_action=config.use_prev_action,
-                        use_nf=config.use_nf,
-                        use_distributional=config.use_distributional,
-                        nf_eval_num_samples=config.nf_eval_num_samples,
-                        nf_eval_z_scale=config.nf_eval_z_scale,
-                        nf_eval_z_clip=config.nf_eval_z_clip,
-                        nf_eval_select=eval_select,
-                    )
-                    normalized_returns = eval_env.get_normalized_score(returns) * 100.0
-                    eval_metrics[f"eval/normalized_score_mean_sn_{sn}_an_{an}"] = np.mean(normalized_returns)
+                if config.noisy_eval:
+                    for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
+                        returns, _ = evaluate(
+                            eval_env,
+                            eval_actor_params,
+                            eval_actor_batch_stats,
+                            eval_actor_constants,
+                            update_carry["critic"],
+                            actor_action_fn,
+                            actor_logprob_fn if config.use_nf else None,
+                            config.eval_episodes,
+                            seed=config.eval_seed,
+                            action_noise=an,
+                            state_noise=sn,
+                            q_infer_step_size=eval_q_step_size,
+                            q_infer_steps=eval_q_steps,
+                            use_prev_state=config.use_prev_state,
+                            use_prev_action=config.use_prev_action,
+                            use_nf=config.use_nf,
+                            use_distributional=config.use_distributional,
+                            nf_eval_num_samples=ns,
+                            nf_eval_z_scale=config.nf_eval_z_scale,
+                            nf_eval_z_clip=config.nf_eval_z_clip,
+                            nf_eval_select=eval_select,
+                        )
+                        normalized_returns = eval_env.get_normalized_score(returns) * 100.0
+                        eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
+                            normalized_returns
+                        )
 
             wandb.log(eval_metrics)
 
