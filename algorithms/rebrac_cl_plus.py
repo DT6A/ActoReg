@@ -125,7 +125,10 @@ class Config:
     eval_every: int = 100
     eval_first_action_only: bool = True
     q_infer_step_size: float = 0.0
-    q_infer_steps: int = 0
+    q_infer_steps: Union[int, str] = 0
+    use_likelihood_alpha_target: bool = False
+    likelihood_alpha_eps: float = 1e-6
+    likelihood_stats_batch_size: int = 1024
 
     # general params
     train_seed: int = 0
@@ -689,6 +692,70 @@ def parse_eval_num_samples(value: Union[int, Sequence[int], str]) -> Sequence[in
     return unique
 
 
+def parse_q_infer_steps(value: Union[int, Sequence[int], str]) -> Sequence[int]:
+    if isinstance(value, int):
+        parsed = [value]
+    elif isinstance(value, str):
+        tokens = [tok for tok in re.split(r"[\s,\[\]]+", value.strip()) if tok]
+        parsed = [int(tok) for tok in tokens] if tokens else []
+    elif isinstance(value, Sequence):
+        parsed = [int(v) for v in value]
+    else:
+        raise ValueError("q_infer_steps must be an int, a sequence of ints, or a comma-separated string")
+
+    if not parsed:
+        raise ValueError("q_infer_steps must contain at least one value")
+    if any(v < 0 for v in parsed):
+        raise ValueError("q_infer_steps values must be >= 0")
+
+    unique = []
+    seen = set()
+    for v in parsed:
+        if v not in seen:
+            unique.append(v)
+            seen.add(v)
+    return unique
+
+
+def compute_dataset_action_logprob_stats(
+    actor: "ActorTrainState",
+    buffer_data: Dict[str, jax.Array],
+    use_prev_state: bool,
+    use_prev_action: bool,
+    batch_size: int,
+) -> Tuple[float, float]:
+    if batch_size <= 0:
+        raise ValueError("likelihood_stats_batch_size must be > 0")
+
+    @jax.jit
+    def _log_prob_batch(params, constants, actor_obs, actions):
+        return actor.apply_fn(
+            {"params": params, "constants": constants},
+            actions,
+            actor_obs,
+            train=False,
+            method=NFActorFlat.log_prob,
+        )
+
+    n = int(buffer_data["states"].shape[0])
+    lp_min = float("inf")
+    lp_max = float("-inf")
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        states = buffer_data["states"][start:end]
+        prev_states = buffer_data["prev_states"][start:end]
+        prev_actions = buffer_data["prev_actions"][start:end]
+        actions = buffer_data["actions"][start:end]
+        actor_obs = build_actor_inputs(states, prev_states, prev_actions, use_prev_state, use_prev_action)
+        logp = np.asarray(jax.device_get(_log_prob_batch(actor.params, actor.constants, actor_obs, actions)))
+        lp_min = min(lp_min, float(np.min(logp)))
+        lp_max = max(lp_max, float(np.max(logp)))
+
+    if not np.isfinite(lp_min) or not np.isfinite(lp_max):
+        raise ValueError("Failed to compute finite dataset action likelihood statistics")
+    return lp_min, lp_max
+
+
 def transform_to_probs(target: jax.Array, support: jax.Array, sigma: float) -> jax.Array:
     cdf_evals = jax.scipy.special.erf((support - target) / (jnp.sqrt(2) * sigma))
     z = cdf_evals[-1] - cdf_evals[0]
@@ -791,12 +858,12 @@ def evaluate(
         return q_values
 
     def _refine_action(obs_j, action_j):
-        def q_value(a):
-            return eval_q(obs_j, a)[0]
+        def q_value_sum(a):
+            return jnp.sum(eval_q(obs_j, a))
 
         def body(_, a):
-            grad = jax.grad(q_value)(a)
-            grad_norm = jnp.linalg.norm(grad) + 1e-8
+            grad = jax.grad(q_value_sum)(a)
+            grad_norm = jnp.linalg.norm(grad, axis=-1, keepdims=True) + 1e-8
             return jnp.clip(a + q_infer_step_size * (grad / grad_norm), -1.0, 1.0)
 
         return jax.lax.fori_loop(0, q_infer_steps, body, action_j)
@@ -840,6 +907,9 @@ def evaluate(
                 candidates = jnp.asarray(action)
                 obs_j = jnp.asarray(obs_for_actor)[None, ...]
                 actor_obs_j = jnp.asarray(actor_obs)[None, ...]
+                if use_refine:
+                    obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
+                    candidates = refine_action(obs_rep, candidates)
                 if nf_eval_select == "likelihood":
                     if log_prob_fn is None:
                         raise ValueError("nf_eval_select='likelihood' requires log_prob_fn")
@@ -851,8 +921,7 @@ def evaluate(
                     q_vals = eval_q(obs_rep, candidates)
                     best_idx = int(jax.device_get(jnp.argmax(q_vals)))
                 action = np.asarray(jax.device_get(candidates[best_idx]))
-
-            if use_refine:
+            elif use_refine:
                 obs_j = jnp.asarray(obs_for_actor)[None, ...]
                 action_j = jnp.asarray(action)[None, ...]
                 action = np.asarray(jax.device_get(refine_action(obs_j, action_j)[0]))
@@ -1274,6 +1343,10 @@ def update_critic(
     use_distributional: bool,
     epoch: jax.Array,
     next_state_pred_epochs: int,
+    use_likelihood_alpha_target: bool,
+    likelihood_alpha_eps: float,
+    likelihood_logprob_min: jax.Array,
+    likelihood_logprob_max: jax.Array,
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, CriticTrainState, Metrics]:
     key, actions_key, noise_key, critic_dropout_key, objective_noise_key, grad_noise_key = jax.random.split(key, 6)
@@ -1323,7 +1396,22 @@ def update_critic(
             next_q = next_q.min(0)
     next_q = next_q - beta * bc_penalty
 
-    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q
+    alpha = jnp.ones_like(next_q)
+    if use_likelihood_alpha_target and use_nf:
+        next_logp = actor.apply_fn(
+            {"params": actor_params, "constants": actor_constants},
+            next_actions,
+            next_actor_inputs,
+            train=False,
+            method=NFActorFlat.log_prob,
+        )
+        denom = jnp.maximum(likelihood_logprob_max - likelihood_logprob_min, likelihood_alpha_eps)
+        alpha = (next_logp - likelihood_logprob_min) / denom
+    alpha_mean = jnp.mean(alpha)
+    alpha_min = jnp.min(alpha)
+    alpha_max = jnp.max(alpha)
+
+    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q * alpha
     next_state_coef = jnp.where((next_state_pred_epochs > 0) & (epoch < next_state_pred_epochs), 1.0, 0.0)
 
     def critic_loss_fn(critic_params: jax.Array):
@@ -1368,7 +1456,16 @@ def update_critic(
 
     grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
     new_critic = critic.apply_gradients(grads=grads)
-    new_metrics = metrics.update({"critic_loss": loss, "q_min": q_min, "critic_next_state_loss": next_state_loss})
+    new_metrics = metrics.update(
+        {
+            "critic_loss": loss,
+            "q_min": q_min,
+            "critic_next_state_loss": next_state_loss,
+            "alpha_mean": alpha_mean,
+            "alpha_min": alpha_min,
+            "alpha_max": alpha_max,
+        }
+    )
     return key, new_critic, new_metrics
 
 
@@ -1400,6 +1497,10 @@ def update_td3(
     use_nf: bool,
     use_distributional: bool,
     next_state_pred_epochs: int,
+    use_likelihood_alpha_target: bool,
+    likelihood_alpha_eps: float,
+    likelihood_logprob_min: jax.Array,
+    likelihood_logprob_max: jax.Array,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1420,6 +1521,10 @@ def update_td3(
         use_distributional,
         epoch,
         next_state_pred_epochs,
+        use_likelihood_alpha_target,
+        likelihood_alpha_eps,
+        likelihood_logprob_min,
+        likelihood_logprob_max,
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
@@ -1568,6 +1673,10 @@ def update_td3_no_targets(
     use_nf: bool,
     use_distributional: bool,
     next_state_pred_epochs: int,
+    use_likelihood_alpha_target: bool,
+    likelihood_alpha_eps: float,
+    likelihood_logprob_min: jax.Array,
+    likelihood_logprob_max: jax.Array,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1588,6 +1697,10 @@ def update_td3_no_targets(
         use_distributional,
         epoch,
         next_state_pred_epochs,
+        use_likelihood_alpha_target,
+        likelihood_alpha_eps,
+        likelihood_logprob_min,
+        likelihood_logprob_max,
         metrics,
     )
     return key, actor, new_critic, new_metrics
@@ -1613,6 +1726,10 @@ def update_critic_warmup(
     use_nf: bool,
     use_distributional: bool,
     next_state_pred_epochs: int,
+    use_likelihood_alpha_target: bool,
+    likelihood_alpha_eps: float,
+    likelihood_logprob_min: jax.Array,
+    likelihood_logprob_max: jax.Array,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1633,6 +1750,10 @@ def update_critic_warmup(
         use_distributional,
         epoch,
         next_state_pred_epochs,
+        use_likelihood_alpha_target,
+        likelihood_alpha_eps,
+        likelihood_logprob_min,
+        likelihood_logprob_max,
         metrics,
     )
     new_critic = new_critic.replace(target_params=optax.incremental_update(new_critic.params, critic.target_params, tau))
@@ -1700,7 +1821,14 @@ def train(config: Config):
         raise ValueError("critic_next_state_pred_epochs must be >= 0")
     if config.activation not in {"silu", "gsp"}:
         raise ValueError("activation must be 'silu' or 'gsp'")
+    if config.use_likelihood_alpha_target and not config.use_nf:
+        raise ValueError("use_likelihood_alpha_target requires use_nf=True")
+    if config.likelihood_alpha_eps <= 0:
+        raise ValueError("likelihood_alpha_eps must be > 0")
+    if config.likelihood_stats_batch_size <= 0:
+        raise ValueError("likelihood_stats_batch_size must be > 0")
     eval_num_samples_values = parse_eval_num_samples(config.nf_eval_num_samples)
+    eval_q_infer_steps_values = parse_q_infer_steps(config.q_infer_steps)
 
     wandb.init(config=dict_config, project=config.project, group=config.group, name=config.name, id=str(uuid.uuid4()))
     wandb.mark_preempting()
@@ -1925,6 +2053,8 @@ def train(config: Config):
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
+        use_likelihood_alpha_target=config.use_likelihood_alpha_target,
+        likelihood_alpha_eps=config.likelihood_alpha_eps,
     )
 
     update_td3_no_targets_partial = partial(
@@ -1943,6 +2073,8 @@ def train(config: Config):
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
+        use_likelihood_alpha_target=config.use_likelihood_alpha_target,
+        likelihood_alpha_eps=config.likelihood_alpha_eps,
     )
 
     update_iql_partial = partial(
@@ -2028,12 +2160,17 @@ def train(config: Config):
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
+        use_likelihood_alpha_target=config.use_likelihood_alpha_target,
+        likelihood_alpha_eps=config.likelihood_alpha_eps,
     )
 
     full_metrics_to_log = [
         "critic_loss",
         "critic_next_state_loss",
         "q_min",
+        "alpha_mean",
+        "alpha_min",
+        "alpha_max",
         "actor_loss",
         "actor_loss_bc_term",
         "actor_loss_aux_term",
@@ -2059,7 +2196,7 @@ def train(config: Config):
     ]
     full_metrics_to_log.append("nll")
 
-    critic_metrics_to_log = ["critic_loss", "critic_next_state_loss", "q_min"]
+    critic_metrics_to_log = ["critic_loss", "critic_next_state_loss", "q_min", "alpha_mean", "alpha_min", "alpha_max"]
     if config.use_iql:
         critic_metrics_to_log.append("value_loss")
 
@@ -2108,6 +2245,8 @@ def train(config: Config):
                     "value": new_value,
                     "metrics": new_metrics,
                     "epoch": carry["epoch"],
+                    "likelihood_logprob_min": carry["likelihood_logprob_min"],
+                    "likelihood_logprob_max": carry["likelihood_logprob_max"],
                 }
             else:
                 full_update = partial(
@@ -2118,6 +2257,8 @@ def train(config: Config):
                     batch=batch,
                     metrics=carry["metrics"],
                     epoch=carry["epoch"],
+                    likelihood_logprob_min=carry["likelihood_logprob_min"],
+                    likelihood_logprob_max=carry["likelihood_logprob_max"],
                 )
                 update = partial(
                     update_td3_no_targets_partial,
@@ -2127,6 +2268,8 @@ def train(config: Config):
                     batch=batch,
                     metrics=carry["metrics"],
                     epoch=carry["epoch"],
+                    likelihood_logprob_min=carry["likelihood_logprob_min"],
+                    likelihood_logprob_max=carry["likelihood_logprob_max"],
                 )
                 key, new_actor, new_critic, new_metrics = jax.lax.cond(do_update, full_update, update)
                 new_carry = {
@@ -2135,6 +2278,8 @@ def train(config: Config):
                     "critic": new_critic,
                     "metrics": new_metrics,
                     "epoch": carry["epoch"],
+                    "likelihood_logprob_min": carry["likelihood_logprob_min"],
+                    "likelihood_logprob_max": carry["likelihood_logprob_max"],
                 }
             return new_carry, None
 
@@ -2144,6 +2289,8 @@ def train(config: Config):
             "critic": carry["critic"],
             "metrics": carry["metrics"],
             "epoch": carry["epoch"],
+            "likelihood_logprob_min": carry["likelihood_logprob_min"],
+            "likelihood_logprob_max": carry["likelihood_logprob_max"],
         }
         if config.use_iql:
             inner_carry["value"] = carry["value"]
@@ -2175,6 +2322,8 @@ def train(config: Config):
                 "critic": carry["critic"],
                 "metrics": new_metrics,
                 "epoch": carry["epoch"],
+                "likelihood_logprob_min": carry["likelihood_logprob_min"],
+                "likelihood_logprob_max": carry["likelihood_logprob_max"],
             }
             if config.use_iql:
                 new_carry["value"] = carry["value"]
@@ -2186,6 +2335,8 @@ def train(config: Config):
             "critic": carry["critic"],
             "metrics": carry["metrics"],
             "epoch": carry["epoch"],
+            "likelihood_logprob_min": carry["likelihood_logprob_min"],
+            "likelihood_logprob_max": carry["likelihood_logprob_max"],
         }
         if config.use_iql:
             carry["value"] = value_state
@@ -2222,6 +2373,8 @@ def train(config: Config):
                     "value": new_value,
                     "metrics": new_metrics,
                     "epoch": carry["epoch"],
+                    "likelihood_logprob_min": carry["likelihood_logprob_min"],
+                    "likelihood_logprob_max": carry["likelihood_logprob_max"],
                 }
             else:
                 key, new_actor, new_critic, new_metrics = update_critic_warmup_partial(
@@ -2231,6 +2384,8 @@ def train(config: Config):
                     batch=batch,
                     metrics=carry["metrics"],
                     epoch=carry["epoch"],
+                    likelihood_logprob_min=carry["likelihood_logprob_min"],
+                    likelihood_logprob_max=carry["likelihood_logprob_max"],
                 )
                 new_carry = {
                     "key": key,
@@ -2238,6 +2393,8 @@ def train(config: Config):
                     "critic": new_critic,
                     "metrics": new_metrics,
                     "epoch": carry["epoch"],
+                    "likelihood_logprob_min": carry["likelihood_logprob_min"],
+                    "likelihood_logprob_max": carry["likelihood_logprob_max"],
                 }
             return new_carry, None
 
@@ -2247,6 +2404,8 @@ def train(config: Config):
             "critic": carry["critic"],
             "metrics": carry["metrics"],
             "epoch": carry["epoch"],
+            "likelihood_logprob_min": carry["likelihood_logprob_min"],
+            "likelihood_logprob_max": carry["likelihood_logprob_max"],
         }
         if config.use_iql:
             carry["value"] = value_state
@@ -2280,6 +2439,8 @@ def train(config: Config):
                 "critic": new_critic,
                 "metrics": new_metrics,
                 "epoch": carry["epoch"],
+                "likelihood_logprob_min": carry["likelihood_logprob_min"],
+                "likelihood_logprob_max": carry["likelihood_logprob_max"],
             }
             return new_carry, None
 
@@ -2289,6 +2450,8 @@ def train(config: Config):
             "critic": carry["critic"],
             "metrics": carry["metrics"],
             "epoch": carry["epoch"],
+            "likelihood_logprob_min": carry["likelihood_logprob_min"],
+            "likelihood_logprob_max": carry["likelihood_logprob_max"],
         }
         carry, _ = jax.lax.scan(body, carry, batch_indices)
         return carry
@@ -2298,7 +2461,14 @@ def train(config: Config):
     run_critic_updates = jax.jit(run_critic_updates)
     run_refinement_updates = jax.jit(run_refinement_updates)
 
-    update_carry = {"key": key, "actor": actor, "critic": critic, "epoch": jnp.array(0, dtype=jnp.int32)}
+    update_carry = {
+        "key": key,
+        "actor": actor,
+        "critic": critic,
+        "epoch": jnp.array(0, dtype=jnp.int32),
+        "likelihood_logprob_min": jnp.array(0.0, dtype=jnp.float32),
+        "likelihood_logprob_max": jnp.array(1.0, dtype=jnp.float32),
+    }
     if config.use_iql:
         update_carry["value"] = value
 
@@ -2361,6 +2531,29 @@ def train(config: Config):
         elif epoch < critic_end:
             stage = "critic"
 
+        if config.use_likelihood_alpha_target and config.use_nf:
+            needs_stats = (
+                (il_end > 0 and epoch == il_end)
+                or (il_end == 0 and epoch == 0)
+            )
+            if needs_stats:
+                lp_min, lp_max = compute_dataset_action_logprob_stats(
+                    update_carry["actor"],
+                    buffer.data,
+                    config.use_prev_state,
+                    config.use_prev_action,
+                    config.likelihood_stats_batch_size,
+                )
+                update_carry["likelihood_logprob_min"] = jnp.array(lp_min, dtype=jnp.float32)
+                update_carry["likelihood_logprob_max"] = jnp.array(lp_max, dtype=jnp.float32)
+                wandb.log(
+                    {
+                        "epoch": epoch,
+                        "ReBRACPlus/likelihood_logprob_min": lp_min,
+                        "ReBRACPlus/likelihood_logprob_max": lp_max,
+                    }
+                )
+
         update_fn = run_td3_updates
         metrics_list = full_metrics_to_log
         if stage == "il":
@@ -2419,67 +2612,71 @@ def train(config: Config):
             )
             eval_select = "likelihood" if stage == "il" else "q"
             eval_q_step_size = 0.0 if stage == "il" else config.q_infer_step_size
-            eval_q_steps = 0 if stage == "il" else config.q_infer_steps
+            eval_q_steps_values = eval_q_infer_steps_values
             eval_metrics = {"epoch": epoch}
             multi_eval = len(eval_num_samples_values) > 1
+            multi_qs = len(eval_q_steps_values) > 1
             for ns in eval_num_samples_values:
-                suffix = f"_ns_{ns}" if multi_eval else ""
-                eval_returns, _ = evaluate(
-                    eval_env,
-                    eval_actor_params,
-                    eval_actor_batch_stats,
-                    eval_actor_constants,
-                    update_carry["critic"],
-                    actor_action_fn,
-                    actor_logprob_fn if config.use_nf else None,
-                    config.eval_episodes,
-                    seed=config.eval_seed,
-                    q_infer_step_size=eval_q_step_size,
-                    q_infer_steps=eval_q_steps,
-                    use_prev_state=config.use_prev_state,
-                    use_prev_action=config.use_prev_action,
-                    use_nf=config.use_nf,
-                    use_distributional=config.use_distributional,
-                    nf_eval_num_samples=ns,
-                    nf_eval_z_scale=config.nf_eval_z_scale,
-                    nf_eval_z_clip=config.nf_eval_z_clip,
-                    nf_eval_select=eval_select,
-                )
-                normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-                eval_metrics[f"eval/return_mean{suffix}"] = np.mean(eval_returns)
-                eval_metrics[f"eval/return_std{suffix}"] = np.std(eval_returns)
-                eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(normalized_score)
-                eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(normalized_score)
+                ns_suffix = f"_ns_{ns}" if multi_eval else ""
+                for qs in eval_q_steps_values:
+                    qs_suffix = f"_qs_{qs}" if multi_qs else ""
+                    suffix = f"{ns_suffix}{qs_suffix}"
+                    eval_returns, _ = evaluate(
+                        eval_env,
+                        eval_actor_params,
+                        eval_actor_batch_stats,
+                        eval_actor_constants,
+                        update_carry["critic"],
+                        actor_action_fn,
+                        actor_logprob_fn if config.use_nf else None,
+                        config.eval_episodes,
+                        seed=config.eval_seed,
+                        q_infer_step_size=eval_q_step_size,
+                        q_infer_steps=qs,
+                        use_prev_state=config.use_prev_state,
+                        use_prev_action=config.use_prev_action,
+                        use_nf=config.use_nf,
+                        use_distributional=config.use_distributional,
+                        nf_eval_num_samples=ns,
+                        nf_eval_z_scale=config.nf_eval_z_scale,
+                        nf_eval_z_clip=config.nf_eval_z_clip,
+                        nf_eval_select=eval_select,
+                    )
+                    normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+                    eval_metrics[f"eval/return_mean{suffix}"] = np.mean(eval_returns)
+                    eval_metrics[f"eval/return_std{suffix}"] = np.std(eval_returns)
+                    eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(normalized_score)
+                    eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(normalized_score)
 
-                if config.noisy_eval:
-                    for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
-                        returns, _ = evaluate(
-                            eval_env,
-                            eval_actor_params,
-                            eval_actor_batch_stats,
-                            eval_actor_constants,
-                            update_carry["critic"],
-                            actor_action_fn,
-                            actor_logprob_fn if config.use_nf else None,
-                            config.eval_episodes,
-                            seed=config.eval_seed,
-                            action_noise=an,
-                            state_noise=sn,
-                            q_infer_step_size=eval_q_step_size,
-                            q_infer_steps=eval_q_steps,
-                            use_prev_state=config.use_prev_state,
-                            use_prev_action=config.use_prev_action,
-                            use_nf=config.use_nf,
-                            use_distributional=config.use_distributional,
-                            nf_eval_num_samples=ns,
-                            nf_eval_z_scale=config.nf_eval_z_scale,
-                            nf_eval_z_clip=config.nf_eval_z_clip,
-                            nf_eval_select=eval_select,
-                        )
-                        normalized_returns = eval_env.get_normalized_score(returns) * 100.0
-                        eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
-                            normalized_returns
-                        )
+                    if config.noisy_eval:
+                        for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
+                            returns, _ = evaluate(
+                                eval_env,
+                                eval_actor_params,
+                                eval_actor_batch_stats,
+                                eval_actor_constants,
+                                update_carry["critic"],
+                                actor_action_fn,
+                                actor_logprob_fn if config.use_nf else None,
+                                config.eval_episodes,
+                                seed=config.eval_seed,
+                                action_noise=an,
+                                state_noise=sn,
+                                q_infer_step_size=eval_q_step_size,
+                                q_infer_steps=qs,
+                                use_prev_state=config.use_prev_state,
+                                use_prev_action=config.use_prev_action,
+                                use_nf=config.use_nf,
+                                use_distributional=config.use_distributional,
+                                nf_eval_num_samples=ns,
+                                nf_eval_z_scale=config.nf_eval_z_scale,
+                                nf_eval_z_clip=config.nf_eval_z_clip,
+                                nf_eval_select=eval_select,
+                            )
+                            normalized_returns = eval_env.get_normalized_score(returns) * 100.0
+                            eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
+                                normalized_returns
+                            )
 
             wandb.log(eval_metrics)
 

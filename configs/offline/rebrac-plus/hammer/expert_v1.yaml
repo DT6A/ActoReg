@@ -35,7 +35,7 @@ num_critics: 4
 num_epochs: 1000
 optimizer_type: "adam"
 policy_noise: 0
-q_infer_step_size: 0.1
+q_infer_step_size: 0.01
 q_infer_steps: 0
 tau: 0.003
 use_actor_ema: true
