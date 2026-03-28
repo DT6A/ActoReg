@@ -1,0 +1,131 @@
+command:
+  - ${env}
+  - PYTHONPATH=.
+  - python3
+  - ${program}
+  - --program=algorithms/rebrac_cl_plus.py
+  - --multiseed_seeds=0,1,2,3
+  - --metric_key=eval/normalized_score_mean
+  - --aggregate=mean
+  - ${args}
+method: grid
+metric:
+  goal: maximize
+  name: eval/normalized_score_mean
+parameters:
+  actor_bc_aux_loss:
+    value: sum
+  actor_bc_aux_weight:
+    values:
+      - 0.001
+      - 0.003
+      - 0.005
+      - 0.01
+  actor_bc_coef:
+    values:
+      - 0.0003
+      - 0.001
+      - 0.003
+      - 0.01
+      - 0.05
+  actor_bc_noise:
+    value: 0.01
+  actor_ema_tau:
+    value: 0.005
+  actor_grad_noise:
+    value: 0.0003
+  actor_learning_rate:
+    value: 0.0001
+  actor_wd:
+    value: 0.003
+  batch_size:
+    value: 1024
+  critic_dropout:
+    value: 0.03
+  critic_grad_noise:
+    value: 0.0001
+  critic_learning_rate:
+    value: 0.003
+  critic_n_hiddens:
+    value: 5
+  critic_next_state_pred_epochs:
+    value: 1000
+  critic_objective_noise:
+    value: 0
+  critic_warmup_epochs:
+    value: 100
+  critic_wd:
+    value: 3e-05
+  dataset_name:
+    values:
+      - pen-human-v1
+      - pen-cloned-v1
+      - pen-expert-v1
+      - door-human-v1
+      - door-cloned-v1
+      - door-expert-v1
+      - hammer-human-v1
+      - hammer-cloned-v1
+      - hammer-expert-v1
+      - relocate-human-v1
+      - relocate-cloned-v1
+      - relocate-expert-v1
+  eval_episodes:
+    value: 10
+  eval_every:
+    value: 200
+  gamma:
+    value: 0.999
+  il_warmup_epochs:
+    value: 50
+  nf_base_dist:
+    value: uniform
+  nf_det_layers:
+    value: 2
+  nf_dropout:
+    value: 0.1
+  nf_eval_num_samples:
+    value: 16
+  nf_eval_z_scale:
+    value: 1
+  nf_hidden_dim:
+    value: 512
+  nf_n_hiddens:
+    value: 4
+  nf_num_layers:
+    value: 6
+  nf_scale_max:
+    value: 0.75
+  nf_use_plu:
+    value: true
+  normalize_reward:
+    value: false
+  num_critics:
+    value: 4
+  num_epochs:
+    value: 1000
+  optimizer_type:
+    value: adam
+  policy_noise:
+    value: 0
+  q_infer_step_size:
+    value: 0.1
+  q_infer_steps:
+    value: 0
+  tau:
+    value: 0.003
+  use_actor_ema:
+    value: true
+  use_distributional:
+    value: true
+  use_iql:
+    value: false
+  use_nf:
+    value: true
+  use_prev_action:
+    value: false
+  use_prev_state:
+    value: true
+  use_target_actor:
+    value: false
+program: tools/multiseed_sweep_wrapper.py
