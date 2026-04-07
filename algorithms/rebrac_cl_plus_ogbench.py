@@ -154,7 +154,7 @@ class Config:
     q_infer_steps: Union[int, Sequence[int], str] = 0
     use_likelihood_alpha_target: bool = False
     likelihood_alpha_eps: float = 1e-6
-    likelihood_stats_batch_size: int = 65536
+    likelihood_stats_batch_size: int = 1024
 
     # general params
     train_seed: int = 0
@@ -494,6 +494,10 @@ def _parse_task_ids(task_ids: str) -> Tuple[int, ...]:
             continue
         parsed.append(int(token))
     return tuple(parsed)
+
+
+def _is_singletask_ogbench(dataset_name: str) -> bool:
+    return "-singletask" in str(dataset_name)
 
 
 def _concat_obs_goal(obs: np.ndarray, goals: Optional[np.ndarray], append_goal: bool) -> np.ndarray:
@@ -1528,7 +1532,7 @@ def update_critic(
             method=NFActorFlat.log_prob,
         )
         denom = jnp.maximum(likelihood_logprob_max - likelihood_logprob_min, likelihood_alpha_eps)
-        alpha = jnp.clip((next_logp - likelihood_logprob_min) / denom, 0.0, 1.0)
+        alpha = (next_logp - likelihood_logprob_min) / denom
     alpha_mean = jnp.mean(alpha)
     alpha_min = jnp.min(alpha)
     alpha_max = jnp.max(alpha)
@@ -1955,6 +1959,10 @@ def train(config: Config):
     wandb.init(config=dict_config, project=config.project, group=config.group, name=config.name, id=str(uuid.uuid4()))
     wandb.mark_preempting()
 
+    use_singletask_rollout = _is_singletask_ogbench(config.dataset_name)
+    effective_append_goal = config.ogbench_append_goal and (not use_singletask_rollout)
+    eval_task_ids = () if use_singletask_rollout else _parse_task_ids(config.ogbench_eval_task_ids)
+
     buffer = ReplayBuffer()
     buffer.create_from_ogbench(
         config.dataset_name,
@@ -1963,7 +1971,7 @@ def train(config: Config):
         is_normalize=config.normalize_states,
         discount=config.gamma,
         goal_source=config.ogbench_goal_source,
-        append_goal=config.ogbench_append_goal,
+        append_goal=effective_append_goal,
         use_masks_for_dones=config.ogbench_use_masks_for_dones,
     )
 
@@ -1972,7 +1980,6 @@ def train(config: Config):
     key, actor_key, critic_key, dropout_key = jax.random.split(key, 4)
 
     eval_env = make_env(config.dataset_name, seed=config.eval_seed, dataset_dir=config.ogbench_dataset_dir)
-    eval_task_ids = _parse_task_ids(config.ogbench_eval_task_ids)
 
     init_state = buffer.data["states"][0][None, ...]
     init_action = buffer.data["actions"][0][None, ...]
@@ -2767,7 +2774,7 @@ def train(config: Config):
                         q_infer_step_size=eval_q_step_size,
                         q_infer_steps=qs,
                         eval_task_ids=eval_task_ids,
-                        append_goal=config.ogbench_append_goal,
+                        append_goal=effective_append_goal,
                         goal_source=config.ogbench_goal_source,
                         use_prev_state=config.use_prev_state,
                         use_prev_action=config.use_prev_action,
@@ -2803,7 +2810,7 @@ def train(config: Config):
                                 q_infer_step_size=eval_q_step_size,
                                 q_infer_steps=qs,
                                 eval_task_ids=eval_task_ids,
-                                append_goal=config.ogbench_append_goal,
+                                append_goal=effective_append_goal,
                                 goal_source=config.ogbench_goal_source,
                                 use_prev_state=config.use_prev_state,
                                 use_prev_action=config.use_prev_action,
