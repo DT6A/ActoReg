@@ -147,7 +147,7 @@ class Config:
     normalize_states: bool = False
 
     # evaluation params
-    eval_episodes: int = 10
+    eval_episodes: int = 50
     eval_every: int = 100
     eval_first_action_only: bool = True
     q_infer_step_size: float = 0.0
