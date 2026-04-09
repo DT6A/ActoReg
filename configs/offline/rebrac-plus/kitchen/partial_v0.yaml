@@ -15,7 +15,7 @@ critic_next_state_pred_epochs: 1000
 critic_objective_noise: 0
 critic_warmup_epochs: 100
 critic_wd: 3e-05
-dataset_name: kitchen-complete-v0
+dataset_name: kitchen-partial-v0
 eval_episodes: 10
 eval_every: 200
 gamma: 0.999
