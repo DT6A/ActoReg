@@ -1,6 +1,6 @@
 actor_bc_aux_loss: "sum"
 actor_bc_aux_weight: 0.03
-actor_bc_coef: 0.0003
+actor_bc_coef: 0.1
 actor_bc_noise: 0.01
 actor_ema_tau: 0.005
 actor_grad_noise: 0.0003
