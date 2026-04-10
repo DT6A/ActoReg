@@ -114,7 +114,8 @@ class Config:
     nf_use_layernorm: bool = True
     nf_dropout: float = 0.1
     nf_det_layers: int = 2
-    nf_eval_num_samples: Union[int, Sequence[int], str] = 8
+    nf_eval_num_samples: Union[int, str] = 8
+    nf_eval_select: str = "auto"  # auto | q | likelihood | mix | q,likelihood,mix
     nf_eval_z_scale: float = 1.0
     nf_eval_z_clip: float = 0.0
     use_target_actor: bool = False
@@ -131,6 +132,7 @@ class Config:
     # training params
     dataset_name: str = "antmaze-large-navigate-singletask-v0"
     ogbench_dataset_dir: str = "~/.ogbench/data"
+    ogbench_task_id: Optional[int] = None
     ogbench_goal_source: str = "trajectory_final"  # trajectory_final | env_info | oracle_reps | zeros
     ogbench_eval_task_ids: str = "1,2,3,4,5"
     ogbench_append_goal: bool = True
@@ -151,7 +153,7 @@ class Config:
     eval_every: int = 100
     eval_first_action_only: bool = True
     q_infer_step_size: float = 0.0
-    q_infer_steps: Union[int, Sequence[int], str] = 0
+    q_infer_steps: Union[int, str] = 0
     use_likelihood_alpha_target: bool = False
     likelihood_alpha_eps: float = 1e-6
     likelihood_stats_batch_size: int = 1024
@@ -500,6 +502,20 @@ def _is_singletask_ogbench(dataset_name: str) -> bool:
     return "-singletask" in str(dataset_name)
 
 
+def _apply_ogbench_task_override(dataset_name: str, task_id: Optional[int]) -> str:
+    if task_id is None:
+        return dataset_name
+    if task_id <= 0:
+        raise ValueError("ogbench_task_id must be >= 1")
+    if not _is_singletask_ogbench(dataset_name):
+        raise ValueError("ogbench_task_id is only supported for OGBench singletask datasets")
+
+    text = str(dataset_name)
+    if re.search(r"-singletask-task\d+-", text):
+        return re.sub(r"-singletask-task\d+-", f"-singletask-task{task_id}-", text)
+    return text.replace("-singletask-", f"-singletask-task{task_id}-", 1)
+
+
 def _concat_obs_goal(obs: np.ndarray, goals: Optional[np.ndarray], append_goal: bool) -> np.ndarray:
     if (not append_goal) or goals is None:
         return obs.astype(np.float32)
@@ -799,6 +815,33 @@ def parse_q_infer_steps(value: Union[int, Sequence[int], str]) -> Sequence[int]:
     return unique
 
 
+def parse_nf_eval_select(value: Union[str, Sequence[str]]) -> Sequence[str]:
+    if isinstance(value, str):
+        tokens = [tok.lower() for tok in re.split(r"[\s,\[\]]+", value.strip()) if tok]
+        parsed = tokens if tokens else []
+    elif isinstance(value, Sequence):
+        parsed = [str(v).lower() for v in value]
+    else:
+        raise ValueError("nf_eval_select must be a string, a sequence of strings, or a comma-separated string")
+
+    if not parsed:
+        raise ValueError("nf_eval_select must contain at least one value")
+
+    allowed = {"auto", "q", "likelihood", "mix"}
+    if any(v not in allowed for v in parsed):
+        raise ValueError("nf_eval_select values must be chosen from: auto, q, likelihood, mix")
+    if "auto" in parsed and len(parsed) > 1:
+        raise ValueError("nf_eval_select='auto' cannot be combined with explicit values")
+
+    unique = []
+    seen = set()
+    for v in parsed:
+        if v not in seen:
+            unique.append(v)
+            seen.add(v)
+    return unique
+
+
 def compute_dataset_action_logprob_stats(
     actor: "ActorTrainState",
     buffer_data: Dict[str, jax.Array],
@@ -978,6 +1021,7 @@ def evaluate(
     refine_action = jax.jit(_refine_action)
 
     returns = []
+    successes = []
     eval_states = []
     eval_actions = []
     eval_prev_states = []
@@ -1039,6 +1083,16 @@ def evaluate(
                     actor_obs_rep = jnp.repeat(actor_obs_j, nf_eval_num_samples, axis=0)
                     logp = log_prob_fn(params, batch_stats, constants, actor_obs_rep, candidates)
                     best_idx = int(jax.device_get(jnp.argmax(logp)))
+                elif nf_eval_select == "mix":
+                    if log_prob_fn is None:
+                        raise ValueError("nf_eval_select='mix' requires log_prob_fn")
+                    actor_obs_rep = jnp.repeat(actor_obs_j, nf_eval_num_samples, axis=0)
+                    logp = log_prob_fn(params, batch_stats, constants, actor_obs_rep, candidates)
+                    obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
+                    q_vals = eval_q(obs_rep, candidates)
+                    logp_factor = logp - jnp.min(logp) + 1e-8
+                    mix_score = q_vals * logp_factor
+                    best_idx = int(jax.device_get(jnp.argmax(mix_score)))
                 else:
                     obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
                     q_vals = eval_q(obs_rep, candidates)
@@ -1056,10 +1110,10 @@ def evaluate(
 
             step_result = env.step(executed_action)
             if len(step_result) == 5:
-                next_obs_raw, reward, terminated, truncated, _ = step_result
+                next_obs_raw, reward, terminated, truncated, info = step_result
                 done = bool(terminated or truncated)
             else:
-                next_obs_raw, reward, done, _ = step_result
+                next_obs_raw, reward, done, info = step_result
 
             prev_obs = np.asarray(obs_norm, dtype=np.float32)
             prev_action = np.asarray(executed_action, dtype=np.float32)
@@ -1068,12 +1122,15 @@ def evaluate(
             total_reward += reward
 
         returns.append(total_reward)
+        success = float(info.get("success", 0.0)) if isinstance(info, dict) else 0.0
+        successes.append(success)
 
     eval_batch = {
         "states": jnp.array(eval_states),
         "actions": jnp.array(eval_actions),
         "prev_states": jnp.array(eval_prev_states),
         "prev_actions": jnp.array(eval_prev_actions),
+        "episode_successes": np.array(successes, dtype=np.float32),
     }
     return np.array(returns), eval_batch
 
@@ -1953,19 +2010,23 @@ def train(config: Config):
         raise ValueError("likelihood_alpha_eps must be > 0")
     if config.likelihood_stats_batch_size <= 0:
         raise ValueError("likelihood_stats_batch_size must be > 0")
+    effective_dataset_name = _apply_ogbench_task_override(config.dataset_name, config.ogbench_task_id)
     eval_num_samples_values = parse_eval_num_samples(config.nf_eval_num_samples)
     eval_q_infer_steps_values = parse_q_infer_steps(config.q_infer_steps)
+    eval_select_values_raw = parse_nf_eval_select(config.nf_eval_select)
+    if (not config.use_nf) and any(v in {"likelihood", "mix"} for v in eval_select_values_raw):
+        raise ValueError("nf_eval_select='likelihood' and 'mix' require use_nf=True")
 
     wandb.init(config=dict_config, project=config.project, group=config.group, name=config.name, id=str(uuid.uuid4()))
     wandb.mark_preempting()
 
-    use_singletask_rollout = _is_singletask_ogbench(config.dataset_name)
+    use_singletask_rollout = _is_singletask_ogbench(effective_dataset_name)
     effective_append_goal = config.ogbench_append_goal and (not use_singletask_rollout)
     eval_task_ids = () if use_singletask_rollout else _parse_task_ids(config.ogbench_eval_task_ids)
 
     buffer = ReplayBuffer()
     buffer.create_from_ogbench(
-        config.dataset_name,
+        effective_dataset_name,
         dataset_dir=config.ogbench_dataset_dir,
         normalize_reward=config.normalize_reward,
         is_normalize=config.normalize_states,
@@ -1979,7 +2040,7 @@ def train(config: Config):
     key = jax.random.PRNGKey(seed=config.train_seed)
     key, actor_key, critic_key, dropout_key = jax.random.split(key, 4)
 
-    eval_env = make_env(config.dataset_name, seed=config.eval_seed, dataset_dir=config.ogbench_dataset_dir)
+    eval_env = make_env(effective_dataset_name, seed=config.eval_seed, dataset_dir=config.ogbench_dataset_dir)
 
     init_state = buffer.data["states"][0][None, ...]
     init_action = buffer.data["actions"][0][None, ...]
@@ -2748,83 +2809,104 @@ def train(config: Config):
             eval_actor_constants = (
                 update_carry["actor"].ema_constants if config.use_actor_ema else update_carry["actor"].constants
             )
-            eval_select = "likelihood" if stage == "il" else "q"
+            default_eval_select = "likelihood" if stage == "il" else "q"
+            eval_select_values = [default_eval_select] if eval_select_values_raw == ["auto"] else list(eval_select_values_raw)
+            if stage == "il":
+                eval_select_values = ["likelihood" if v in {"q", "mix"} else v for v in eval_select_values]
+                eval_select_values = list(dict.fromkeys(eval_select_values))
             eval_q_step_size = 0.0 if stage == "il" else config.q_infer_step_size
             eval_q_steps_values = eval_q_infer_steps_values
             eval_metrics = {"epoch": epoch}
             multi_eval = len(eval_num_samples_values) > 1
             multi_qs = len(eval_q_steps_values) > 1
+            multi_select = len(eval_select_values) > 1
             for ns in eval_num_samples_values:
                 ns_suffix = f"_ns_{ns}" if multi_eval else ""
                 for qs in eval_q_steps_values:
                     qs_suffix = f"_qs_{qs}" if multi_qs else ""
-                    suffix = f"{ns_suffix}{qs_suffix}"
-                    eval_returns, _ = evaluate(
-                        eval_env,
-                        eval_actor_params,
-                        eval_actor_batch_stats,
-                        eval_actor_constants,
-                        update_carry["critic"],
-                        actor_action_fn,
-                        actor_logprob_fn if config.use_nf else None,
-                        config.eval_episodes,
-                        seed=config.eval_seed,
-                        state_mean=buffer.mean,
-                        state_std=buffer.std,
-                        q_infer_step_size=eval_q_step_size,
-                        q_infer_steps=qs,
-                        eval_task_ids=eval_task_ids,
-                        append_goal=effective_append_goal,
-                        goal_source=config.ogbench_goal_source,
-                        use_prev_state=config.use_prev_state,
-                        use_prev_action=config.use_prev_action,
-                        use_nf=config.use_nf,
-                        use_distributional=config.use_distributional,
-                        nf_eval_num_samples=ns,
-                        nf_eval_z_scale=config.nf_eval_z_scale,
-                        nf_eval_z_clip=config.nf_eval_z_clip,
-                        nf_eval_select=eval_select,
-                    )
-                    normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-                    eval_metrics[f"eval/return_mean{suffix}"] = np.mean(eval_returns)
-                    eval_metrics[f"eval/return_std{suffix}"] = np.std(eval_returns)
-                    eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(normalized_score)
-                    eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(normalized_score)
+                    for eval_select in eval_select_values:
+                        select_suffix = f"_sel_{eval_select}" if multi_select else ""
+                        suffix = f"{ns_suffix}{qs_suffix}{select_suffix}"
+                        eval_returns, eval_info = evaluate(
+                            eval_env,
+                            eval_actor_params,
+                            eval_actor_batch_stats,
+                            eval_actor_constants,
+                            update_carry["critic"],
+                            actor_action_fn,
+                            actor_logprob_fn if config.use_nf else None,
+                            config.eval_episodes,
+                            seed=config.eval_seed,
+                            state_mean=buffer.mean,
+                            state_std=buffer.std,
+                            q_infer_step_size=eval_q_step_size,
+                            q_infer_steps=qs,
+                            eval_task_ids=eval_task_ids,
+                            append_goal=effective_append_goal,
+                            goal_source=config.ogbench_goal_source,
+                            use_prev_state=config.use_prev_state,
+                            use_prev_action=config.use_prev_action,
+                            use_nf=config.use_nf,
+                            use_distributional=config.use_distributional,
+                            nf_eval_num_samples=ns,
+                            nf_eval_z_scale=config.nf_eval_z_scale,
+                            nf_eval_z_clip=config.nf_eval_z_clip,
+                            nf_eval_select=eval_select,
+                        )
+                        eval_metrics[f"eval/return_mean{suffix}"] = np.mean(eval_returns)
+                        eval_metrics[f"eval/return_std{suffix}"] = np.std(eval_returns)
+                        if use_singletask_rollout:
+                            successes = np.asarray(eval_info["episode_successes"], dtype=np.float32) * 100.0
+                            eval_metrics[f"eval/success_mean{suffix}"] = np.mean(successes)
+                            eval_metrics[f"eval/success_std{suffix}"] = np.std(successes)
+                            eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(successes)
+                            eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(successes)
+                        else:
+                            normalized_score = eval_env.unwrapped.get_normalized_score(eval_returns) * 100.0
+                            eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(normalized_score)
+                            eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(normalized_score)
 
-                    if config.noisy_eval:
-                        for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
-                            returns, _ = evaluate(
-                                eval_env,
-                                eval_actor_params,
-                                eval_actor_batch_stats,
-                                eval_actor_constants,
-                                update_carry["critic"],
-                                actor_action_fn,
-                                actor_logprob_fn if config.use_nf else None,
-                                config.eval_episodes,
-                                seed=config.eval_seed,
-                                state_mean=buffer.mean,
-                                state_std=buffer.std,
-                                action_noise=an,
-                                state_noise=sn,
-                                q_infer_step_size=eval_q_step_size,
-                                q_infer_steps=qs,
-                                eval_task_ids=eval_task_ids,
-                                append_goal=effective_append_goal,
-                                goal_source=config.ogbench_goal_source,
-                                use_prev_state=config.use_prev_state,
-                                use_prev_action=config.use_prev_action,
-                                use_nf=config.use_nf,
-                                use_distributional=config.use_distributional,
-                                nf_eval_num_samples=ns,
-                                nf_eval_z_scale=config.nf_eval_z_scale,
-                                nf_eval_z_clip=config.nf_eval_z_clip,
-                                nf_eval_select=eval_select,
-                            )
-                            normalized_returns = eval_env.get_normalized_score(returns) * 100.0
-                            eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
-                                normalized_returns
-                            )
+                        if config.noisy_eval:
+                            for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
+                                returns, noisy_eval_info = evaluate(
+                                    eval_env,
+                                    eval_actor_params,
+                                    eval_actor_batch_stats,
+                                    eval_actor_constants,
+                                    update_carry["critic"],
+                                    actor_action_fn,
+                                    actor_logprob_fn if config.use_nf else None,
+                                    config.eval_episodes,
+                                    seed=config.eval_seed,
+                                    state_mean=buffer.mean,
+                                    state_std=buffer.std,
+                                    action_noise=an,
+                                    state_noise=sn,
+                                    q_infer_step_size=eval_q_step_size,
+                                    q_infer_steps=qs,
+                                    eval_task_ids=eval_task_ids,
+                                    append_goal=effective_append_goal,
+                                    goal_source=config.ogbench_goal_source,
+                                    use_prev_state=config.use_prev_state,
+                                    use_prev_action=config.use_prev_action,
+                                    use_nf=config.use_nf,
+                                    use_distributional=config.use_distributional,
+                                    nf_eval_num_samples=ns,
+                                    nf_eval_z_scale=config.nf_eval_z_scale,
+                                    nf_eval_z_clip=config.nf_eval_z_clip,
+                                    nf_eval_select=eval_select,
+                                )
+                                if use_singletask_rollout:
+                                    noisy_successes = np.asarray(noisy_eval_info["episode_successes"], dtype=np.float32) * 100.0
+                                    eval_metrics[f"eval/success_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(noisy_successes)
+                                    eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
+                                        noisy_successes
+                                    )
+                                else:
+                                    normalized_returns = eval_env.unwrapped.get_normalized_score(returns) * 100.0
+                                    eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
+                                        normalized_returns
+                                    )
 
             wandb.log(eval_metrics)
 

@@ -94,6 +94,7 @@ class Config:
     nf_dropout: float = 0.1
     nf_det_layers: int = 2
     nf_eval_num_samples: Union[int, str] = 8
+    nf_eval_select: str = "auto"  # auto | q | likelihood | mix | q,likelihood,mix
     nf_eval_z_scale: float = 1.0
     nf_eval_z_clip: float = 0.0
     use_target_actor: bool = False
@@ -717,6 +718,33 @@ def parse_q_infer_steps(value: Union[int, Sequence[int], str]) -> Sequence[int]:
     return unique
 
 
+def parse_nf_eval_select(value: Union[str, Sequence[str]]) -> Sequence[str]:
+    if isinstance(value, str):
+        tokens = [tok.lower() for tok in re.split(r"[\s,\[\]]+", value.strip()) if tok]
+        parsed = tokens if tokens else []
+    elif isinstance(value, Sequence):
+        parsed = [str(v).lower() for v in value]
+    else:
+        raise ValueError("nf_eval_select must be a string, a sequence of strings, or a comma-separated string")
+
+    if not parsed:
+        raise ValueError("nf_eval_select must contain at least one value")
+
+    allowed = {"auto", "q", "likelihood", "mix"}
+    if any(v not in allowed for v in parsed):
+        raise ValueError("nf_eval_select values must be chosen from: auto, q, likelihood, mix")
+    if "auto" in parsed and len(parsed) > 1:
+        raise ValueError("nf_eval_select='auto' cannot be combined with explicit values")
+
+    unique = []
+    seen = set()
+    for v in parsed:
+        if v not in seen:
+            unique.append(v)
+            seen.add(v)
+    return unique
+
+
 def compute_dataset_action_logprob_stats(
     actor: "ActorTrainState",
     buffer_data: Dict[str, jax.Array],
@@ -916,6 +944,18 @@ def evaluate(
                     actor_obs_rep = jnp.repeat(actor_obs_j, nf_eval_num_samples, axis=0)
                     logp = log_prob_fn(params, batch_stats, constants, actor_obs_rep, candidates)
                     best_idx = int(jax.device_get(jnp.argmax(logp)))
+                elif nf_eval_select == "mix":
+                    if log_prob_fn is None:
+                        raise ValueError("nf_eval_select='mix' requires log_prob_fn")
+                    actor_obs_rep = jnp.repeat(actor_obs_j, nf_eval_num_samples, axis=0)
+                    logp = log_prob_fn(params, batch_stats, constants, actor_obs_rep, candidates)
+                    obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
+                    q_vals = eval_q(obs_rep, candidates)
+                    # Convert log-likelihoods into a non-negative factor so higher likelihood
+                    # still increases the mixed score before multiplying by Q.
+                    logp_factor = logp - jnp.min(logp) + 1e-8
+                    mix_score = q_vals * logp_factor
+                    best_idx = int(jax.device_get(jnp.argmax(mix_score)))
                 else:
                     obs_rep = jnp.repeat(obs_j, nf_eval_num_samples, axis=0)
                     q_vals = eval_q(obs_rep, candidates)
@@ -1829,6 +1869,9 @@ def train(config: Config):
         raise ValueError("likelihood_stats_batch_size must be > 0")
     eval_num_samples_values = parse_eval_num_samples(config.nf_eval_num_samples)
     eval_q_infer_steps_values = parse_q_infer_steps(config.q_infer_steps)
+    eval_select_values_raw = parse_nf_eval_select(config.nf_eval_select)
+    if (not config.use_nf) and any(v in {"likelihood", "mix"} for v in eval_select_values_raw):
+        raise ValueError("nf_eval_select='likelihood' and 'mix' require use_nf=True")
 
     wandb.init(config=dict_config, project=config.project, group=config.group, name=config.name, id=str(uuid.uuid4()))
     wandb.mark_preempting()
@@ -2610,73 +2653,80 @@ def train(config: Config):
             eval_actor_constants = (
                 update_carry["actor"].ema_constants if config.use_actor_ema else update_carry["actor"].constants
             )
-            eval_select = "likelihood" if stage == "il" else "q"
+            default_eval_select = "likelihood" if stage == "il" else "q"
+            eval_select_values = [default_eval_select] if eval_select_values_raw == ["auto"] else list(eval_select_values_raw)
+            if stage == "il":
+                eval_select_values = ["likelihood" if v in {"q", "mix"} else v for v in eval_select_values]
+                eval_select_values = list(dict.fromkeys(eval_select_values))
             eval_q_step_size = 0.0 if stage == "il" else config.q_infer_step_size
             eval_q_steps_values = eval_q_infer_steps_values
             eval_metrics = {"epoch": epoch}
             multi_eval = len(eval_num_samples_values) > 1
             multi_qs = len(eval_q_steps_values) > 1
+            multi_select = len(eval_select_values) > 1
             for ns in eval_num_samples_values:
                 ns_suffix = f"_ns_{ns}" if multi_eval else ""
                 for qs in eval_q_steps_values:
                     qs_suffix = f"_qs_{qs}" if multi_qs else ""
-                    suffix = f"{ns_suffix}{qs_suffix}"
-                    eval_returns, _ = evaluate(
-                        eval_env,
-                        eval_actor_params,
-                        eval_actor_batch_stats,
-                        eval_actor_constants,
-                        update_carry["critic"],
-                        actor_action_fn,
-                        actor_logprob_fn if config.use_nf else None,
-                        config.eval_episodes,
-                        seed=config.eval_seed,
-                        q_infer_step_size=eval_q_step_size,
-                        q_infer_steps=qs,
-                        use_prev_state=config.use_prev_state,
-                        use_prev_action=config.use_prev_action,
-                        use_nf=config.use_nf,
-                        use_distributional=config.use_distributional,
-                        nf_eval_num_samples=ns,
-                        nf_eval_z_scale=config.nf_eval_z_scale,
-                        nf_eval_z_clip=config.nf_eval_z_clip,
-                        nf_eval_select=eval_select,
-                    )
-                    normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
-                    eval_metrics[f"eval/return_mean{suffix}"] = np.mean(eval_returns)
-                    eval_metrics[f"eval/return_std{suffix}"] = np.std(eval_returns)
-                    eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(normalized_score)
-                    eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(normalized_score)
+                    for eval_select in eval_select_values:
+                        select_suffix = f"_sel_{eval_select}" if multi_select else ""
+                        suffix = f"{ns_suffix}{qs_suffix}{select_suffix}"
+                        eval_returns, _ = evaluate(
+                            eval_env,
+                            eval_actor_params,
+                            eval_actor_batch_stats,
+                            eval_actor_constants,
+                            update_carry["critic"],
+                            actor_action_fn,
+                            actor_logprob_fn if config.use_nf else None,
+                            config.eval_episodes,
+                            seed=config.eval_seed,
+                            q_infer_step_size=eval_q_step_size,
+                            q_infer_steps=qs,
+                            use_prev_state=config.use_prev_state,
+                            use_prev_action=config.use_prev_action,
+                            use_nf=config.use_nf,
+                            use_distributional=config.use_distributional,
+                            nf_eval_num_samples=ns,
+                            nf_eval_z_scale=config.nf_eval_z_scale,
+                            nf_eval_z_clip=config.nf_eval_z_clip,
+                            nf_eval_select=eval_select,
+                        )
+                        normalized_score = eval_env.get_normalized_score(eval_returns) * 100.0
+                        eval_metrics[f"eval/return_mean{suffix}"] = np.mean(eval_returns)
+                        eval_metrics[f"eval/return_std{suffix}"] = np.std(eval_returns)
+                        eval_metrics[f"eval/normalized_score_mean{suffix}"] = np.mean(normalized_score)
+                        eval_metrics[f"eval/normalized_score_std{suffix}"] = np.std(normalized_score)
 
-                    if config.noisy_eval:
-                        for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
-                            returns, _ = evaluate(
-                                eval_env,
-                                eval_actor_params,
-                                eval_actor_batch_stats,
-                                eval_actor_constants,
-                                update_carry["critic"],
-                                actor_action_fn,
-                                actor_logprob_fn if config.use_nf else None,
-                                config.eval_episodes,
-                                seed=config.eval_seed,
-                                action_noise=an,
-                                state_noise=sn,
-                                q_infer_step_size=eval_q_step_size,
-                                q_infer_steps=qs,
-                                use_prev_state=config.use_prev_state,
-                                use_prev_action=config.use_prev_action,
-                                use_nf=config.use_nf,
-                                use_distributional=config.use_distributional,
-                                nf_eval_num_samples=ns,
-                                nf_eval_z_scale=config.nf_eval_z_scale,
-                                nf_eval_z_clip=config.nf_eval_z_clip,
-                                nf_eval_select=eval_select,
-                            )
-                            normalized_returns = eval_env.get_normalized_score(returns) * 100.0
-                            eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
-                                normalized_returns
-                            )
+                        if config.noisy_eval:
+                            for sn, an in [(0.0, 0.2), (0.05, 0.0)]:
+                                returns, _ = evaluate(
+                                    eval_env,
+                                    eval_actor_params,
+                                    eval_actor_batch_stats,
+                                    eval_actor_constants,
+                                    update_carry["critic"],
+                                    actor_action_fn,
+                                    actor_logprob_fn if config.use_nf else None,
+                                    config.eval_episodes,
+                                    seed=config.eval_seed,
+                                    action_noise=an,
+                                    state_noise=sn,
+                                    q_infer_step_size=eval_q_step_size,
+                                    q_infer_steps=qs,
+                                    use_prev_state=config.use_prev_state,
+                                    use_prev_action=config.use_prev_action,
+                                    use_nf=config.use_nf,
+                                    use_distributional=config.use_distributional,
+                                    nf_eval_num_samples=ns,
+                                    nf_eval_z_scale=config.nf_eval_z_scale,
+                                    nf_eval_z_clip=config.nf_eval_z_clip,
+                                    nf_eval_select=eval_select,
+                                )
+                                normalized_returns = eval_env.get_normalized_score(returns) * 100.0
+                                eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
+                                    normalized_returns
+                                )
 
             wandb.log(eval_metrics)
 
