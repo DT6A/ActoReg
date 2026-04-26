@@ -107,6 +107,7 @@ class Config:
     decay_schedule: Optional[str] = None
     num_critics: int = 2
     activation: str = "silu"  # silu | gsp
+    target_critic_aggregation: str = "min"  # min | mean
 
     # training params
     dataset_name: str = "halfcheetah-medium-v2"
@@ -189,6 +190,18 @@ def resolve_activation(name: str):
     if name == "gsp":
         return GSP
     raise ValueError(f"Unsupported activation '{name}'. Expected one of: silu, gsp")
+
+
+def aggregate_target_critics(q_values: jax.Array, reduction: str) -> jax.Array:
+    if q_values.ndim <= 1:
+        return q_values
+    if reduction == "min":
+        return q_values.min(0)
+    if reduction == "mean":
+        return q_values.mean(0)
+    raise ValueError(
+        f"Unsupported target_critic_aggregation '{reduction}'. Expected one of: min, mean"
+    )
 
 
 AddDecayedWeightsState = base.EmptyState
@@ -1381,6 +1394,7 @@ def update_critic(
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
+    target_critic_aggregation: str,
     epoch: jax.Array,
     next_state_pred_epochs: int,
     use_likelihood_alpha_target: bool,
@@ -1429,11 +1443,9 @@ def update_critic(
     logits = critic.apply_fn(critic.target_params, batch["next_states"], next_actions, False)
     if use_distributional:
         probs = nn.softmax(logits, axis=-1)
-        next_q = transform_from_probs(probs, critic.support).min(0)
+        next_q = aggregate_target_critics(transform_from_probs(probs, critic.support), target_critic_aggregation)
     else:
-        next_q = jnp.squeeze(logits, axis=-1)
-        if next_q.ndim > 1:
-            next_q = next_q.min(0)
+        next_q = aggregate_target_critics(jnp.squeeze(logits, axis=-1), target_critic_aggregation)
     next_q = next_q - beta * bc_penalty
 
     alpha = jnp.ones_like(next_q)
@@ -1536,6 +1548,7 @@ def update_td3(
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
+    target_critic_aggregation: str,
     next_state_pred_epochs: int,
     use_likelihood_alpha_target: bool,
     likelihood_alpha_eps: float,
@@ -1559,6 +1572,7 @@ def update_td3(
         use_target_actor,
         use_nf,
         use_distributional,
+        target_critic_aggregation,
         epoch,
         next_state_pred_epochs,
         use_likelihood_alpha_target,
@@ -1712,6 +1726,7 @@ def update_td3_no_targets(
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
+    target_critic_aggregation: str,
     next_state_pred_epochs: int,
     use_likelihood_alpha_target: bool,
     likelihood_alpha_eps: float,
@@ -1735,6 +1750,7 @@ def update_td3_no_targets(
         use_target_actor,
         use_nf,
         use_distributional,
+        target_critic_aggregation,
         epoch,
         next_state_pred_epochs,
         use_likelihood_alpha_target,
@@ -1765,6 +1781,7 @@ def update_critic_warmup(
     use_target_actor: bool,
     use_nf: bool,
     use_distributional: bool,
+    target_critic_aggregation: str,
     next_state_pred_epochs: int,
     use_likelihood_alpha_target: bool,
     likelihood_alpha_eps: float,
@@ -1788,6 +1805,7 @@ def update_critic_warmup(
         use_target_actor,
         use_nf,
         use_distributional,
+        target_critic_aggregation,
         epoch,
         next_state_pred_epochs,
         use_likelihood_alpha_target,
@@ -1861,6 +1879,8 @@ def train(config: Config):
         raise ValueError("critic_next_state_pred_epochs must be >= 0")
     if config.activation not in {"silu", "gsp"}:
         raise ValueError("activation must be 'silu' or 'gsp'")
+    if config.target_critic_aggregation not in {"min", "mean"}:
+        raise ValueError("target_critic_aggregation must be 'min' or 'mean'")
     if config.use_likelihood_alpha_target and not config.use_nf:
         raise ValueError("use_likelihood_alpha_target requires use_nf=True")
     if config.likelihood_alpha_eps <= 0:
@@ -2095,6 +2115,7 @@ def train(config: Config):
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
+        target_critic_aggregation=config.target_critic_aggregation,
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
         use_likelihood_alpha_target=config.use_likelihood_alpha_target,
         likelihood_alpha_eps=config.likelihood_alpha_eps,
@@ -2115,6 +2136,7 @@ def train(config: Config):
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
+        target_critic_aggregation=config.target_critic_aggregation,
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
         use_likelihood_alpha_target=config.use_likelihood_alpha_target,
         likelihood_alpha_eps=config.likelihood_alpha_eps,
@@ -2202,6 +2224,7 @@ def train(config: Config):
         use_target_actor=config.use_target_actor,
         use_nf=config.use_nf,
         use_distributional=config.use_distributional,
+        target_critic_aggregation=config.target_critic_aggregation,
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
         use_likelihood_alpha_target=config.use_likelihood_alpha_target,
         likelihood_alpha_eps=config.likelihood_alpha_eps,
