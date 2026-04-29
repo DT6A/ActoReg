@@ -144,24 +144,24 @@ def main() -> int:
 
     scores = []
     for seed in seeds:
-        try:
-            score = _run_child(
-                python_bin=args.python_bin,
-                program=args.program,
-                base_args=base_args,
-                seed=seed,
-                group=child_group,
-                parent_id=parent_id,
-                metric_key=metric_key,
-                base_wandb_dir=base_wandb_dir,
-            )
-            if not np.isfinite(score):
-                raise RuntimeError(f"Non-finite metric for seed={seed}: {score}")
-            status = "ok"
-        except Exception as exc:
-            print(f"[multiseed] seed={seed} failed, assigning 0.0 score: {exc}", flush=True)
-            score = 0.0
-            status = "failed"
+        # try:
+        score = _run_child(
+            python_bin=args.python_bin,
+            program=args.program,
+            base_args=base_args,
+            seed=seed,
+            group=child_group,
+            parent_id=parent_id,
+            metric_key=metric_key,
+            base_wandb_dir=base_wandb_dir,
+        )
+        if not np.isfinite(score):
+            raise RuntimeError(f"Non-finite metric for seed={seed}: {score}")
+        status = "ok"
+        # except Exception as exc:
+        #     print(f"[multiseed] seed={seed} failed, assigning 0.0 score: {exc}", flush=True)
+        #     score = 0.0
+        #     status = "failed"
         scores.append(score)
         run.log(
             {
