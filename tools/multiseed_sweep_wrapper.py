@@ -6,7 +6,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import numpy as np
 import wandb
@@ -23,12 +23,26 @@ def _parse_seeds(raw) -> List[int]:
     return [int(x.strip()) for x in text.split(",") if x.strip()]
 
 
-def _strip_overrides(args: Iterable[str]) -> List[str]:
-    blocked_prefixes = (
-        "--train_seed",
-        "--group",
-        "--name",
-    )
+def _parse_items(raw) -> List[str]:
+    if isinstance(raw, (list, tuple)):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if raw is None:
+        return []
+    text = str(raw).strip()
+    if not text:
+        return []
+    return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def _normalize_arg_name(name: str) -> str:
+    text = str(name).strip()
+    if not text:
+        return "dataset_name"
+    return text[2:] if text.startswith("--") else text
+
+
+def _strip_overrides(args: Iterable[str], blocked_keys: Iterable[str]) -> List[str]:
+    blocked_prefixes = tuple(f"--{_normalize_arg_name(key)}" for key in blocked_keys)
     filtered = []
     skip_next = False
     for a in args:
@@ -73,12 +87,15 @@ def _run_child(
     program: str,
     base_args: List[str],
     seed: int,
+    dataset: Optional[str],
+    dataset_arg_name: str,
     group: str,
     parent_id: str,
     metric_key: str,
     base_wandb_dir: Path,
 ) -> float:
-    child_dir = base_wandb_dir / f"seed_{seed}"
+    dataset_suffix = f"-dataset-{_sanitize_name(dataset)}" if dataset is not None else ""
+    child_dir = base_wandb_dir / f"seed_{seed}{dataset_suffix}"
     child_dir.mkdir(parents=True, exist_ok=True)
 
     child_env = os.environ.copy()
@@ -88,7 +105,7 @@ def _run_child(
     child_env.pop("WANDB_SWEEP_ID", None)
     child_env.pop("WANDB_RUN_ID", None)
 
-    child_name = f"ms-{parent_id}-seed-{seed}"
+    child_name = f"ms-{parent_id}-seed-{seed}{dataset_suffix}"
     cmd = [
         python_bin,
         program,
@@ -97,6 +114,8 @@ def _run_child(
         f"--group={group}",
         f"--name={child_name}",
     ]
+    if dataset is not None:
+        cmd.append(f"--{_normalize_arg_name(dataset_arg_name)}={dataset}")
 
     print("[multiseed] launching:", " ".join(cmd), flush=True)
 
@@ -114,9 +133,20 @@ def _run_child(
 
     ret = proc.wait()
     if ret != 0:
-        raise RuntimeError(f"Child run failed for seed={seed} with exit code {ret}")
+        raise RuntimeError(
+            f"Child run failed for seed={seed}, dataset={dataset!r} with exit code {ret}"
+        )
 
     return _read_summary_metric(child_dir, metric_key)
+
+
+def _sanitize_name(value: Optional[str]) -> str:
+    if value is None:
+        return "default"
+    keep = []
+    for ch in str(value):
+        keep.append(ch if ch.isalnum() or ch in ("-", "_", ".") else "_")
+    return "".join(keep)
 
 
 def main() -> int:
@@ -124,6 +154,8 @@ def main() -> int:
     parser.add_argument("--program", default="algorithms/rebrac_cl_plus.py")
     parser.add_argument("--python_bin", default="python3")
     parser.add_argument("--multiseed_seeds", default="0,1,2,3")
+    parser.add_argument("--multiseed_datasets", default="")
+    parser.add_argument("--multiseed_dataset_arg", default="dataset_name")
     parser.add_argument("--metric_key", default="eval/normalized_score_mean")
     parser.add_argument("--aggregate", choices=["mean", "median"], default="mean")
     args, passthrough = parser.parse_known_args()
@@ -132,43 +164,59 @@ def main() -> int:
     cfg = dict(run.config)
 
     seeds = _parse_seeds(cfg.get("multiseed_seeds", args.multiseed_seeds))
+    datasets = _parse_items(cfg.get("multiseed_datasets", args.multiseed_datasets))
+    dataset_arg_name = _normalize_arg_name(
+        cfg.get("multiseed_dataset_arg", args.multiseed_dataset_arg)
+    )
     metric_key = str(cfg.get("metric_key", args.metric_key))
     aggregate = str(cfg.get("aggregate", args.aggregate))
 
-    base_args = _strip_overrides(passthrough)
+    blocked_keys = ["train_seed", "group", "name"]
+    if datasets:
+        blocked_keys.append(dataset_arg_name)
+    base_args = _strip_overrides(passthrough, blocked_keys)
 
     parent_id = run.id or f"manual-{int(time.time())}"
     child_group = f"multiseed-{parent_id}"
     base_wandb_dir = Path(os.environ.get("MULTISEED_CHILD_WANDB_DIR", f"/tmp/wandb-multiseed-{parent_id}"))
     base_wandb_dir.mkdir(parents=True, exist_ok=True)
 
+    dataset_values: List[Optional[str]] = datasets or [None]
     scores = []
-    for seed in seeds:
-        # try:
-        score = _run_child(
-            python_bin=args.python_bin,
-            program=args.program,
-            base_args=base_args,
-            seed=seed,
-            group=child_group,
-            parent_id=parent_id,
-            metric_key=metric_key,
-            base_wandb_dir=base_wandb_dir,
-        )
-        if not np.isfinite(score):
-            raise RuntimeError(f"Non-finite metric for seed={seed}: {score}")
-        status = "ok"
-        # except Exception as exc:
-        #     print(f"[multiseed] seed={seed} failed, assigning 0.0 score: {exc}", flush=True)
-        #     score = 0.0
-        #     status = "failed"
-        scores.append(score)
-        run.log(
-            {
-                f"multiseed/seed_{seed}/{metric_key}": score,
-                f"multiseed/seed_{seed}/status": status,
-            }
-        )
+    per_dataset_scores = {}
+    for dataset in dataset_values:
+        dataset_scores = []
+        for seed in seeds:
+            score = _run_child(
+                python_bin=args.python_bin,
+                program=args.program,
+                base_args=base_args,
+                seed=seed,
+                dataset=dataset,
+                dataset_arg_name=dataset_arg_name,
+                group=child_group,
+                parent_id=parent_id,
+                metric_key=metric_key,
+                base_wandb_dir=base_wandb_dir,
+            )
+            if not np.isfinite(score):
+                raise RuntimeError(f"Non-finite metric for seed={seed}, dataset={dataset!r}: {score}")
+            status = "ok"
+            scores.append(score)
+            dataset_scores.append(score)
+            metric_prefix = (
+                f"multiseed/dataset_{_sanitize_name(dataset)}/seed_{seed}"
+                if dataset is not None
+                else f"multiseed/seed_{seed}"
+            )
+            run.log(
+                {
+                    f"{metric_prefix}/{metric_key}": score,
+                    f"{metric_prefix}/status": status,
+                }
+            )
+        if dataset is not None:
+            per_dataset_scores[dataset] = dataset_scores
 
     values = np.asarray(scores, dtype=np.float64)
     if aggregate == "median":
@@ -177,18 +225,32 @@ def main() -> int:
         agg = float(np.mean(values))
 
     std = float(np.std(values))
-    run.log(
-        {
-            metric_key: agg,
-            "multiseed/metric_mean": float(np.mean(values)),
-            "multiseed/metric_median": float(np.median(values)),
-            "multiseed/metric_std": std,
-            "multiseed/num_seeds": len(seeds),
-        }
-    )
+    log_payload = {
+        metric_key: agg,
+        "multiseed/metric_mean": float(np.mean(values)),
+        "multiseed/metric_median": float(np.median(values)),
+        "multiseed/metric_std": std,
+        "multiseed/num_seeds": len(seeds),
+        "multiseed/num_datasets": len(datasets) if datasets else 1,
+    }
+    for dataset, dataset_scores in per_dataset_scores.items():
+        dataset_values_np = np.asarray(dataset_scores, dtype=np.float64)
+        dataset_key = _sanitize_name(dataset)
+        log_payload[f"multiseed/dataset_{dataset_key}/metric_mean"] = float(
+            np.mean(dataset_values_np)
+        )
+        log_payload[f"multiseed/dataset_{dataset_key}/metric_median"] = float(
+            np.median(dataset_values_np)
+        )
+        log_payload[f"multiseed/dataset_{dataset_key}/metric_std"] = float(
+            np.std(dataset_values_np)
+        )
+    run.log(log_payload)
     run.summary[metric_key] = agg
     run.summary["multiseed/metric_std"] = std
     run.summary["multiseed/seeds"] = seeds
+    run.summary["multiseed/datasets"] = datasets
+    run.summary["multiseed/dataset_arg"] = dataset_arg_name
     run.summary["multiseed/child_group"] = child_group
 
     wandb.finish()

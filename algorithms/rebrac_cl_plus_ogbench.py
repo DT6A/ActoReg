@@ -2825,6 +2825,7 @@ def train(config: Config):
         wandb.log({"epoch": epoch, **{f"ReBRACPlus/{k}": v for k, v in mean_metrics.items()}})
 
         force_eval = epoch == il_end - 1 or epoch == critic_end - 1
+        force_eval = False
         if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1 or force_eval:
             eval_actor_params = update_carry["actor"].ema_params if config.use_actor_ema else update_carry["actor"].params
             eval_actor_batch_stats = (
