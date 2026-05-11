@@ -74,6 +74,17 @@ class Config:
     gamma: float = 0.99
     tau: float = 5e-3
 
+    # NS-style n-step return horizon for the critic backup.
+    # n_step=1 reproduces the original 1-step Bellman target.
+    n_step: int = 1
+
+    # Multi-sample target-action selection in the critic update.
+    # At the bootstrap state, sample target_action_k candidate actions, score them
+    # with the (BC-penalty-adjusted) target critic, and reduce over K with the
+    # given operator. K=1 reproduces the original single-action target.
+    target_action_k: int = 1
+    target_action_reduction: str = "max"  # max | min | mean
+
     actor_bc_coef: float = 0.1
     actor_bc_aux_weight: float = 0.0
     actor_bc_aux_loss: str = "mse"  # mse | mae | sum
@@ -585,6 +596,7 @@ def qlearning_dataset(
     goal_source: str = "trajectory_final",
     append_goal: bool = True,
     use_masks_for_dones: bool = True,
+    n_step: int = 1,
 ) -> Tuple[Dict[str, np.ndarray], float, float]:
     ogbench = _import_ogbench()
     env, train_dataset, _ = ogbench.make_env_and_datasets(
@@ -648,6 +660,47 @@ def qlearning_dataset(
         if traj_terminals[i] > 0.5:
             ret = 0.0
 
+    # n-step lookahead bookkeeping. With n_step=1 the resulting arrays match
+    # (next_observations, next_actions, rewards, dones) and discount**1 = gamma,
+    # so the critic targets reduce exactly to the original 1-step Bellman target.
+    max_n = max(1, int(n_step))
+    n_step_states = np.zeros_like(next_obs_goal)
+    n_step_actions = np.zeros_like(actions)
+    n_step_prev_states = np.zeros_like(obs_goal)
+    n_step_prev_actions = np.zeros_like(actions)
+    n_step_rewards = np.zeros((n,), dtype=np.float32)
+    n_step_dones = np.zeros((n,), dtype=np.float32)
+    n_step_horizon = np.zeros((n,), dtype=np.float32)
+
+    # Stop the rollout at either a real trajectory terminal or a logical "done"
+    # (which under use_masks_for_dones may be a task-completion mask).
+    stop_flag = (traj_terminals > 0.5) | (dones > 0.5)
+    for i in range(n):
+        cum_reward = 0.0
+        gamma_pow = 1.0
+        n_eff = 0
+        terminated = False
+        for k in range(max_n):
+            j = i + k
+            if j >= n:
+                break
+            cum_reward += gamma_pow * float(rewards[j])
+            gamma_pow *= discount
+            n_eff = k + 1
+            if stop_flag[j]:
+                terminated = bool(dones[j] > 0.5)
+                break
+        if n_eff == 0:
+            n_eff = 1
+        bootstrap_idx = i + n_eff - 1
+        n_step_states[i] = next_obs_goal[bootstrap_idx]
+        n_step_actions[i] = next_actions[bootstrap_idx]
+        n_step_prev_states[i] = obs_goal[bootstrap_idx]
+        n_step_prev_actions[i] = actions[bootstrap_idx]
+        n_step_rewards[i] = cum_reward
+        n_step_dones[i] = 1.0 if terminated else 0.0
+        n_step_horizon[i] = float(n_eff)
+
     train_data = {
         "observations": obs_goal,
         "actions": actions,
@@ -658,6 +711,13 @@ def qlearning_dataset(
         "next_actions": next_actions,
         "rewards": rewards,
         "terminals": dones,
+        "n_step_states": n_step_states,
+        "n_step_actions": n_step_actions,
+        "n_step_prev_states": n_step_prev_states,
+        "n_step_prev_actions": n_step_prev_actions,
+        "n_step_rewards": n_step_rewards,
+        "n_step_dones": n_step_dones,
+        "n_step_horizon": n_step_horizon,
     }
     return train_data, float(np.min(mc_returns)), float(np.max(mc_returns))
 
@@ -690,6 +750,7 @@ class ReplayBuffer:
         goal_source: str = "trajectory_final",
         append_goal: bool = True,
         use_masks_for_dones: bool = True,
+        n_step: int = 1,
     ):
         d4rl_data, self.min, self.max = qlearning_dataset(
             dataset_name,
@@ -699,6 +760,7 @@ class ReplayBuffer:
             goal_source=goal_source,
             append_goal=append_goal,
             use_masks_for_dones=use_masks_for_dones,
+            n_step=n_step,
         )
         print("Min/Max", self.min, self.max)
 
@@ -712,14 +774,34 @@ class ReplayBuffer:
             "next_states": jnp.asarray(d4rl_data["next_observations"], dtype=jnp.float32),
             "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
             "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
+            "n_step_states": jnp.asarray(d4rl_data["n_step_states"], dtype=jnp.float32),
+            "n_step_actions": jnp.asarray(d4rl_data["n_step_actions"], dtype=jnp.float32),
+            "n_step_prev_states": jnp.asarray(d4rl_data["n_step_prev_states"], dtype=jnp.float32),
+            "n_step_prev_actions": jnp.asarray(d4rl_data["n_step_prev_actions"], dtype=jnp.float32),
+            "n_step_rewards": jnp.asarray(d4rl_data["n_step_rewards"], dtype=jnp.float32),
+            "n_step_dones": jnp.asarray(d4rl_data["n_step_dones"], dtype=jnp.float32),
+            "n_step_horizon": jnp.asarray(d4rl_data["n_step_horizon"], dtype=jnp.float32),
         }
 
         if is_normalize:
             self.mean, self.std = compute_mean_std(buffer["states"], eps=1e-3)
             buffer["states"] = normalize_states(buffer["states"], self.mean, self.std)
             buffer["next_states"] = normalize_states(buffer["next_states"], self.mean, self.std)
+            buffer["n_step_states"] = normalize_states(buffer["n_step_states"], self.mean, self.std)
+            n_step_prev_states_norm = normalize_states(buffer["n_step_prev_states"], self.mean, self.std)
+            # Mirror the prev_states masking: zero out when the n-step window contains a terminal.
+            buffer["n_step_prev_states"] = jnp.where(
+                buffer["n_step_dones"][:, None] > 0.5, 0.0, n_step_prev_states_norm
+            )
             prev_states_norm = normalize_states(buffer["prev_states"], self.mean, self.std)
             buffer["prev_states"] = jnp.where(buffer["prev_valid"][:, None] > 0.5, prev_states_norm, 0.0)
+        else:
+            buffer["n_step_prev_states"] = jnp.where(
+                buffer["n_step_dones"][:, None] > 0.5, 0.0, buffer["n_step_prev_states"]
+            )
+        buffer["n_step_prev_actions"] = jnp.where(
+            buffer["n_step_dones"][:, None] > 0.5, 0.0, buffer["n_step_prev_actions"]
+        )
         self.data = buffer
 
     @property
@@ -1472,8 +1554,11 @@ def update_critic_iql(
     state_noise_key, action_noise_key = jax.random.split(objective_noise_key)
     state_noise = jax.random.normal(state_noise_key, batch["states"].shape) * objective_noise
     action_noise = jax.random.normal(action_noise_key, batch["actions"].shape) * objective_noise
-    v_next = value.apply_fn(value.params, batch["next_states"])
-    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * v_next
+    # n-step bootstrap: V is queried at s_{t+n_eff}, with the discounted n-step
+    # reward already accumulated and gamma raised to the per-sample horizon.
+    v_next = value.apply_fn(value.params, batch["n_step_states"])
+    n_step_discount = jnp.power(gamma, batch["n_step_horizon"])
+    target_q = batch["n_step_rewards"] + (1 - batch["n_step_dones"]) * n_step_discount * v_next
     next_state_coef = jnp.where((next_state_pred_epochs > 0) & (epoch < next_state_pred_epochs), 1.0, 0.0)
 
     def critic_loss_fn(critic_params: jax.Array):
@@ -1494,6 +1579,7 @@ def update_critic_iql(
             q_min = q.min(0).mean() if q.ndim > 1 else q.mean()
             q_loss = jnp.mean((q - target_q) ** 2, axis=1).sum(0) if q.ndim > 1 else jnp.mean((q - target_q) ** 2)
 
+        # Auxiliary next-state head still targets the immediate next state.
         target_next_state = batch["next_states"]
         if next_state_pred.ndim > 2:
             next_state_loss = jnp.mean((next_state_pred - target_next_state[None, ...]) ** 2, axis=(1, 2)).sum(0)
@@ -1545,6 +1631,8 @@ def update_critic(
     likelihood_alpha_eps: float,
     likelihood_logprob_min: jax.Array,
     likelihood_logprob_max: jax.Array,
+    target_action_k: int,
+    target_action_reduction: str,
     metrics: Metrics,
 ) -> Tuple[jax.random.PRNGKey, CriticTrainState, Metrics]:
     key, actions_key, noise_key, critic_dropout_key, objective_noise_key, grad_noise_key = jax.random.split(key, 6)
@@ -1555,59 +1643,106 @@ def update_critic(
     actor_params = actor.target_params if use_target_actor else actor.params
     actor_batch_stats = actor.target_batch_stats if use_target_actor else actor.batch_stats
     actor_constants = actor.target_constants if use_target_actor else actor.constants
-    next_prev_states = jnp.where(batch["dones"][:, None] > 0.5, jnp.zeros_like(batch["states"]), batch["states"])
-    next_prev_actions = jnp.where(batch["dones"][:, None] > 0.5, jnp.zeros_like(batch["actions"]), batch["actions"])
+    # n-step bootstrap state: s_{t+n_eff}. Its prev_(state|action) is s_{t+n_eff-1},
+    # already masked by n_step_dones at buffer-build time.
+    next_prev_states = batch["n_step_prev_states"]
+    next_prev_actions = batch["n_step_prev_actions"]
     next_actor_inputs = build_actor_inputs(
-        batch["next_states"],
+        batch["n_step_states"],
         next_prev_states,
         next_prev_actions,
         use_prev_state,
         use_prev_action,
     )
 
-    if use_nf:
-        next_actions = actor.apply_fn(
-            {"params": actor_params, "constants": actor_constants},
-            next_actor_inputs,
-            rng=actions_key,
-            train=False,
-            method=NFActorFlat.sample,
-        )
+    # Sample K candidate next actions; K=1 reproduces the original single-sample target.
+    K = max(1, int(target_action_k))
+    if K == 1:
+        sample_keys = actions_key[None]
+        noise_keys = noise_key[None]
     else:
-        next_actions, _ = actor.apply_fn(
+        sample_keys = jax.random.split(actions_key, K)
+        noise_keys = jax.random.split(noise_key, K)
+
+    if use_nf:
+        def _sample_one(k):
+            return actor.apply_fn(
+                {"params": actor_params, "constants": actor_constants},
+                next_actor_inputs,
+                rng=k,
+                train=False,
+                method=NFActorFlat.sample,
+            )
+        next_actions_k = jax.vmap(_sample_one)(sample_keys)  # (K, B, A)
+    else:
+        next_actions_single, _ = actor.apply_fn(
             {"params": actor_params, "batch_stats": actor_batch_stats},
             next_actor_inputs,
             False,
         )
-
-    noise = jnp.clip(jax.random.normal(noise_key, next_actions.shape) * policy_noise, -noise_clip, noise_clip)
-    next_actions = jnp.clip(next_actions + noise, -1, 1)
-    bc_penalty = jnp.sum((next_actions - batch["next_actions"]) ** 2, axis=-1)
-
-    logits = critic.apply_fn(critic.target_params, batch["next_states"], next_actions, False)
-    if use_distributional:
-        probs = nn.softmax(logits, axis=-1)
-        next_q = aggregate_target_critics(transform_from_probs(probs, critic.support), target_critic_aggregation)
-    else:
-        next_q = aggregate_target_critics(jnp.squeeze(logits, axis=-1), target_critic_aggregation)
-    next_q = next_q - beta * bc_penalty
-
-    alpha = jnp.ones_like(next_q)
-    if use_likelihood_alpha_target and use_nf:
-        next_logp = actor.apply_fn(
-            {"params": actor_params, "constants": actor_constants},
-            next_actions,
-            next_actor_inputs,
-            train=False,
-            method=NFActorFlat.log_prob,
+        next_actions_k = jnp.broadcast_to(
+            next_actions_single[None], (K,) + next_actions_single.shape
         )
-        denom = jnp.maximum(likelihood_logprob_max - likelihood_logprob_min, likelihood_alpha_eps)
-        alpha = (next_logp - likelihood_logprob_min) / denom
-    alpha_mean = jnp.mean(alpha)
-    alpha_min = jnp.min(alpha)
-    alpha_max = jnp.max(alpha)
 
-    target_q = batch["rewards"] + (1 - batch["dones"]) * gamma * next_q * alpha
+    def _make_noise(k):
+        n = jax.random.normal(k, next_actions_k.shape[1:]) * policy_noise
+        return jnp.clip(n, -noise_clip, noise_clip)
+    noise_k = jax.vmap(_make_noise)(noise_keys)  # (K, B, A)
+    next_actions_k = jnp.clip(next_actions_k + noise_k, -1, 1)
+
+    # BC penalty per candidate. (K, B)
+    bc_penalty_k = jnp.sum(
+        (next_actions_k - batch["n_step_actions"][None]) ** 2, axis=-1
+    )
+
+    # Target critic per candidate. (K, B)
+    def _score(a):
+        logits = critic.apply_fn(critic.target_params, batch["n_step_states"], a, False)
+        if use_distributional:
+            probs = nn.softmax(logits, axis=-1)
+            return aggregate_target_critics(
+                transform_from_probs(probs, critic.support), target_critic_aggregation
+            )
+        return aggregate_target_critics(
+            jnp.squeeze(logits, axis=-1), target_critic_aggregation
+        )
+    next_q_raw_k = jax.vmap(_score)(next_actions_k)
+    next_q_adj_k = next_q_raw_k - beta * bc_penalty_k
+
+    # Likelihood-weighted alpha per candidate. (K, B)
+    alpha_k = jnp.ones_like(next_q_adj_k)
+    if use_likelihood_alpha_target and use_nf:
+        def _logp(a):
+            return actor.apply_fn(
+                {"params": actor_params, "constants": actor_constants},
+                a,
+                next_actor_inputs,
+                train=False,
+                method=NFActorFlat.log_prob,
+            )
+        next_logp_k = jax.vmap(_logp)(next_actions_k)
+        denom = jnp.maximum(likelihood_logprob_max - likelihood_logprob_min, likelihood_alpha_eps)
+        alpha_k = (next_logp_k - likelihood_logprob_min) / denom
+
+    # Per-candidate bootstrap value, then reduce over K.
+    target_value_k = next_q_adj_k * alpha_k  # (K, B)
+    if target_action_reduction == "max":
+        target_value = jnp.max(target_value_k, axis=0)
+    elif target_action_reduction == "min":
+        target_value = jnp.min(target_value_k, axis=0)
+    elif target_action_reduction == "mean":
+        target_value = jnp.mean(target_value_k, axis=0)
+    else:
+        raise ValueError(
+            f"target_action_reduction must be 'max', 'min', or 'mean'; got {target_action_reduction!r}"
+        )
+
+    alpha_mean = jnp.mean(alpha_k)
+    alpha_min = jnp.min(alpha_k)
+    alpha_max = jnp.max(alpha_k)
+
+    n_step_discount = jnp.power(gamma, batch["n_step_horizon"])
+    target_q = batch["n_step_rewards"] + (1 - batch["n_step_dones"]) * n_step_discount * target_value
     next_state_coef = jnp.where((next_state_pred_epochs > 0) & (epoch < next_state_pred_epochs), 1.0, 0.0)
 
     def critic_loss_fn(critic_params: jax.Array):
@@ -1698,6 +1833,8 @@ def update_td3(
     likelihood_alpha_eps: float,
     likelihood_logprob_min: jax.Array,
     likelihood_logprob_max: jax.Array,
+    target_action_k: int,
+    target_action_reduction: str,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1723,6 +1860,8 @@ def update_td3(
         likelihood_alpha_eps,
         likelihood_logprob_min,
         likelihood_logprob_max,
+        target_action_k,
+        target_action_reduction,
         metrics,
     )
     key, new_actor, new_critic, new_metrics = update_actor(
@@ -1876,6 +2015,8 @@ def update_td3_no_targets(
     likelihood_alpha_eps: float,
     likelihood_logprob_min: jax.Array,
     likelihood_logprob_max: jax.Array,
+    target_action_k: int,
+    target_action_reduction: str,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1901,6 +2042,8 @@ def update_td3_no_targets(
         likelihood_alpha_eps,
         likelihood_logprob_min,
         likelihood_logprob_max,
+        target_action_k,
+        target_action_reduction,
         metrics,
     )
     return key, actor, new_critic, new_metrics
@@ -1931,6 +2074,8 @@ def update_critic_warmup(
     likelihood_alpha_eps: float,
     likelihood_logprob_min: jax.Array,
     likelihood_logprob_max: jax.Array,
+    target_action_k: int,
+    target_action_reduction: str,
 ) -> Tuple[jax.random.PRNGKey, ActorTrainState, CriticTrainState, Metrics]:
     key, new_critic, new_metrics = update_critic(
         key,
@@ -1956,6 +2101,8 @@ def update_critic_warmup(
         likelihood_alpha_eps,
         likelihood_logprob_min,
         likelihood_logprob_max,
+        target_action_k,
+        target_action_reduction,
         metrics,
     )
     new_critic = new_critic.replace(target_params=optax.incremental_update(new_critic.params, critic.target_params, tau))
@@ -2046,6 +2193,12 @@ def train(config: Config):
     eval_task_ids = () if use_singletask_rollout else _parse_task_ids(config.ogbench_eval_task_ids)
 
     buffer = ReplayBuffer()
+    if config.n_step < 1:
+        raise ValueError("n_step must be >= 1")
+    if config.target_action_k < 1:
+        raise ValueError("target_action_k must be >= 1")
+    if config.target_action_reduction not in {"max", "min", "mean"}:
+        raise ValueError("target_action_reduction must be 'max', 'min', or 'mean'")
     buffer.create_from_ogbench(
         effective_dataset_name,
         dataset_dir=config.ogbench_dataset_dir,
@@ -2055,6 +2208,7 @@ def train(config: Config):
         goal_source=config.ogbench_goal_source,
         append_goal=effective_append_goal,
         use_masks_for_dones=config.ogbench_use_masks_for_dones,
+        n_step=config.n_step,
     )
 
     random.seed(config.train_seed)
@@ -2276,6 +2430,8 @@ def train(config: Config):
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
         use_likelihood_alpha_target=config.use_likelihood_alpha_target,
         likelihood_alpha_eps=config.likelihood_alpha_eps,
+        target_action_k=config.target_action_k,
+        target_action_reduction=config.target_action_reduction,
     )
 
     update_td3_no_targets_partial = partial(
@@ -2297,6 +2453,8 @@ def train(config: Config):
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
         use_likelihood_alpha_target=config.use_likelihood_alpha_target,
         likelihood_alpha_eps=config.likelihood_alpha_eps,
+        target_action_k=config.target_action_k,
+        target_action_reduction=config.target_action_reduction,
     )
 
     update_iql_partial = partial(
@@ -2385,6 +2543,8 @@ def train(config: Config):
         next_state_pred_epochs=config.critic_next_state_pred_epochs,
         use_likelihood_alpha_target=config.use_likelihood_alpha_target,
         likelihood_alpha_eps=config.likelihood_alpha_eps,
+        target_action_k=config.target_action_k,
+        target_action_reduction=config.target_action_reduction,
     )
 
     full_metrics_to_log = [
