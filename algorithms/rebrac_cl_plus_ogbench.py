@@ -34,6 +34,11 @@ try:
 except ImportError:  # pragma: no cover
     from algorithms.nf_policy_action import NFActorFlat
 
+try:
+    from kron import kron
+except ImportError:  # pragma: no cover
+    from algorithms.kron import kron
+
 
 def _import_ogbench():
     try:
@@ -135,7 +140,7 @@ class Config:
     noise_clip: float = 0.5
     policy_freq: int = 2
     normalize_q: bool = True
-    optimizer_type: str = "adam"  # adam | adan
+    optimizer_type: str = "adam"  # adam | adan | kron
     decay_schedule: Optional[str] = None
     num_critics: int = 2
     activation: str = "silu"  # silu | gsp
@@ -2315,10 +2320,12 @@ def train(config: Config):
 
     if config.optimizer_type == "adan":
         optimizer = optax.adan(learning_rate=actor_lr, weight_decay=config.actor_wd)
+    elif config.optimizer_type == "kron":
+        optimizer = kron(learning_rate=actor_lr, weight_decay=config.actor_wd)
     elif config.optimizer_type == "adam":
         optimizer = adamw_elastic(learning_rate=actor_lr, weight_decay=config.actor_wd, l1_ratio=config.l1_ratio)
     else:
-        raise ValueError("optimizer_type must be 'adam' or 'adan'")
+        raise ValueError("optimizer_type must be 'adam', 'adan', or 'kron'")
 
     if config.use_nf:
         init_vars = actor_module.init(
@@ -2377,6 +2384,8 @@ def train(config: Config):
 
     if config.optimizer_type == "adan":
         critic_tx = optax.adan(learning_rate=config.critic_learning_rate, weight_decay=config.critic_wd)
+    elif config.optimizer_type == "kron":
+        critic_tx = kron(learning_rate=config.critic_learning_rate, weight_decay=config.critic_wd)
     else:
         critic_tx = optax.adam(learning_rate=config.critic_learning_rate)
 
@@ -2393,6 +2402,8 @@ def train(config: Config):
     if config.use_iql:
         if config.optimizer_type == "adan":
             value_tx = optax.adan(learning_rate=config.value_learning_rate, weight_decay=config.value_wd)
+        elif config.optimizer_type == "kron":
+            value_tx = kron(learning_rate=config.value_learning_rate, weight_decay=config.value_wd)
         else:
             value_tx = optax.adam(learning_rate=config.value_learning_rate)
         value_module = Value(hidden_dim=config.hidden_dim, layernorm=config.critic_ln, n_hiddens=config.critic_n_hiddens)
