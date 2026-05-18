@@ -31,8 +31,10 @@ from tqdm.auto import trange
 
 try:
     from nf_policy_action import NFActorFlat
+    from nf_policy_spline import NSFActorFlat
 except ImportError:  # pragma: no cover
     from algorithms.nf_policy_action import NFActorFlat
+    from algorithms.nf_policy_spline import NSFActorFlat
 
 try:
     from kron import kron
@@ -121,9 +123,12 @@ class Config:
     actor_prereset_mode: bool = True
 
     use_nf: bool = True
+    nf_flow_type: str = "affine"  # affine | nsf
     nf_num_layers: int = 8
     nf_hidden_dim: int = 128
     nf_n_hiddens: int = 2
+    nf_num_bins: int = 8
+    nf_tail_bound: float = 3.0
     nf_scale_max: float = 1.0
     nf_base_dist: str = "normal"
     nf_use_plu: bool = True
@@ -2235,7 +2240,19 @@ def train(config: Config):
     )
 
     if config.use_nf:
-        actor_module = NFActorFlat(
+        nf_flow_type = config.nf_flow_type.lower()
+        if nf_flow_type == "affine":
+            actor_cls = NFActorFlat
+            extra_nf_kwargs = {}
+        elif nf_flow_type == "nsf":
+            actor_cls = NSFActorFlat
+            extra_nf_kwargs = {
+                "num_bins": config.nf_num_bins,
+                "tail_bound": config.nf_tail_bound,
+            }
+        else:
+            raise ValueError("nf_flow_type must be one of: affine, nsf")
+        nf_actor_kwargs = dict(
             action_dim=init_action.shape[-1],
             hidden_dim=config.nf_hidden_dim,
             n_hiddens=config.nf_n_hiddens,
@@ -2247,20 +2264,10 @@ def train(config: Config):
             dropout_rate=config.nf_dropout,
             deterministic_layers=config.nf_det_layers,
             activation=config.activation,
+            **extra_nf_kwargs,
         )
-        reset_module = NFActorFlat(
-            action_dim=init_action.shape[-1],
-            hidden_dim=config.nf_hidden_dim,
-            n_hiddens=config.nf_n_hiddens,
-            num_layers=config.nf_num_layers,
-            scale_max=config.nf_scale_max,
-            base_dist=config.nf_base_dist,
-            use_plu=config.nf_use_plu,
-            use_layernorm=config.nf_use_layernorm,
-            dropout_rate=config.nf_dropout,
-            deterministic_layers=config.nf_det_layers,
-            activation=config.activation,
-        )
+        actor_module = actor_cls(**nf_actor_kwargs)
+        reset_module = actor_cls(**nf_actor_kwargs)
     else:
         if config.actor_prereset_mode:
             actor_module = DetActor(
