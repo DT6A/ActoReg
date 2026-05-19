@@ -160,7 +160,7 @@ class Config:
     nf_hidden_dim: int = 128
     nf_n_hiddens: int = 2
     nf_num_bins: int = 8
-    nf_tail_bound: float = 3.0
+    nf_tail_bound: float = 5.0
     nf_scale_max: float = 1.0
     nf_base_dist: str = "normal"
     nf_use_plu: bool = True

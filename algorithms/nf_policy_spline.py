@@ -133,7 +133,10 @@ def rational_quadratic_spline(
         b = input_bin_heights * input_derivatives - y_minus_cumheight * dsum
         c = -delta * y_minus_cumheight
         discriminant = jnp.maximum(b**2 - 4.0 * a * c, 0.0)
-        quadratic_root = _safe_div(2.0 * c, -b - jnp.sqrt(discriminant))
+        # Add DEFAULT_EPS**2 inside the sqrt to prevent d/dx[sqrt(x)]→∞ at x=0,
+        # which produces NaN gradients whenever the quadratic is near-degenerate.
+        # The bias is O(1e-12), negligible for any realistic discriminant value.
+        quadratic_root = _safe_div(2.0 * c, -b - jnp.sqrt(discriminant + DEFAULT_EPS**2))
         linear_root = _safe_div(-c, b)
         root = jnp.where(jnp.abs(a) < 1e-12, linear_root, quadratic_root)
         root = jnp.clip(root, 0.0, 1.0)
@@ -193,7 +196,10 @@ class SplineConditioner(nn.Module):
             kernel_init=nn.initializers.zeros,
             bias_init=nn.initializers.zeros,
         )(h)
-        out = jnp.clip(out, -20.0, 20.0)
+        # No hard clip here: softmax on widths/heights is self-normalising for any
+        # input magnitude, and softplus on derivatives has a natural lower bound.
+        # A hard clip creates zero-gradient dead zones when RL state inputs drive
+        # large activations, which is the main source of training stalls.
         out = out.reshape((x.shape[0], self.out_dim, params_per_dim))
         widths = out[..., : self.num_bins]
         heights = out[..., self.num_bins : 2 * self.num_bins]
@@ -208,7 +214,7 @@ class SplineCouplingLayer(nn.Module):
     hidden_dim: int
     n_hiddens: int
     num_bins: int = 8
-    tail_bound: float = 3.0
+    tail_bound: float = 5.0
     use_layernorm: bool = True
     dropout_rate: float = 0.0
     activation: str = "silu"
@@ -245,8 +251,8 @@ class NSFActorFlat(nn.Module):
     n_hiddens: int
     num_layers: int
     num_bins: int = 8
-    tail_bound: float = 3.0
-    scale_max: float = 1.0
+    tail_bound: float = 5.0
+    scale_max: float = 1.0  # unused; kept for API parity with NFActorFlat
     base_dist: str = "normal"
     use_plu: bool = True
     use_layernorm: bool = True
@@ -255,7 +261,6 @@ class NSFActorFlat(nn.Module):
     activation: str = "silu"
 
     def setup(self) -> None:
-        del self.scale_max
         half = self.action_dim // 2
         det_layers = max(0, min(self.deterministic_layers, self.num_layers))
         det_start = self.num_layers - det_layers
@@ -394,4 +399,7 @@ class NSFActorFlat(nn.Module):
         else:
             base_log_prob = jnp.sum(_normal_log_prob(z), axis=-1)
         log_prob = base_log_prob + logdet - logdet_tanh
+        # Clamp to prevent extreme NLL values from dominating the actor loss,
+        # which can happen with out-of-distribution states at the RL stage.
+        log_prob = jnp.clip(log_prob, -100.0, 100.0)
         return log_prob[0] if single else log_prob
