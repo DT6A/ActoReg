@@ -104,6 +104,7 @@ class CouplingLayer(nn.Module):
 class InvertiblePLU(nn.Module):
     dim: int
     key: jax.Array = jax.random.PRNGKey(0)
+    min_abs_diag: float = 1e-4
 
     def setup(self) -> None:
         w_shape = (self.dim, self.dim)
@@ -123,7 +124,8 @@ class InvertiblePLU(nn.Module):
     def _build(self):
         l = jnp.tril(self.l, k=-1) + jnp.eye(self.dim, dtype=self.l.dtype)
         u = jnp.triu(self.u, k=1)
-        s = self.s
+        sign = jnp.where(self.s >= 0, 1.0, -1.0)
+        s = sign * jnp.maximum(jnp.abs(self.s), self.min_abs_diag)
         return self.p, self.p_inv, l, u, s
 
     def __call__(

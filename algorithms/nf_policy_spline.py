@@ -14,6 +14,7 @@ except ImportError:  # pragma: no cover
 DEFAULT_MIN_BIN_WIDTH = 1e-3
 DEFAULT_MIN_BIN_HEIGHT = 1e-3
 DEFAULT_MIN_DERIVATIVE = 1e-3
+DEFAULT_EPS = 1e-6
 
 
 def _inverse_softplus(x: float) -> float:
@@ -31,6 +32,15 @@ def _select_bins(values: jax.Array, cum_values: jax.Array) -> jax.Array:
 
 def _gather_bin(values: jax.Array, idx: jax.Array) -> jax.Array:
     return jnp.take_along_axis(values, idx[..., None], axis=-1)[..., 0]
+
+
+def _safe_div(numerator: jax.Array, denominator: jax.Array, eps: float = DEFAULT_EPS) -> jax.Array:
+    safe_denominator = jnp.where(
+        jnp.abs(denominator) < eps,
+        jnp.where(denominator >= 0, eps, -eps),
+        denominator,
+    )
+    return numerator / safe_denominator
 
 
 def unconstrained_rational_quadratic_spline(
@@ -123,13 +133,14 @@ def rational_quadratic_spline(
         b = input_bin_heights * input_derivatives - y_minus_cumheight * dsum
         c = -delta * y_minus_cumheight
         discriminant = jnp.maximum(b**2 - 4.0 * a * c, 0.0)
-        root = (2.0 * c) / (-b - jnp.sqrt(discriminant))
-        root = jnp.where(jnp.abs(a) < 1e-12, -c / b, root)
+        quadratic_root = _safe_div(2.0 * c, -b - jnp.sqrt(discriminant))
+        linear_root = _safe_div(-c, b)
+        root = jnp.where(jnp.abs(a) < 1e-12, linear_root, quadratic_root)
         root = jnp.clip(root, 0.0, 1.0)
         outputs = root * input_bin_widths + input_cumwidths
         theta = root
     else:
-        theta = (inputs - input_cumwidths) / input_bin_widths
+        theta = _safe_div(inputs - input_cumwidths, input_bin_widths)
         theta_one_minus_theta = theta * (1.0 - theta)
         numerator = input_bin_heights * (
             delta * theta**2 + input_derivatives * theta_one_minus_theta
@@ -137,7 +148,7 @@ def rational_quadratic_spline(
         denominator = delta + (
             input_derivatives + input_derivatives_plus_one - 2.0 * delta
         ) * theta_one_minus_theta
-        outputs = input_cumheights + numerator / denominator
+        outputs = input_cumheights + _safe_div(numerator, denominator)
 
     theta_one_minus_theta = theta * (1.0 - theta)
     denominator = delta + (
@@ -148,6 +159,8 @@ def rational_quadratic_spline(
         + 2.0 * delta * theta_one_minus_theta
         + input_derivatives * (1.0 - theta) ** 2
     )
+    derivative_numer = jnp.maximum(derivative_numer, DEFAULT_EPS)
+    denominator = jnp.maximum(denominator, DEFAULT_EPS)
     logabsdet = jnp.log(derivative_numer) - 2.0 * jnp.log(denominator)
     if inverse:
         logabsdet = -logabsdet
@@ -180,6 +193,7 @@ class SplineConditioner(nn.Module):
             kernel_init=nn.initializers.zeros,
             bias_init=nn.initializers.zeros,
         )(h)
+        out = jnp.clip(out, -20.0, 20.0)
         out = out.reshape((x.shape[0], self.out_dim, params_per_dim))
         widths = out[..., : self.num_bins]
         heights = out[..., self.num_bins : 2 * self.num_bins]

@@ -64,6 +64,38 @@ default_kernel_init = nn.initializers.lecun_normal()
 default_bias_init = nn.initializers.zeros
 
 
+def nf_actor_sample(module: nn.Module, state: jax.Array, rng: jax.Array, train: bool = False) -> jax.Array:
+    return module.sample(state, rng, train=train)
+
+
+def nf_actor_sample_n(
+    module: nn.Module,
+    state: jax.Array,
+    rng: jax.Array,
+    num_samples: int,
+    z_scale: float = 1.0,
+    z_clip: float = 0.0,
+    train: bool = False,
+) -> jax.Array:
+    return module.sample_n(
+        state,
+        rng,
+        num_samples=num_samples,
+        z_scale=z_scale,
+        z_clip=z_clip,
+        train=train,
+    )
+
+
+def nf_actor_log_prob(
+    module: nn.Module,
+    actions: jax.Array,
+    state: jax.Array,
+    train: bool = False,
+) -> jax.Array:
+    return module.log_prob(actions, state, train=train)
+
+
 @dataclass
 class Config:
     # wandb params
@@ -965,7 +997,7 @@ def compute_dataset_action_logprob_stats(
             actions,
             actor_obs,
             train=False,
-            method=NFActorFlat.log_prob,
+            method=nf_actor_log_prob,
         )
 
     n = int(buffer_data["states"].shape[0])
@@ -1304,7 +1336,7 @@ def update_actor(
                 actor_inputs,
                 rng=sample_key,
                 train=True,
-                method=NFActorFlat.sample,
+                method=nf_actor_sample,
                 rngs={"dropout": dropout_apply_key},
             )
             updates = {"batch_stats": actor.batch_stats}
@@ -1314,7 +1346,7 @@ def update_actor(
                 bc_actions,
                 actor_inputs,
                 train=True,
-                method=NFActorFlat.log_prob,
+                method=nf_actor_log_prob,
                 rngs={"dropout": dropout_log_key},
             )
             bc_penalty = -log_probs
@@ -1361,6 +1393,7 @@ def update_actor(
         random_actions = jax.random.uniform(random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0)
         metrics_payload = {
             "actor_loss": loss,
+            "actor_loss_is_finite": jnp.asarray(jnp.isfinite(loss), dtype=jnp.float32),
             "actor_loss_bc_term": bc_term.mean(),
             "actor_loss_aux_term": aux_term.mean(),
             "actor_loss_q_term": q_term.mean(),
@@ -1375,6 +1408,7 @@ def update_actor(
         return loss, (updates, new_metrics)
 
     grads, (updates, new_metrics) = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+    actor_grad_norm = optax.global_norm(grads)
 
     def add_gaussian_noise(gr, noise_std, rng_key):
         def add_noise_to_grad(g, k):
@@ -1387,6 +1421,13 @@ def update_actor(
         return jax.tree_util.tree_map(lambda g, k: add_noise_to_grad(g, k), gr, rng_keys)
 
     grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
+    actor_grad_norm_after_noise = optax.global_norm(grads)
+    new_metrics = new_metrics.update(
+        {
+            "actor_grad_norm": actor_grad_norm,
+            "actor_grad_norm_after_noise": actor_grad_norm_after_noise,
+        }
+    )
     new_actor = actor.apply_gradients(grads=grads)
     new_actor = new_actor.replace(batch_stats=updates["batch_stats"])
     new_actor = new_actor.replace(
@@ -1440,7 +1481,7 @@ def update_actor_bc(
                 actor_inputs,
                 rng=sample_key,
                 train=True,
-                method=NFActorFlat.sample,
+                method=nf_actor_sample,
                 rngs={"dropout": dropout_apply_key},
             )
             updates = {"batch_stats": actor.batch_stats}
@@ -1450,7 +1491,7 @@ def update_actor_bc(
                 bc_actions,
                 actor_inputs,
                 train=True,
-                method=NFActorFlat.log_prob,
+                method=nf_actor_log_prob,
                 rngs={"dropout": dropout_log_key},
             )
             bc_penalty = -log_probs
@@ -1483,6 +1524,7 @@ def update_actor_bc(
         random_actions = jax.random.uniform(random_action_key, shape=batch["actions"].shape, minval=-1.0, maxval=1.0)
         metrics_payload = {
             "actor_loss": loss,
+            "actor_loss_is_finite": jnp.asarray(jnp.isfinite(loss), dtype=jnp.float32),
             "actor_loss_bc_term": bc_term.mean(),
             "actor_loss_aux_term": aux_term.mean(),
             "bc_mse_policy": jnp.mean((actions - batch["actions"] + b_noise) ** 2),
@@ -1495,6 +1537,7 @@ def update_actor_bc(
         return loss, (updates, new_metrics)
 
     grads, (updates, new_metrics) = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+    actor_grad_norm = optax.global_norm(grads)
 
     def add_gaussian_noise(gr, noise_std, rng_key):
         def add_noise_to_grad(g, k):
@@ -1507,6 +1550,13 @@ def update_actor_bc(
         return jax.tree_util.tree_map(lambda g, k: add_noise_to_grad(g, k), gr, rng_keys)
 
     grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
+    actor_grad_norm_after_noise = optax.global_norm(grads)
+    new_metrics = new_metrics.update(
+        {
+            "actor_grad_norm": actor_grad_norm,
+            "actor_grad_norm_after_noise": actor_grad_norm_after_noise,
+        }
+    )
     new_actor = actor.apply_gradients(grads=grads)
     new_actor = new_actor.replace(
         batch_stats=updates["batch_stats"],
@@ -1681,7 +1731,7 @@ def update_critic(
                 next_actor_inputs,
                 rng=k,
                 train=False,
-                method=NFActorFlat.sample,
+                method=nf_actor_sample,
             )
         next_actions_k = jax.vmap(_sample_one)(sample_keys)  # (K, B, A)
     else:
@@ -1728,7 +1778,7 @@ def update_critic(
                 a,
                 next_actor_inputs,
                 train=False,
-                method=NFActorFlat.log_prob,
+                method=nf_actor_log_prob,
             )
         next_logp_k = jax.vmap(_logp)(next_actions_k)
         denom = jnp.maximum(likelihood_logprob_max - likelihood_logprob_min, likelihood_alpha_eps)
@@ -1795,13 +1845,18 @@ def update_critic(
         rng_keys = jax.tree_util.tree_unflatten(tree, rng_keys)
         return jax.tree_util.tree_map(lambda g, k: add_noise_to_grad(g, k), gr, rng_keys)
 
+    critic_grad_norm = optax.global_norm(grads)
     grads = add_gaussian_noise(grads, grad_noise, grad_noise_key)
+    critic_grad_norm_after_noise = optax.global_norm(grads)
     new_critic = critic.apply_gradients(grads=grads)
     new_metrics = metrics.update(
         {
             "critic_loss": loss,
+            "critic_loss_is_finite": jnp.asarray(jnp.isfinite(loss), dtype=jnp.float32),
             "q_min": q_min,
             "critic_next_state_loss": next_state_loss,
+            "critic_grad_norm": critic_grad_norm,
+            "critic_grad_norm_after_noise": critic_grad_norm_after_noise,
             "alpha_mean": alpha_mean,
             "alpha_min": alpha_min,
             "alpha_max": alpha_max,
@@ -2340,7 +2395,7 @@ def train(config: Config):
             init_actor_state,
             rng=actor_key,
             train=False,
-            method=NFActorFlat.sample,
+            method=nf_actor_sample,
         )
     else:
         init_vars = actor_module.init(actor_key, init_actor_state, False)
@@ -2573,6 +2628,7 @@ def train(config: Config):
         "alpha_min",
         "alpha_max",
         "actor_loss",
+        "actor_loss_is_finite",
         "actor_loss_bc_term",
         "actor_loss_aux_term",
         "actor_loss_q_term",
@@ -2581,12 +2637,18 @@ def train(config: Config):
         "bc_mse_policy",
         "bc_mse_random",
         "action_mse",
+        "actor_grad_norm",
+        "actor_grad_norm_after_noise",
+        "critic_loss_is_finite",
+        "critic_grad_norm",
+        "critic_grad_norm_after_noise",
     ]
     if config.use_iql:
         full_metrics_to_log.append("value_loss")
 
     actor_metrics_to_log = [
         "actor_loss",
+        "actor_loss_is_finite",
         "actor_loss_bc_term",
         "actor_loss_aux_term",
         "aux_bc",
@@ -2594,10 +2656,22 @@ def train(config: Config):
         "bc_mse_random",
         "action_mse",
         "nll",
+        "actor_grad_norm",
+        "actor_grad_norm_after_noise",
     ]
     full_metrics_to_log.append("nll")
 
-    critic_metrics_to_log = ["critic_loss", "critic_next_state_loss", "q_min", "alpha_mean", "alpha_min", "alpha_max"]
+    critic_metrics_to_log = [
+        "critic_loss",
+        "critic_loss_is_finite",
+        "critic_next_state_loss",
+        "critic_grad_norm",
+        "critic_grad_norm_after_noise",
+        "q_min",
+        "alpha_mean",
+        "alpha_min",
+        "alpha_max",
+    ]
     if config.use_iql:
         critic_metrics_to_log.append("value_loss")
 
@@ -2894,14 +2968,14 @@ def train(config: Config):
                     z_scale=z_scale,
                     z_clip=z_clip,
                     train=False,
-                    method=NFActorFlat.sample_n,
+                    method=nf_actor_sample_n,
                 )
             return actor.apply_fn(
                 {"params": params, "constants": constants},
                 obs,
                 rng=rng,
                 train=False,
-                method=NFActorFlat.sample,
+                method=nf_actor_sample,
             )
         return actor.apply_fn({"params": params, "batch_stats": batch_stats}, obs, False)[0]
 
@@ -2919,7 +2993,7 @@ def train(config: Config):
             actions,
             obs,
             train=False,
-            method=NFActorFlat.log_prob,
+            method=nf_actor_log_prob,
         )
 
     il_end = config.il_warmup_epochs
@@ -2964,6 +3038,36 @@ def train(config: Config):
             update_fn = run_critic_updates
             metrics_list = critic_metrics_to_log
 
+        if stage == "il":
+            actor_updates_this_epoch = config.num_updates_on_epoch
+            critic_updates_this_epoch = 0
+            stage_id = 0
+        elif stage == "critic":
+            actor_updates_this_epoch = 0
+            critic_updates_this_epoch = config.num_updates_on_epoch
+            stage_id = 1
+        else:
+            actor_updates_this_epoch = (config.num_updates_on_epoch + config.policy_freq - 1) // config.policy_freq
+            critic_updates_this_epoch = config.num_updates_on_epoch
+            stage_id = 2
+
+        if epoch in {0, il_end, critic_end}:
+            print(
+                "[ReBRACPlus] stage transition: "
+                f"epoch={epoch}, stage={stage}, "
+                f"actor_updates={actor_updates_this_epoch}, "
+                f"critic_updates={critic_updates_this_epoch}",
+                flush=True,
+            )
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    "ReBRACPlus/pre_update_stage_id": stage_id,
+                    "ReBRACPlus/pre_update_actor_updates_this_epoch": actor_updates_this_epoch,
+                    "ReBRACPlus/pre_update_critic_updates_this_epoch": critic_updates_this_epoch,
+                }
+            )
+
         if epoch == config.num_epochs - config.num_refinement_epochs:
             print("Refinement stage")
             update_fn = run_refinement_updates
@@ -2975,7 +3079,7 @@ def train(config: Config):
                         init_actor_state,
                         rng=actor_key,
                         train=False,
-                        method=NFActorFlat.sample,
+                        method=nf_actor_sample,
                     )
                 else:
                     reset_vars = reset_module.init(actor_key, init_actor_state, False)
@@ -3000,7 +3104,15 @@ def train(config: Config):
         update_carry = update_fn(update_carry, buffer.data)
         mean_metrics = update_carry["metrics"].compute()
 
-        wandb.log({"epoch": epoch, **{f"ReBRACPlus/{k}": v for k, v in mean_metrics.items()}})
+        wandb.log(
+            {
+                "epoch": epoch,
+                "ReBRACPlus/stage_id": stage_id,
+                "ReBRACPlus/actor_updates_this_epoch": actor_updates_this_epoch,
+                "ReBRACPlus/critic_updates_this_epoch": critic_updates_this_epoch,
+                **{f"ReBRACPlus/{k}": v for k, v in mean_metrics.items()},
+            }
+        )
 
         force_eval = epoch == il_end - 1 or epoch == critic_end - 1
         force_eval = False
