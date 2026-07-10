@@ -28,10 +28,10 @@ from tqdm.auto import trange
 
 try:
     from nf_policy_action import NFActorFlat
-    from nf_policy_spline import NSFActorFlat
+    from nf_policy_spline import NFActorFlat as NSFActorFlat
 except ImportError:  # pragma: no cover
     from algorithms.nf_policy_action import NFActorFlat
-    from algorithms.nf_policy_spline import NSFActorFlat
+    from algorithms.nf_policy_spline import NFActorFlat as NSFActorFlat
 
 try:
     from kron import kron
