@@ -76,6 +76,7 @@ class Config:
     actor_bn: bool = False
     actor_sn: bool = False
     critic_ln: bool = True
+    critic_residual: bool = True
     actor_dropout: float = 0.1
     actor_wd: float = 0.0
     l1_ratio: float = 0.0
@@ -318,6 +319,7 @@ class Critic(nn.Module):
     n_hiddens: int = 3
     n_classes: int = 21
     use_distributional: bool = True
+    residual: bool = True
 
     @nn.compact
     def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
@@ -344,7 +346,7 @@ class Critic(nn.Module):
             )(x)
             h = nn.silu(h)
             h = nn.LayerNorm()(h) if self.layernorm else h
-            x = x + h
+            x = x + h if self.residual else h
 
         out = nn.Dense(
             self.n_classes if self.use_distributional else 1,
@@ -394,6 +396,7 @@ class EnsembleCritic(nn.Module):
     n_hiddens: int = 3
     n_classes: int = 21
     use_distributional: bool = True
+    residual: bool = True
 
     @nn.compact
     def __call__(self, state: jax.Array, action: jax.Array) -> jax.Array:
@@ -411,6 +414,7 @@ class EnsembleCritic(nn.Module):
             self.n_hiddens,
             self.n_classes,
             self.use_distributional,
+            self.residual,
         )(state, action)
         return q_values
 
@@ -2011,6 +2015,7 @@ def train(config: Config):
         n_hiddens=config.critic_n_hiddens,
         n_classes=n_classes_eff,
         use_distributional=config.use_distributional,
+        residual=config.critic_residual,
     )
 
     v_min, v_max = config.v_min, config.v_max

@@ -28,7 +28,9 @@ def resolve_activation(name: str):
         return nn.silu
     if name == "gsp":
         return GSP
-    raise ValueError(f"Unsupported activation '{name}'. Expected one of: silu, gsp")
+    if name == "relu":
+        return nn.relu
+    raise ValueError(f"Unsupported activation '{name}'. Expected one of: silu, gsp, relu")
 
 
 class Conditioner(nn.Module):

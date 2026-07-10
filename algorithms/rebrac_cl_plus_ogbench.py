@@ -135,6 +135,7 @@ class Config:
     actor_bn: bool = False
     actor_sn: bool = False
     critic_ln: bool = True
+    critic_residual: bool = True
 
     actor_dropout: float = 0.1
     actor_wd: float = 0.0
@@ -269,7 +270,9 @@ def resolve_activation(name: str):
         return nn.silu
     if name == "gsp":
         return GSP
-    raise ValueError(f"Unsupported activation '{name}'. Expected one of: silu, gsp")
+    if name == "relu":
+        return nn.relu
+    raise ValueError(f"Unsupported activation '{name}'. Expected one of: silu, gsp, relu")
 
 
 def aggregate_target_critics(q_values: jax.Array, reduction: str) -> jax.Array:
@@ -408,6 +411,7 @@ class Critic(nn.Module):
     use_distributional: bool = True
     dropout_rate: float = 0.0
     activation: str = "silu"
+    residual: bool = True
 
     @nn.compact
     def __call__(
@@ -439,7 +443,7 @@ class Critic(nn.Module):
             h = activation_fn(h)
             h = nn.LayerNorm()(h) if self.layernorm else h
             h = nn.Dropout(rate=self.dropout_rate)(h, deterministic=not train)
-            x = x + h
+            x = x + h if self.residual else h
 
         def head_block(features: jax.Array, out_dim: int, name: str) -> jax.Array:
             h = nn.Dense(
@@ -509,6 +513,7 @@ class EnsembleCritic(nn.Module):
     use_distributional: bool = True
     dropout_rate: float = 0.0
     activation: str = "silu"
+    residual: bool = True
 
     @nn.compact
     def __call__(
@@ -534,6 +539,7 @@ class EnsembleCritic(nn.Module):
             self.use_distributional,
             self.dropout_rate,
             self.activation,
+            self.residual,
         )(state, action, train, predict_next_state)
 
 
@@ -2425,6 +2431,7 @@ def train(config: Config):
         use_distributional=config.use_distributional,
         dropout_rate=config.critic_dropout,
         activation=config.activation,
+        residual=config.critic_residual,
     )
 
     v_min, v_max = config.v_min, config.v_max
