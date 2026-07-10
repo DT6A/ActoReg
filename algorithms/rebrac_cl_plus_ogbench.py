@@ -2239,8 +2239,8 @@ def train(config: Config):
         raise ValueError("actor_bc_aux_loss must be 'mse', 'mae', or 'sum'")
     if config.critic_next_state_pred_epochs < 0:
         raise ValueError("critic_next_state_pred_epochs must be >= 0")
-    if config.activation not in {"silu", "gsp"}:
-        raise ValueError("activation must be 'silu' or 'gsp'")
+    if config.activation not in {"silu", "gsp", "relu"}:
+        raise ValueError("activation must be 'silu', 'gsp' or 'relu'")
     if config.target_critic_aggregation not in {"min", "mean"}:
         raise ValueError("target_critic_aggregation must be 'min' or 'mean'")
     if config.use_likelihood_alpha_target and not config.use_nf:
