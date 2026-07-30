@@ -62,6 +62,7 @@ def _import_ogbench():
 
 default_kernel_init = nn.initializers.lecun_normal()
 default_bias_init = nn.initializers.zeros
+CHECKPOINT_AVERAGE_UPDATES = (800_000, 900_000, 1_000_000)
 
 
 def nf_actor_sample(module: nn.Module, state: jax.Array, rng: jax.Array, train: bool = False) -> jax.Array:
@@ -206,6 +207,7 @@ class Config:
     # evaluation params
     eval_episodes: int = 50
     eval_every: int = 100
+    track_checkpoint_average: bool = False
     eval_first_action_only: bool = True
     q_infer_step_size: float = 0.0
     q_infer_steps: Union[int, str] = 0
@@ -2253,6 +2255,22 @@ def train(config: Config):
     eval_num_samples_values = parse_eval_num_samples(config.nf_eval_num_samples)
     eval_q_infer_steps_values = parse_q_infer_steps(config.q_infer_steps)
     eval_select_values_raw = parse_nf_eval_select(config.nf_eval_select)
+    if config.num_epochs < 1:
+        raise ValueError("num_epochs must be >= 1")
+    if config.num_updates_on_epoch < 1:
+        raise ValueError("num_updates_on_epoch must be >= 1")
+    total_training_updates = config.num_epochs * config.num_updates_on_epoch
+    checkpoint_average_updates = CHECKPOINT_AVERAGE_UPDATES if config.track_checkpoint_average else ()
+    if any(v > total_training_updates for v in checkpoint_average_updates):
+        raise ValueError(
+            f"checkpoint averaging requires at least {max(CHECKPOINT_AVERAGE_UPDATES)} total training updates"
+        )
+    if any(v % config.num_updates_on_epoch != 0 for v in checkpoint_average_updates):
+        raise ValueError("checkpoint averaging updates must be divisible by num_updates_on_epoch")
+    if not checkpoint_average_updates and config.eval_every < 1:
+        raise ValueError("eval_every must be >= 1 when checkpoint averaging is disabled")
+    checkpoint_average_updates_set = set(checkpoint_average_updates)
+    dict_config["checkpoint_average_updates"] = list(checkpoint_average_updates)
     if (not config.use_nf) and any(v in {"likelihood", "mix"} for v in eval_select_values_raw):
         raise ValueError("nf_eval_select='likelihood' and 'mix' require use_nf=True")
 
@@ -3005,6 +3023,8 @@ def train(config: Config):
 
     il_end = config.il_warmup_epochs
     critic_end = il_end + config.critic_warmup_epochs
+    checkpoint_eval_history = {}
+    evaluated_checkpoint_count = 0
 
     for epoch in trange(config.num_epochs, desc="ReBRAC+ Epochs"):
         stage = "rl"
@@ -3123,7 +3143,12 @@ def train(config: Config):
 
         force_eval = epoch == il_end - 1 or epoch == critic_end - 1
         force_eval = False
-        if epoch % config.eval_every == 0 or epoch == config.num_epochs - 1 or force_eval:
+        completed_updates = (epoch + 1) * config.num_updates_on_epoch
+        if checkpoint_average_updates_set:
+            should_evaluate = completed_updates in checkpoint_average_updates_set
+        else:
+            should_evaluate = epoch % config.eval_every == 0 or epoch == config.num_epochs - 1 or force_eval
+        if should_evaluate:
             eval_actor_params = update_carry["actor"].ema_params if config.use_actor_ema else update_carry["actor"].params
             eval_actor_batch_stats = (
                 update_carry["actor"].ema_batch_stats if config.use_actor_ema else update_carry["actor"].batch_stats
@@ -3138,7 +3163,7 @@ def train(config: Config):
                 eval_select_values = list(dict.fromkeys(eval_select_values))
             eval_q_step_size = 0.0 if stage == "il" else config.q_infer_step_size
             eval_q_steps_values = eval_q_infer_steps_values
-            eval_metrics = {"epoch": epoch}
+            eval_metrics = {"epoch": epoch, "updates": completed_updates}
             multi_eval = len(eval_num_samples_values) > 1
             multi_qs = len(eval_q_steps_values) > 1
             multi_select = len(eval_select_values) > 1
@@ -3229,6 +3254,17 @@ def train(config: Config):
                                     eval_metrics[f"eval/normalized_score_mean{suffix}_sn_{sn}_an_{an}"] = np.mean(
                                         normalized_returns
                                     )
+
+            if checkpoint_average_updates_set:
+                evaluated_checkpoint_count += 1
+                checkpoint_average_metrics = {}
+                for metric_name, metric_value in eval_metrics.items():
+                    if metric_name.startswith("eval/") and "_mean" in metric_name:
+                        checkpoint_eval_history.setdefault(metric_name, []).append(float(metric_value))
+                        average_name = f"eval/checkpoint_average_{metric_name.removeprefix('eval/')}"
+                        checkpoint_average_metrics[average_name] = np.mean(checkpoint_eval_history[metric_name])
+                eval_metrics.update(checkpoint_average_metrics)
+                eval_metrics["eval/checkpoint_count"] = evaluated_checkpoint_count
 
             wandb.log(eval_metrics)
 
