@@ -1,0 +1,130 @@
+command:
+- ${env}
+- PYTHONPATH=.
+- python3
+- ${program}
+- ${args}
+method: grid
+metric:
+  goal: maximize
+  name: eval/return_mean
+parameters:
+  activation:
+    value: gsp
+  actor_bc_aux_loss:
+    value: sum
+  actor_bc_aux_weight:
+    values:
+    - 1.0
+    - 0.5
+    - 0.1
+    - 0.03
+  actor_bc_coef:
+    values:
+    - 0.1
+    - 0.03
+    - 0.01
+    - 0.003
+    - 0.001
+  actor_bc_noise:
+    value: 0.0011527150088694314
+  actor_ema_tau:
+    value: 0.005
+  actor_grad_noise:
+    value: 0.0002592457561662737
+  actor_learning_rate:
+    value: 4.1267685316003e-05
+  actor_wd:
+    value: 9.63228148582001e-06
+  batch_size:
+    value: 512
+  config_path:
+    values:
+    - configs/offline/rebrac-plus-ogbench/cube/double_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/quadruple_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/quadruple_play_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/triple_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/triple_play_singletask_v0.yaml
+  critic_dropout:
+    value: 0.004812813019710172
+  critic_grad_noise:
+    value: 5.037219341185508e-06
+  critic_learning_rate:
+    value: 2.3933259595983062e-05
+  critic_n_hiddens:
+    value: 5
+  critic_next_state_pred_epochs:
+    value: 2000
+  critic_objective_noise:
+    value: 0
+  critic_warmup_epochs:
+    value: 200
+  critic_wd:
+    value: 3.685090240381485e-05
+  eval_episodes:
+    value: 50
+  eval_every:
+    value: 1000
+  gamma:
+    value: 0.999
+  il_warmup_epochs:
+    value: 100
+  n_classes:
+    value: 201
+  n_step:
+    value: 1
+  nf_base_dist:
+    value: uniform
+  nf_det_layers:
+    value: 2
+  nf_dropout:
+    value: 0.04812220593485498
+  nf_eval_num_samples:
+    value: 32
+  nf_hidden_dim:
+    value: 256
+  nf_n_hiddens:
+    value: 2
+  nf_num_layers:
+    value: 14
+  nf_use_plu:
+    value: true
+  normalize_reward:
+    value: false
+  num_critics:
+    value: 4
+  num_epochs:
+    value: 1000
+  optimizer_type:
+    value: kron
+  policy_noise:
+    value: 0.2
+  q_infer_steps:
+    value: 2
+  target_action_k:
+    value: 1
+  target_action_reduction:
+    value: mean
+  target_critic_aggregation:
+    value: mean
+  tau:
+    value: 0.007310827254552789
+  train_seed:
+    values:
+    - 0
+    - 1
+    - 2
+    - 3
+  use_actor_ema:
+    value: true
+  use_distributional:
+    value: true
+  use_iql:
+    value: false
+  use_nf:
+    value: true
+  use_prev_state:
+    value: false
+  use_target_actor:
+    value: false
+program: algorithms/rebrac_cl_plus_ogbench.py
