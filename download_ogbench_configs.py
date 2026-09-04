@@ -109,11 +109,18 @@ def main():
     p.add_argument("--dataset_dir", default="~/.ogbench/data")
     p.add_argument("--list", action="store_true", help="print the base datasets and exit")
     p.add_argument("--no_skip", action="store_true", help="re-download even if the file exists")
+    p.add_argument("--start-from", metavar="NAME", default=None,
+                   help="skip datasets whose name sorts before NAME (e.g. 'pointmaze' keeps "
+                        "pointmaze/puzzle/scene and drops antmaze/antsoccer/cube/humanoidmaze)")
     args = p.parse_args()
 
     bases = collect_base_datasets(args.configs_dir)
     if not bases:
         raise SystemExit(f"No dataset_name entries found under {args.configs_dir}")
+    if args.start_from:
+        before = len(bases)
+        bases = [b for b in bases if b >= args.start_from]
+        print(f"--start-from {args.start_from!r}: kept {len(bases)} of {before} datasets")
 
     if args.list:
         for b in bases:
