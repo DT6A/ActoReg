@@ -21,6 +21,7 @@ Usage:
 import argparse
 import os
 import re
+import urllib.error
 import urllib.request
 
 try:
@@ -57,8 +58,31 @@ def collect_base_datasets(configs_dir):
     return sorted(bases)
 
 
+def _open(url, retries=3):
+    """urlopen with a browser-like User-Agent and simple retry/backoff.
+    Some hosts 403 the default 'Python-urllib' agent; transient 5xx/connection
+    errors are retried."""
+    import time
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) ogbench-downloader",
+        "Accept": "*/*",
+    })
+    last = None
+    for attempt in range(retries):
+        try:
+            return urllib.request.urlopen(req, timeout=60)
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (403, 404):  # not transient -- don't hammer the host
+                raise
+        except Exception as e:  # noqa: BLE001 - connection resets etc.
+            last = e
+        time.sleep(2 * (attempt + 1))
+    raise last
+
+
 def download_file(url, dest_path):
-    response = urllib.request.urlopen(url)
+    response = _open(url)
     total = getattr(response, "length", None)
     tmp_path = dest_path + ".tmp"
     filename = os.path.basename(dest_path)
@@ -76,7 +100,7 @@ def download_file(url, dest_path):
     os.rename(tmp_path, dest_path)
 
 
-def download_datasets(base_names, dataset_dir, skip_existing=True):
+def download_datasets(base_names, dataset_dir, skip_existing=True, base_url=DATASET_URL):
     dataset_dir = os.path.expanduser(dataset_dir)
     os.makedirs(dataset_dir, exist_ok=True)
     files = []
@@ -90,7 +114,7 @@ def download_datasets(base_names, dataset_dir, skip_existing=True):
         if skip_existing and os.path.exists(dest):
             print(f"[{i}/{total}] skip {filename} (exists)")
             continue
-        url = f"{DATASET_URL}/{filename}"
+        url = f"{base_url.rstrip('/')}/{filename}"
         print(f"[{i}/{total}] downloading {filename}")
         try:
             download_file(url, dest)
@@ -112,6 +136,12 @@ def main():
     p.add_argument("--start-from", metavar="NAME", default=None,
                    help="skip datasets whose name sorts before NAME (e.g. 'pointmaze' keeps "
                         "pointmaze/puzzle/scene and drops antmaze/antsoccer/cube/humanoidmaze)")
+    p.add_argument("--url", default=DATASET_URL,
+                   help=f"base URL to download from (default: {DATASET_URL}); point at a mirror "
+                        "if the default host 403s")
+    p.add_argument("--via-ogbench", action="store_true",
+                   help="delegate the fetching to ogbench.download_datasets instead of the "
+                        "built-in downloader (same datasets, ogbench's own logic)")
     args = p.parse_args()
 
     bases = collect_base_datasets(args.configs_dir)
@@ -129,7 +159,11 @@ def main():
         return
 
     print(f"Downloading {len(bases)} base dataset(s) ({len(bases) * 2} files) to {args.dataset_dir}")
-    download_datasets(bases, args.dataset_dir, skip_existing=not args.no_skip)
+    if args.via_ogbench:
+        import ogbench
+        ogbench.download_datasets(bases, dataset_dir=os.path.expanduser(args.dataset_dir))
+    else:
+        download_datasets(bases, args.dataset_dir, skip_existing=not args.no_skip, base_url=args.url)
     print("Done.")
 
 
