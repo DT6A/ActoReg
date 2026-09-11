@@ -203,6 +203,7 @@ class Config:
     num_updates_on_epoch: int = 1000
     normalize_reward: bool = False
     normalize_states: bool = False
+    load_dataset_to_gpu: bool = False
 
     # evaluation params
     eval_episodes: int = 50
@@ -782,9 +783,26 @@ def normalize_states(states: jax.Array, mean: jax.Array, std: jax.Array) -> jax.
     return (states - mean) / std
 
 
+def as_replay_array(array: np.ndarray, load_to_gpu: bool) -> Union[np.ndarray, jax.Array]:
+    if load_to_gpu:
+        return jnp.asarray(array, dtype=jnp.float32)
+    return np.asarray(array, dtype=np.float32)
+
+
+def replay_where(
+    condition: Union[np.ndarray, jax.Array],
+    x: Union[np.ndarray, jax.Array, float],
+    y: Union[np.ndarray, jax.Array, float],
+    load_to_gpu: bool,
+) -> Union[np.ndarray, jax.Array]:
+    if load_to_gpu:
+        return jnp.where(condition, x, y)
+    return np.where(condition, x, y).astype(np.float32)
+
+
 @chex.dataclass
 class ReplayBuffer:
-    data: Dict[str, jax.Array] = None
+    data: Dict[str, Union[np.ndarray, jax.Array]] = None
     mean: float = 0
     std: float = 1
     min: float = 0
@@ -801,6 +819,7 @@ class ReplayBuffer:
         append_goal: bool = True,
         use_masks_for_dones: bool = True,
         n_step: int = 1,
+        load_to_gpu: bool = False,
     ):
         d4rl_data, self.min, self.max = qlearning_dataset(
             dataset_name,
@@ -815,22 +834,22 @@ class ReplayBuffer:
         print("Min/Max", self.min, self.max)
 
         buffer = {
-            "states": jnp.asarray(d4rl_data["observations"], dtype=jnp.float32),
-            "actions": jnp.asarray(d4rl_data["actions"], dtype=jnp.float32),
-            "prev_states": jnp.asarray(d4rl_data["prev_observations"], dtype=jnp.float32),
-            "prev_actions": jnp.asarray(d4rl_data["prev_actions"], dtype=jnp.float32),
-            "prev_valid": jnp.asarray(d4rl_data["prev_valid"], dtype=jnp.float32),
-            "rewards": jnp.asarray(d4rl_data["rewards"], dtype=jnp.float32),
-            "next_states": jnp.asarray(d4rl_data["next_observations"], dtype=jnp.float32),
-            "next_actions": jnp.asarray(d4rl_data["next_actions"], dtype=jnp.float32),
-            "dones": jnp.asarray(d4rl_data["terminals"], dtype=jnp.float32),
-            "n_step_states": jnp.asarray(d4rl_data["n_step_states"], dtype=jnp.float32),
-            "n_step_actions": jnp.asarray(d4rl_data["n_step_actions"], dtype=jnp.float32),
-            "n_step_prev_states": jnp.asarray(d4rl_data["n_step_prev_states"], dtype=jnp.float32),
-            "n_step_prev_actions": jnp.asarray(d4rl_data["n_step_prev_actions"], dtype=jnp.float32),
-            "n_step_rewards": jnp.asarray(d4rl_data["n_step_rewards"], dtype=jnp.float32),
-            "n_step_dones": jnp.asarray(d4rl_data["n_step_dones"], dtype=jnp.float32),
-            "n_step_horizon": jnp.asarray(d4rl_data["n_step_horizon"], dtype=jnp.float32),
+            "states": as_replay_array(d4rl_data["observations"], load_to_gpu),
+            "actions": as_replay_array(d4rl_data["actions"], load_to_gpu),
+            "prev_states": as_replay_array(d4rl_data["prev_observations"], load_to_gpu),
+            "prev_actions": as_replay_array(d4rl_data["prev_actions"], load_to_gpu),
+            "prev_valid": as_replay_array(d4rl_data["prev_valid"], load_to_gpu),
+            "rewards": as_replay_array(d4rl_data["rewards"], load_to_gpu),
+            "next_states": as_replay_array(d4rl_data["next_observations"], load_to_gpu),
+            "next_actions": as_replay_array(d4rl_data["next_actions"], load_to_gpu),
+            "dones": as_replay_array(d4rl_data["terminals"], load_to_gpu),
+            "n_step_states": as_replay_array(d4rl_data["n_step_states"], load_to_gpu),
+            "n_step_actions": as_replay_array(d4rl_data["n_step_actions"], load_to_gpu),
+            "n_step_prev_states": as_replay_array(d4rl_data["n_step_prev_states"], load_to_gpu),
+            "n_step_prev_actions": as_replay_array(d4rl_data["n_step_prev_actions"], load_to_gpu),
+            "n_step_rewards": as_replay_array(d4rl_data["n_step_rewards"], load_to_gpu),
+            "n_step_dones": as_replay_array(d4rl_data["n_step_dones"], load_to_gpu),
+            "n_step_horizon": as_replay_array(d4rl_data["n_step_horizon"], load_to_gpu),
         }
 
         if is_normalize:
@@ -840,17 +859,17 @@ class ReplayBuffer:
             buffer["n_step_states"] = normalize_states(buffer["n_step_states"], self.mean, self.std)
             n_step_prev_states_norm = normalize_states(buffer["n_step_prev_states"], self.mean, self.std)
             # Mirror the prev_states masking: zero out when the n-step window contains a terminal.
-            buffer["n_step_prev_states"] = jnp.where(
-                buffer["n_step_dones"][:, None] > 0.5, 0.0, n_step_prev_states_norm
+            buffer["n_step_prev_states"] = replay_where(
+                buffer["n_step_dones"][:, None] > 0.5, 0.0, n_step_prev_states_norm, load_to_gpu
             )
             prev_states_norm = normalize_states(buffer["prev_states"], self.mean, self.std)
-            buffer["prev_states"] = jnp.where(buffer["prev_valid"][:, None] > 0.5, prev_states_norm, 0.0)
+            buffer["prev_states"] = replay_where(buffer["prev_valid"][:, None] > 0.5, prev_states_norm, 0.0, load_to_gpu)
         else:
-            buffer["n_step_prev_states"] = jnp.where(
-                buffer["n_step_dones"][:, None] > 0.5, 0.0, buffer["n_step_prev_states"]
+            buffer["n_step_prev_states"] = replay_where(
+                buffer["n_step_dones"][:, None] > 0.5, 0.0, buffer["n_step_prev_states"], load_to_gpu
             )
-        buffer["n_step_prev_actions"] = jnp.where(
-            buffer["n_step_dones"][:, None] > 0.5, 0.0, buffer["n_step_prev_actions"]
+        buffer["n_step_prev_actions"] = replay_where(
+            buffer["n_step_dones"][:, None] > 0.5, 0.0, buffer["n_step_prev_actions"], load_to_gpu
         )
         self.data = buffer
 
@@ -2298,6 +2317,7 @@ def train(config: Config):
         append_goal=effective_append_goal,
         use_masks_for_dones=config.ogbench_use_masks_for_dones,
         n_step=config.n_step,
+        load_to_gpu=config.load_dataset_to_gpu,
     )
 
     random.seed(config.train_seed)
@@ -2306,10 +2326,10 @@ def train(config: Config):
 
     eval_env = make_env(effective_dataset_name, seed=config.eval_seed, dataset_dir=config.ogbench_dataset_dir)
 
-    init_state = buffer.data["states"][0][None, ...]
-    init_action = buffer.data["actions"][0][None, ...]
-    init_prev_state = buffer.data["prev_states"][0][None, ...]
-    init_prev_action = buffer.data["prev_actions"][0][None, ...]
+    init_state = jnp.asarray(buffer.data["states"][0][None, ...], dtype=jnp.float32)
+    init_action = jnp.asarray(buffer.data["actions"][0][None, ...], dtype=jnp.float32)
+    init_prev_state = jnp.asarray(buffer.data["prev_states"][0][None, ...], dtype=jnp.float32)
+    init_prev_action = jnp.asarray(buffer.data["prev_actions"][0][None, ...], dtype=jnp.float32)
     init_actor_state = build_actor_inputs(
         init_state,
         init_prev_state,
@@ -2645,6 +2665,14 @@ def train(config: Config):
         target_action_reduction=config.target_action_reduction,
     )
 
+    update_td3_step = jax.jit(update_td3_partial)
+    update_td3_no_targets_step = jax.jit(update_td3_no_targets_partial)
+    update_iql_step = jax.jit(update_iql_partial)
+    update_iql_no_actor_step = jax.jit(update_iql_no_actor_partial)
+    update_refinement_step = jax.jit(update_refinement_partial)
+    update_actor_bc_step = jax.jit(update_actor_bc_partial)
+    update_critic_warmup_step = jax.jit(update_critic_warmup_partial)
+
     full_metrics_to_log = [
         "critic_loss",
         "critic_next_state_loss",
@@ -2956,6 +2984,155 @@ def train(config: Config):
         carry, _ = jax.lax.scan(body, carry, batch_indices)
         return carry
 
+    def sample_replay_batch(buffer_data, indices):
+        return jax.tree_util.tree_map(lambda arr: jnp.asarray(arr[indices], dtype=jnp.float32), buffer_data)
+
+    def replay_batch_indices(key, buffer_size):
+        indices = jax.random.randint(
+            key,
+            shape=(config.num_updates_on_epoch, config.batch_size),
+            minval=0,
+            maxval=buffer_size,
+        )
+        return np.asarray(jax.device_get(indices))
+
+    def run_td3_updates_host(carry, buffer_data):
+        buffer_size = buffer_data["states"].shape[0]
+        key, indices_key = jax.random.split(carry["key"])
+        batch_indices = replay_batch_indices(indices_key, buffer_size)
+        value_state = carry.get("value")
+        carry = {
+            "key": key,
+            "actor": carry["actor"],
+            "critic": carry["critic"],
+            "metrics": carry["metrics"],
+            "epoch": carry["epoch"],
+            "likelihood_logprob_min": carry["likelihood_logprob_min"],
+            "likelihood_logprob_max": carry["likelihood_logprob_max"],
+        }
+        if config.use_iql:
+            carry["value"] = value_state
+
+        for update_idx, indices in enumerate(batch_indices):
+            batch = sample_replay_batch(buffer_data, indices)
+            if config.use_iql:
+                if update_idx % config.policy_freq == 0:
+                    key, actor, critic, value, metrics = update_iql_step(
+                        carry["key"], carry["actor"], carry["critic"], carry["value"], batch, carry["metrics"], carry["epoch"]
+                    )
+                else:
+                    key, actor, critic, value, metrics = update_iql_no_actor_step(
+                        carry["key"], carry["actor"], carry["critic"], carry["value"], batch, carry["metrics"], carry["epoch"]
+                    )
+                carry.update(key=key, actor=actor, critic=critic, value=value, metrics=metrics)
+            elif update_idx % config.policy_freq == 0:
+                key, actor, critic, metrics = update_td3_step(
+                    carry["key"],
+                    carry["actor"],
+                    carry["critic"],
+                    batch,
+                    carry["metrics"],
+                    carry["epoch"],
+                    carry["likelihood_logprob_min"],
+                    carry["likelihood_logprob_max"],
+                )
+                carry.update(key=key, actor=actor, critic=critic, metrics=metrics)
+            else:
+                key, actor, critic, metrics = update_td3_no_targets_step(
+                    carry["key"],
+                    carry["actor"],
+                    carry["critic"],
+                    batch,
+                    carry["metrics"],
+                    carry["epoch"],
+                    carry["likelihood_logprob_min"],
+                    carry["likelihood_logprob_max"],
+                )
+                carry.update(key=key, actor=actor, critic=critic, metrics=metrics)
+        return carry
+
+    def run_actor_bc_updates_host(carry, buffer_data):
+        buffer_size = buffer_data["states"].shape[0]
+        key, indices_key = jax.random.split(carry["key"])
+        batch_indices = replay_batch_indices(indices_key, buffer_size)
+        value_state = carry.get("value")
+        carry = {
+            "key": key,
+            "actor": carry["actor"],
+            "critic": carry["critic"],
+            "metrics": carry["metrics"],
+            "epoch": carry["epoch"],
+            "likelihood_logprob_min": carry["likelihood_logprob_min"],
+            "likelihood_logprob_max": carry["likelihood_logprob_max"],
+        }
+        if config.use_iql:
+            carry["value"] = value_state
+
+        for indices in batch_indices:
+            batch = sample_replay_batch(buffer_data, indices)
+            key, actor, metrics = update_actor_bc_step(carry["key"], carry["actor"], batch, carry["metrics"])
+            carry.update(key=key, actor=actor, metrics=metrics)
+        return carry
+
+    def run_critic_updates_host(carry, buffer_data):
+        buffer_size = buffer_data["states"].shape[0]
+        key, indices_key = jax.random.split(carry["key"])
+        batch_indices = replay_batch_indices(indices_key, buffer_size)
+        value_state = carry.get("value")
+        carry = {
+            "key": key,
+            "actor": carry["actor"],
+            "critic": carry["critic"],
+            "metrics": carry["metrics"],
+            "epoch": carry["epoch"],
+            "likelihood_logprob_min": carry["likelihood_logprob_min"],
+            "likelihood_logprob_max": carry["likelihood_logprob_max"],
+        }
+        if config.use_iql:
+            carry["value"] = value_state
+
+        for indices in batch_indices:
+            batch = sample_replay_batch(buffer_data, indices)
+            if config.use_iql:
+                key, actor, critic, value, metrics = update_iql_no_actor_step(
+                    carry["key"], carry["actor"], carry["critic"], carry["value"], batch, carry["metrics"], carry["epoch"]
+                )
+                carry.update(key=key, actor=actor, critic=critic, value=value, metrics=metrics)
+            else:
+                key, actor, critic, metrics = update_critic_warmup_step(
+                    carry["key"],
+                    carry["actor"],
+                    carry["critic"],
+                    batch,
+                    carry["metrics"],
+                    carry["epoch"],
+                    carry["likelihood_logprob_min"],
+                    carry["likelihood_logprob_max"],
+                )
+                carry.update(key=key, actor=actor, critic=critic, metrics=metrics)
+        return carry
+
+    def run_refinement_updates_host(carry, buffer_data):
+        buffer_size = buffer_data["states"].shape[0]
+        key, indices_key = jax.random.split(carry["key"])
+        batch_indices = replay_batch_indices(indices_key, buffer_size)
+        carry = {
+            "key": key,
+            "actor": carry["actor"],
+            "critic": carry["critic"],
+            "metrics": carry["metrics"],
+            "epoch": carry["epoch"],
+            "likelihood_logprob_min": carry["likelihood_logprob_min"],
+            "likelihood_logprob_max": carry["likelihood_logprob_max"],
+        }
+        for indices in batch_indices:
+            batch = sample_replay_batch(buffer_data, indices)
+            key, actor, critic, metrics = update_refinement_step(
+                carry["key"], carry["actor"], carry["critic"], batch, carry["metrics"]
+            )
+            carry.update(key=key, actor=actor, critic=critic, metrics=metrics)
+        return carry
+
     run_td3_updates = jax.jit(run_td3_updates)
     run_actor_bc_updates = jax.jit(run_actor_bc_updates)
     run_critic_updates = jax.jit(run_critic_updates)
@@ -3056,13 +3233,13 @@ def train(config: Config):
                     }
                 )
 
-        update_fn = run_td3_updates
+        update_fn = run_td3_updates if config.load_dataset_to_gpu else run_td3_updates_host
         metrics_list = full_metrics_to_log
         if stage == "il":
-            update_fn = run_actor_bc_updates
+            update_fn = run_actor_bc_updates if config.load_dataset_to_gpu else run_actor_bc_updates_host
             metrics_list = actor_metrics_to_log
         elif stage == "critic":
-            update_fn = run_critic_updates
+            update_fn = run_critic_updates if config.load_dataset_to_gpu else run_critic_updates_host
             metrics_list = critic_metrics_to_log
 
         if stage == "il":
@@ -3097,7 +3274,7 @@ def train(config: Config):
 
         if epoch == config.num_epochs - config.num_refinement_epochs:
             print("Refinement stage")
-            update_fn = run_refinement_updates
+            update_fn = run_refinement_updates if config.load_dataset_to_gpu else run_refinement_updates_host
             metrics_list = full_metrics_to_log
             if config.actor_reset:
                 if config.use_nf:
