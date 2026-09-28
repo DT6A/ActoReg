@@ -1,0 +1,59 @@
+{
+  "timestamp_utc": "2026-09-28T12:53:48.462656+00:00",
+  "python": "3.10.19",
+  "system": "Linux-6.8.0-136-generic-x86_64-with-glibc2.39",
+  "machine": "x86_64",
+  "packages": {
+    "jax": "0.6.2",
+    "jaxlib": "0.6.2",
+    "flax": "0.10.7",
+    "numpy": "1.26.4",
+    "ogbench": "1.2.1"
+  },
+  "device": "cuda:0",
+  "device_kind": "NVIDIA GeForce RTX 3090",
+  "platform": "gpu",
+  "model_module": "algorithms.rebrac_cl_plus_ogbench",
+  "model_sha256": "b9a6cf68ea5706f8b10a9b23496f1853911dbafa7802c5a8b7670a7096add253",
+  "actor_sha256": "7ed54ca7fba05143d4ff7fa812cd8490b2b02d97d2abfb4f0d453619416e3537",
+  "arguments": {
+    "config": null,
+    "all_ogbench": false,
+    "dimensions_json": null,
+    "settings": [
+      [
+        1,
+        0
+      ],
+      [
+        32,
+        0
+      ],
+      [
+        32,
+        2
+      ]
+    ],
+    "batch_sizes": [
+      1,
+      32
+    ],
+    "modes": [
+      "staged_host",
+      "fused_device"
+    ],
+    "platform": "gpu",
+    "device_index": 0,
+    "warmup": 20,
+    "iterations": 100,
+    "repeats": 5,
+    "seed": 0,
+    "list_envs": false,
+    "output_dir": "inference_benchmark"
+  },
+  "random_initialization": true,
+  "dtype": "float32",
+  "support": "synthetic linspace(-1, 1, n_classes+1); no dataset-derived value bounds",
+  "state_distribution": "standard normal synthetic vectors, fixed pool of 8 batches",
+  "timing_scope": "No training, optimizer, dataset loading, simulator stepping, or normalization. Warmup excluded; every call synchronized."
+}
