@@ -9,7 +9,7 @@ from jax import vmap
 import jax.numpy as jnp
 import flax.linen as nn
 from optax import tree_utils as otu
-from optax._src import base, transform, clipping, numerics
+from optax._src import base, transform, numerics
 from optax._src.numerics import safe_int32_increment
 from optax._src.utils import canonicalize_dtype
 from optax._src.combine import chain

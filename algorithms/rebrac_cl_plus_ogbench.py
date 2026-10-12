@@ -36,11 +36,6 @@ except ImportError:  # pragma: no cover
     from algorithms.nf_policy_action import NFActorFlat
     from algorithms.nf_policy_spline import NFActorFlat as NSFActorFlat
 
-try:
-    from kron import kron
-except ImportError:  # pragma: no cover
-    from algorithms.kron import kron
-
 
 def _import_ogbench():
     try:
@@ -2231,6 +2226,11 @@ def update_refinement(
 
 @pyrallis.wrap()
 def train(config: Config):
+    if config.optimizer_type == "kron":
+        try:
+            from kron import kron
+        except ImportError:
+            from algorithms.kron import kron
     config.project = "ActoReg"
     dict_config = asdict(config)
     dict_config["mlc_job_name"] = os.environ.get("PLATFORM_JOB_NAME")
