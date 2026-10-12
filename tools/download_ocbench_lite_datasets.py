@@ -1,4 +1,4 @@
-"""Download only the 27 state-based OCBench lite datasets."""
+"""Download only the 16 selected state-based OCBench lite datasets."""
 
 if __package__:
     from .download_ocbench_datasets import main as download

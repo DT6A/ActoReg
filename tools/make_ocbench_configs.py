@@ -8,6 +8,11 @@ import gymnasium
 import ocbench
 import yaml
 
+if __package__:
+    from .download_ocbench_datasets import is_excluded_lite_task
+else:
+    from download_ocbench_datasets import is_excluded_lite_task
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -54,7 +59,8 @@ def main():
         destination = args.output_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(yaml.safe_dump(config, sort_keys=False))
-        groups[category].append(str(relative))
+        if not is_excluded_lite_task(task):
+            groups[category].append(str(relative))
     for category, paths in groups.items():
         sweep = dict(
             program="algorithms/rebrac_v2_ocbench.py",

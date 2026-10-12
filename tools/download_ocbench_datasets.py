@@ -9,6 +9,17 @@ import yaml
 
 
 DEFAULT_CONFIG_ROOT = Path(__file__).resolve().parents[1] / "configs/offline/rebrac-v2-ocbench"
+EXCLUDED_LITE_GROUPS = (
+    "block-lite-quadruple",
+    "chamber-lite-hard",
+    "block-lite-triple",
+    "hanoi-lite-triple",
+    "switch-lite-5x5",
+)
+
+
+def is_excluded_lite_task(name):
+    return any(name.startswith(f"{group}-task") for group in EXCLUDED_LITE_GROUPS)
 
 
 def positive_int(value):
@@ -32,7 +43,8 @@ def configured_environments(config_root, suite, requested=()):
                 raise ValueError(f"Visual dataset is not allowed: {path}")
             if ("-lite-" in name) != (category == "lite"):
                 raise ValueError(f"Task is in the wrong suite directory: {path}")
-            names.add(name)
+            if not is_excluded_lite_task(name):
+                names.add(name)
     if requested:
         requested = {name.replace("-cpu-", "-", 1) for name in requested}
         unknown = requested - names
@@ -82,7 +94,7 @@ def main(argv=None, fixed_suite=None):
     parser = argparse.ArgumentParser(description=description)
     if fixed_suite is None:
         parser.add_argument("--suite", choices=("full", "lite", "all"), default="full",
-                            help="28 main tasks, 27 optional lite variants, or both. Default: full.")
+                            help="28 main tasks, 16 selected lite variants, or both. Default: full.")
     else:
         parser.set_defaults(suite=fixed_suite)
     parser.add_argument("--dataset-dir", type=Path, default=Path("~/.cache/ocbench/datasets"))
