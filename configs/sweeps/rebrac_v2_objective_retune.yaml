@@ -1,0 +1,157 @@
+name: rebrac-v2-objective-retune-six-envs
+program: algorithms/rebrac_cl_plus_ogbench.py
+method: grid
+metric:
+  name: eval/normalized_score_mean
+  goal: maximize
+command:
+  - ${env}
+  - PYTHONPATH=.
+  - python3
+  - ${program}
+  - ${args}
+parameters:
+  config_path:
+    values:
+      - configs/sweeps/objective_retune/presets/full_01.yaml
+      - configs/sweeps/objective_retune/presets/full_02.yaml
+      - configs/sweeps/objective_retune/presets/full_03.yaml
+      - configs/sweeps/objective_retune/presets/full_04.yaml
+      - configs/sweeps/objective_retune/presets/full_05.yaml
+      - configs/sweeps/objective_retune/presets/full_06.yaml
+      - configs/sweeps/objective_retune/presets/full_07.yaml
+      - configs/sweeps/objective_retune/presets/full_08.yaml
+      - configs/sweeps/objective_retune/presets/nll_only_01.yaml
+      - configs/sweeps/objective_retune/presets/nll_only_02.yaml
+      - configs/sweeps/objective_retune/presets/nll_only_03.yaml
+      - configs/sweeps/objective_retune/presets/nll_only_04.yaml
+      - configs/sweeps/objective_retune/presets/nll_only_05.yaml
+      - configs/sweeps/objective_retune/presets/nll_only_06.yaml
+      - configs/sweeps/objective_retune/presets/nll_only_07.yaml
+      - configs/sweeps/objective_retune/presets/nll_only_08.yaml
+      - configs/sweeps/objective_retune/presets/aux_only_01.yaml
+      - configs/sweeps/objective_retune/presets/aux_only_02.yaml
+      - configs/sweeps/objective_retune/presets/aux_only_03.yaml
+      - configs/sweeps/objective_retune/presets/aux_only_04.yaml
+      - configs/sweeps/objective_retune/presets/aux_only_05.yaml
+      - configs/sweeps/objective_retune/presets/aux_only_06.yaml
+      - configs/sweeps/objective_retune/presets/aux_only_07.yaml
+      - configs/sweeps/objective_retune/presets/aux_only_08.yaml
+  dataset_name:
+    values:
+      - antmaze-giant-navigate-singletask-v0
+      - antsoccer-arena-navigate-singletask-v0
+      - cube-double-play-singletask-v0
+      - humanoidmaze-large-navigate-singletask-v0
+      - puzzle-4x4-play-singletask-v0
+      - scene-play-singletask-v0
+  train_seed:
+    values: [0, 1, 2, 3]
+  activation:
+    value: "gsp"
+  actor_bc_aux_loss:
+    value: "sum"
+  actor_bc_noise:
+    value: !!float 0.0011527150088694314
+  actor_ema_tau:
+    value: !!float 0.005
+  actor_grad_noise:
+    value: !!float 0.0002592457561662737
+  actor_learning_rate:
+    value: !!float 0.000041267685316003
+  actor_wd:
+    value: !!float 0.00000963228148582001
+  batch_size:
+    value: 512
+  critic_dropout:
+    value: !!float 0.004812813019710172
+  critic_grad_noise:
+    value: !!float 0.000005037219341185508
+  critic_learning_rate:
+    value: !!float 0.000023933259595983062
+  critic_n_hiddens:
+    value: 5
+  critic_next_state_pred_epochs:
+    value: 2000
+  critic_objective_noise:
+    value: 0
+  critic_warmup_epochs:
+    value: 200
+  critic_wd:
+    value: !!float 0.00003685090240381485
+  eval_episodes:
+    value: 50
+  eval_every:
+    value: 1000
+  gamma:
+    value: !!float 0.999
+  il_warmup_epochs:
+    value: 100
+  n_classes:
+    value: 201
+  n_step:
+    value: 1
+  nf_base_dist:
+    value: "uniform"
+  nf_det_layers:
+    value: 2
+  nf_dropout:
+    value: !!float 0.04812220593485498
+  nf_eval_num_samples:
+    value: 32
+  nf_eval_z_scale:
+    value: 1
+  nf_hidden_dim:
+    value: 256
+  nf_n_hiddens:
+    value: 2
+  nf_num_layers:
+    value: 14
+  nf_scale_max:
+    value: !!float 0.75
+  nf_use_plu:
+    value: true
+  normalize_reward:
+    value: false
+  num_critics:
+    value: 4
+  num_epochs:
+    value: 1000
+  optimizer_type:
+    value: "kron"
+  policy_noise:
+    value: !!float 0.2
+  q_infer_step_size:
+    value: !!float 0.01
+  q_infer_steps:
+    value: 2
+  target_action_k:
+    value: 1
+  target_action_reduction:
+    value: "mean"
+  target_critic_aggregation:
+    value: "mean"
+  tau:
+    value: !!float 0.007310827254552789
+  use_actor_ema:
+    value: true
+  use_distributional:
+    value: true
+  use_iql:
+    value: false
+  use_nf:
+    value: true
+  use_prev_action:
+    value: false
+  use_prev_state:
+    value: false
+  use_target_actor:
+    value: false
+  num_updates_on_epoch:
+    value: 1000
+  track_checkpoint_average:
+    value: false
+  nf_eval_select:
+    value: "q"
+  eval_seed:
+    value: 42

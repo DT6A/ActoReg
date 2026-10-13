@@ -65,5 +65,5 @@ v_min: 0.0
 v_max: 1.0
 critic_bc_coef: 0.0
 normalize_states: false
-save_final_checkpoint: true
+save_final_checkpoint: false
 ocbench_success_only: true

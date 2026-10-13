@@ -1,0 +1,65 @@
+command:
+- ${env}
+- PYTHONPATH=.
+- python3
+- ${program}
+- ${args}
+method: grid
+metric:
+  goal: maximize
+  name: eval/normalized_score_mean
+parameters:
+  config_path:
+    values:
+    - configs/offline/rebrac-plus-ogbench/antmaze/giant_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/large_explore_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/large_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/medium_explore_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/medium_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/medium_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/teleport_explore_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/teleport_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/teleport_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antsoccer/arena_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antsoccer/medium_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antsoccer/medium_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/double_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/quadruple_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/quadruple_play_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/single_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/triple_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/cube/triple_play_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/humanoidmaze/giant_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/humanoidmaze/giant_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/humanoidmaze/large_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/humanoidmaze/medium_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/pointmaze/giant_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/pointmaze/giant_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/pointmaze/large_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/pointmaze/large_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/pointmaze/medium_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/pointmaze/medium_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/pointmaze/teleport_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/pointmaze/teleport_stitch_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/puzzle/3x3_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/puzzle/4x4_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/puzzle/4x5_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/puzzle/4x5_play_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/puzzle/4x6_noisy_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/puzzle/4x6_play_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/scene/noisy_singletask_v0.yaml
+  ogbench_task_id:
+    values:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+  train_seed:
+    values:
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+program: algorithms/rebrac_cl_plus_ogbench.py

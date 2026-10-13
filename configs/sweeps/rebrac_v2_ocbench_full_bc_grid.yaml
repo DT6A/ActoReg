@@ -1,0 +1,62 @@
+program: algorithms/rebrac_v2_ocbench.py
+command:
+- ${env}
+- PYTHONPATH=.
+- python3
+- ${program}
+- ${args}
+method: grid
+metric:
+  goal: maximize
+  name: eval/normalized_score_mean
+parameters:
+  config_path:
+    values:
+    - configs/offline/rebrac-v2-ocbench/full/block/block-double-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/block/block-double-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/block/block-quadruple-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/block/block-quadruple-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/block/block-quadruple-task3-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/block/block-single-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/block/block-triple-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/block/block-triple-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/bowling/bowling-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/chamber/chamber-easy-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/chamber/chamber-easy-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/chamber/chamber-easy-task3-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/chamber/chamber-hard-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/chamber/chamber-hard-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/chamber/chamber-medium-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/chamber/chamber-medium-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/hanoi/hanoi-double-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/hanoi/hanoi-double-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/hanoi/hanoi-single-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/hanoi/hanoi-single-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/hanoi/hanoi-triple-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/hanoi/hanoi-triple-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/switch/switch-3x3-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/switch/switch-3x3-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/switch/switch-4x4-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/switch/switch-4x4-task2-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/switch/switch-5x5-task1-v0.yaml
+    - configs/offline/rebrac-v2-ocbench/full/switch/switch-5x5-task2-v0.yaml
+  actor_bc_aux_weight:
+    values:
+    - 0.03
+    - 0.1
+    - 0.5
+    - 1.0
+  actor_bc_coef:
+    values:
+    - 0.0001
+    - 0.001
+    - 0.003
+    - 0.01
+  train_seed:
+    values:
+    - 0
+    - 1
+    - 2
+    - 3
+  group:
+    value: rebrac-v2-ocbench-full-bc-grid

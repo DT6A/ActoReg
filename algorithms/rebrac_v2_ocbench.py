@@ -40,7 +40,7 @@ class Config(core.Config):
     updates_per_chunk: int = 10
     eval_checkpoints: str = ""
     output_dir: str = "ocbench_runs"
-    save_final_checkpoint: bool = True
+    save_final_checkpoint: bool = False
     wandb_mode: str = "online"
     v_min: float = 0.0
     v_max: float = 1.0

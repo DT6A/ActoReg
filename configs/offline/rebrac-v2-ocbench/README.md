@@ -8,7 +8,7 @@ There are **28 main benchmark tasks**, not 55 unrelated tasks. The **55 config f
 
 These are **starting configurations for tuning, not tuned OCBench results**. Architecture, optimizer, regularizers, and warmup settings are transferred from the existing OGBench recipe. Initial BC weights are `actor_bc_aux_weight=0.03` and `actor_bc_coef=0.0003`; they are not task-specific selections.
 
-**Current experiment set: lite only.** Use `tools/download_ocbench_lite_datasets.py` and `configs/sweeps/rebrac_v2_ocbench_lite_bc_grid.yaml`. They cover exactly the same 27 state-only tasks: Block (8), Chamber (7), Switch (6), and Hanoi (6). Bowling is excluded because it has no lite version. Existing full-horizon configs are not part of this sweep.
+**Current experiment set: 16 selected lite tasks.** Use `tools/download_ocbench_lite_datasets.py` and `configs/sweeps/rebrac_v2_ocbench_lite_bc_grid.yaml`. They cover exactly the same state-only tasks: Block Single/Double (3), Chamber Easy/Medium (5), Switch 3x3/4x4 (4), and Hanoi Single/Double (4). All task IDs from `block-lite-quadruple`, `chamber-lite-hard`, `block-lite-triple`, `hanoi-lite-triple`, and `switch-lite-5x5` are excluded from downloads and the lite sweep because of dataset size. Their config files remain available but inactive. Bowling has no lite version. Full-horizon configs are not part of this sweep.
 
 ## All environments
 
@@ -31,7 +31,7 @@ Replace `N` in each ID with one of the listed task numbers. This enumerates all 
 | `hanoi-triple-taskN-v0` | 1, 2 | 2 |
 | `bowling-taskN-v0` | 1 | 1 |
 
-The 27 lite IDs are the same list except Bowling, with `-lite` inserted after the family, e.g. `block-lite-double-task2-v0`, `chamber-lite-easy-task3-v0`, `switch-lite-5x5-task2-v0`, and `hanoi-lite-triple-task2-v0`. The downloader's `--suite all --list` command prints all 55 exact IDs, one per line.
+The benchmark's 27 lite IDs are the same list except Bowling, with `-lite` inserted after the family, e.g. `block-lite-double-task2-v0` and `chamber-lite-easy-task3-v0`. Only the 16 selected lite IDs are active in this experiment. The lite-only downloader's `--list` prints those 16 exact IDs; the general downloader's `--suite all --list` prints 44 IDs (28 full-horizon plus the 16 selected lite tasks).
 
 ## Installation
 
@@ -62,16 +62,16 @@ python tools/download_ocbench_lite_datasets.py --dry-run
 python tools/download_ocbench_lite_datasets.py
 ```
 
-The lite-only entrypoint rejects full-horizon task IDs and does not accept a `--suite` override. It defaults to all shards for all 27 lite datasets. List the exact tasks or choose a destination:
+The lite-only entrypoint rejects full-horizon and excluded lite task IDs and does not accept a `--suite` override. It defaults to all shards for the 16 selected lite datasets. List the exact tasks or choose a destination:
 
 ```bash
 python tools/download_ocbench_lite_datasets.py --list
 python tools/download_ocbench_lite_datasets.py --dataset-dir /path/to/ocbench/datasets
 ```
 
-The general-purpose `tools/download_ocbench_datasets.py` remains available with `--suite full|lite|all`, but is not needed for the lite-only experiment.
+The general-purpose `tools/download_ocbench_datasets.py` remains available with `--suite full|lite|all`, but is not needed for the lite-only experiment. It respects the same lite exclusions, including when tasks are requested explicitly.
 
-The pinned release manifest lists approximately **2.11 TB for full**, **320 GB for lite**, and **2.43 TB for both**, including all training shards, validation companions, and metadata (decimal units, excluding temporary/cache overhead). `--dry-run` fetches only the small manifest if needed and reports the selected file sizes and existing same-size files. `--list` needs no network access or OCBench import.
+The selected 16 lite datasets total approximately **34.56 GB**, down from **320.37 GB** for all 27 lite datasets, including all training shards, validation companions, and metadata (decimal units, excluding temporary/cache overhead). The separate full-horizon suite is still approximately 2.11 TB and is not selected by the lite-only script. `--dry-run` fetches only the small manifest if needed and reports the selected file sizes and existing same-size files. `--list` needs no network access or OCBench import.
 
 Download a subset or a small pilot dataset:
 
@@ -114,7 +114,8 @@ Useful overrides:
 | `--ocbench_eval_batch_size=10` | Fewer parallel GPU rollouts to reduce evaluation VRAM. |
 | `--eval_episodes=500` | More evaluation episodes, e.g. for final reporting. |
 | `--updates_per_chunk=5` | Smaller minibatch transfer/JIT blocks if memory is tight. |
-| `--wandb_mode=disabled` | Local-only smoke test; JSONL metrics and checkpoints are still saved. |
+| `--save_final_checkpoint=true` | Opt in to saving the final actor/critic checkpoint; disabled by default. |
+| `--wandb_mode=disabled` | Local-only smoke test; JSONL metrics are still saved. |
 
 The default backend is **native MJWarp** and never silently falls back to CPU. CUDA availability is checked before downloading data, and the simulator is initialized and its dimensions checked before training. Although upstream shares dataset files between these IDs, CPU and GPU dynamics are not numerically identical. The actual evaluation ID is recorded in `dataset.json`; use the native backend for comparisons to GPU baselines.
 
@@ -125,7 +126,7 @@ The default backend is **native MJWarp** and never silently falls back to CPU. C
 Two ordinary W&B grid sweeps are provided:
 
 - `configs/sweeps/rebrac_v2_ocbench_full_bc_grid.yaml`: all 28 full-horizon tasks.
-- `configs/sweeps/rebrac_v2_ocbench_lite_bc_grid.yaml`: all 27 lite tasks.
+- `configs/sweeps/rebrac_v2_ocbench_lite_bc_grid.yaml`: the 16 selected lite tasks.
 
 Both use the previous 4-by-4 coefficient grid and seeds **0, 1, 2, 3**:
 
@@ -140,7 +141,7 @@ wandb sweep --entity YOUR_ENTITY --project ReBRAC2 \
 wandb agent YOUR_ENTITY/ReBRAC2/SWEEP_ID
 ```
 
-The full sweep has **1,792 runs** and the lite sweep **1,728 runs**, each with 1M updates. They are provided, **not launched**. For a smaller job or one task at a time, copy the YAML and shorten `parameters.config_path.values`; one task is 64 runs. Extend coefficients or tune other model fields by adding parameters using the same CLI names. Selection should be performed **separately for each task by averaging its four seeds**, not by selecting W&B's globally best individual run. Use fresh seeds, e.g. 10-14, for confirmation. A sweep includes multiple tasks but does not optimize one shared average across tasks.
+The full sweep has **1,792 runs** and the selected lite sweep **1,024 runs**, each with 1M updates. They are provided, **not launched**. For a smaller job or one task at a time, copy the YAML and shorten `parameters.config_path.values`; one task is 64 runs. Extend coefficients or tune other model fields by adding parameters using the same CLI names. Selection should be performed **separately for each task by averaging its four seeds**, not by selecting W&B's globally best individual run. Use fresh seeds, e.g. 10-14, for confirmation. A sweep includes multiple tasks but does not optimize one shared average across tasks.
 
 ## Data and evaluation decisions
 
@@ -167,7 +168,7 @@ Warmups remain 100k/200k updates unless changed. Exact-checkpoint mode overrides
 
 ## Outputs and supported options
 
-Each run writes `ocbench_runs/<unique-run-name>/config.yaml`, `dataset.json`, `metrics.jsonl`, and, by default, `final.msgpack`. The checkpoint contains actor/critic training states, observation statistics, action transform, and update count; it is intended for subsequent inference, not exact training resumption (host sampling RNG state is not saved). The checkpoint does not include the dataset. The W&B project argument is respected; no entity/profile is hardcoded.
+Each run writes `ocbench_runs/<unique-run-name>/config.yaml`, `dataset.json`, and `metrics.jsonl`. Checkpoint saving is disabled by default to limit disk usage; pass `--save_final_checkpoint=true` to also write `final.msgpack`. The optional checkpoint contains actor/critic training states, observation statistics, action transform, and update count; it is intended for subsequent inference, not exact training resumption (host sampling RNG state is not saved). The checkpoint does not include the dataset. Disabling saving does not affect evaluation or checkpoint-score averaging, which use the in-memory models, and does not delete existing checkpoint files. The W&B project argument is respected; no entity/profile is hardcoded.
 
 All normal ReBRAC-v2 architecture, BC, regularizer, optimizer, EMA, n-step, and inference fields use the OGBench names. `adam` preserves the existing actor weight decay / plain-Adam critic behavior; `adamw` explicitly applies weight decay to both. The inherited IQL, actor-reset, refinement-training, likelihood-alpha-target, reward-rescaling, and noisy-evaluation experiments are rejected instead of silently ignored. `critic_bc_coef` must remain zero because truncated datasets have no demonstrated action at the final bootstrap state. OGBench-specific goal/task flags are irrelevant here: task identity is in `dataset_name` and no artificial goal is appended.
 
@@ -179,4 +180,4 @@ PYTHONPATH=. python -m unittest discover -s tests -p test_ocbench.py -v
 PYTHONPATH=. python -m unittest discover -s tests -p test_ocbench_download.py -v
 ```
 
-Regeneration overwrites the 55 starting configs and two sweeps from the current OGBench base recipe. Do not run it over tuned configs you want to preserve. Unit tests cover compact transitions, filtering, timeouts, n-step targets, action transforms, rollout masking, all three optimization stages, checkpoints, config coverage, and W&B-style CLI overrides. GPU MJWarp execution must additionally be checked on the target CUDA machine; CPU tests do not validate that backend's kernels.
+Regeneration overwrites the 55 starting configs and two sweeps from the current OGBench base recipe. It preserves the five lite-group exclusions in the generated lite sweep, using the same selection rule as the downloaders. Do not run it over tuned configs you want to preserve. Unit tests cover compact transitions, filtering, timeouts, n-step targets, action transforms, rollout masking, all three optimization stages, checkpoints, config coverage, and W&B-style CLI overrides. GPU MJWarp execution must additionally be checked on the target CUDA machine; CPU tests do not validate that backend's kernels.

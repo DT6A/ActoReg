@@ -1,0 +1,45 @@
+command:
+- ${env}
+- PYTHONPATH=.
+- python3
+- ${program}
+- ${args}
+method: grid
+metric:
+  goal: maximize
+  name: eval/normalized_score_mean
+parameters:
+  config_path:
+    values:
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/nll_only/antmaze-giant-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/nll_only/antsoccer-arena-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/nll_only/cube-double-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/nll_only/humanoidmaze-large-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/nll_only/puzzle-4x4-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/nll_only/scene-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_only/antmaze-giant-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_only/antsoccer-arena-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_only/cube-double-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_only/humanoidmaze-large-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_only/puzzle-4x4-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_only/scene-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mse_only/antmaze-giant-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mse_only/antsoccer-arena-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mse_only/cube-double-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mse_only/humanoidmaze-large-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mse_only/puzzle-4x4-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mse_only/scene-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mae_only/antmaze-giant-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mae_only/antsoccer-arena-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mae_only/cube-double-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mae_only/humanoidmaze-large-navigate-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mae_only/puzzle-4x4-play-singletask-v0.yaml
+    - configs/offline/rebrac-v2-ogbench-objective-retuned/aux_mae_only/scene-play-singletask-v0.yaml
+  train_seed:
+    values:
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+program: algorithms/rebrac_cl_plus_ogbench.py

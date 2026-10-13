@@ -1,0 +1,30 @@
+command:
+- ${env}
+- PYTHONPATH=.
+- python3
+- ${program}
+- ${args}
+method: grid
+metric:
+  goal: maximize
+  name: eval/normalized_score_mean
+parameters:
+  actor_bc_aux_loss:
+    value: mae
+  actor_bc_coef:
+    values: [0.0001, 0.001, 0.003, 0.01]
+  actor_bc_aux_weight:
+    values: [0.03, 0.1, 0.5, 1.0]
+  group:
+    value: abl-retune-aux-mae-only
+  config_path:
+    values:
+    - configs/offline/rebrac-plus-ogbench/cube/double_play_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antmaze/giant_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/antsoccer/arena_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/scene/play_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/humanoidmaze/large_navigate_singletask_v0.yaml
+    - configs/offline/rebrac-plus-ogbench/puzzle/4x4_play_singletask_v0.yaml
+  train_seed:
+    values: [0, 1, 2, 3]
+program: algorithms/rebrac_cl_plus_ogbench.py
